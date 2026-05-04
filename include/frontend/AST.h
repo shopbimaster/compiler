@@ -8,6 +8,13 @@
 
 namespace AST {
 
+// 数据类型
+enum class Type {
+    INT,
+    FLOAT,
+    VOID
+};
+
 enum class BinOp {
     ADD, SUB, MUL, DIV, MOD,
     LT, GT, LE, GE, EQ, NE,
@@ -32,10 +39,21 @@ class Expr : public Node {};
 class Stmt : public Node {};
 class Decl : public Node {};
 
+// 数值表达式（整型或浮点型）
 class Number : public Expr {
 public:
-    int64_t value;
-    Number(int64_t val, int l, int c) : value(val) { line = l; column = c; }
+    bool isFloat;
+    int64_t intValue;
+    float floatValue;
+    
+    Number(int64_t val, int l, int c) 
+        : isFloat(false), intValue(val), floatValue(0.0f) 
+        { line = l; column = c; }
+    
+    Number(float val, int l, int c) 
+        : isFloat(true), intValue(0), floatValue(val) 
+        { line = l; column = c; }
+    
     void accept(Visitor& visitor) override;
 };
 
@@ -150,34 +168,37 @@ public:
 class VarDecl : public Decl {
 public:
     bool isConst;
+    Type varType;
     std::string name;
     std::vector<std::unique_ptr<Expr>> dims;
     std::unique_ptr<Expr> init;
-    VarDecl(bool isConst, const std::string& n, std::vector<std::unique_ptr<Expr>> d,
-            std::unique_ptr<Expr> i, int l, int c)
-        : isConst(isConst), name(n), dims(std::move(d)), init(std::move(i))
+    VarDecl(bool isConst, Type type, const std::string& n, 
+            std::vector<std::unique_ptr<Expr>> d, std::unique_ptr<Expr> i, int l, int c)
+        : isConst(isConst), varType(type), name(n), dims(std::move(d)), init(std::move(i))
         { line = l; column = c; }
     void accept(Visitor& visitor) override;
 };
 
 class FuncParam {
 public:
+    Type paramType;
     std::string name;
     bool isArray;
     std::vector<std::unique_ptr<Expr>> dims;
-    FuncParam(const std::string& n, bool isArr, std::vector<std::unique_ptr<Expr>> d)
-        : name(n), isArray(isArr), dims(std::move(d)) {}
+    FuncParam(Type type, const std::string& n, bool isArr, 
+              std::vector<std::unique_ptr<Expr>> d)
+        : paramType(type), name(n), isArray(isArr), dims(std::move(d)) {}
 };
 
 class FuncDef : public Decl {
 public:
     std::string name;
-    bool returnsInt;
+    Type returnType;
     std::vector<FuncParam> params;
     std::unique_ptr<Block> body;
-    FuncDef(const std::string& n, bool retInt, std::vector<FuncParam> p,
+    FuncDef(const std::string& n, Type retType, std::vector<FuncParam> p,
             std::unique_ptr<Block> b, int l, int c)
-        : name(n), returnsInt(retInt), params(std::move(p)), body(std::move(b))
+        : name(n), returnType(retType), params(std::move(p)), body(std::move(b))
         { line = l; column = c; }
     void accept(Visitor& visitor) override;
 };
