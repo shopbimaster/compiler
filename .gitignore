@@ -1,0 +1,46 @@
+# Build directories
+build/
+cmake-build-*/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled object files
+*.o
+*.obj
+
+# Executables
+sysyc
+*.exe
+*.out
+*.app
+
+# Generated ANTLR files
+src/frontend/SysY2022Lexer.cpp
+src/frontend/SysY2022Lexer.h
+src/frontend/SysY2022Parser.cpp
+src/frontend/SysY2022Parser.h
+src/frontend/SysY2022ParserBaseListener.cpp
+src/frontend/SysY2022ParserBaseListener.h
+src/frontend/SysY2022ParserListener.cpp
+src/frontend/SysY2022ParserListener.h
+src/frontend/SysY2022ParserBaseVisitor.cpp
+src/frontend/SysY2022ParserBaseVisitor.h
+src/frontend/SysY2022ParserVisitor.cpp
+src/frontend/SysY2022ParserVisitor.h
+
+# Compiled assembly
+*.s
+*.o
+*.elf
+
+# Log files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
