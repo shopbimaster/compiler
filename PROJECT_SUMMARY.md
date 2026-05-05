@@ -3,6 +3,7 @@
 ## ✅ 已完成
 
 ### 1. 项目结构搭建
+
 - [x] 完整的目录结构 (include/, src/, grammar/, test/)
 - [x] CMakeLists.txt 构建配置
 - [x] README.md 项目说明
@@ -10,12 +11,14 @@
 - [x] .gitignore 文件
 
 ### 2. 工具模块 (Utils)
+
 - [x] Error.h - 错误报告系统头文件
 - [x] Logger.h - 日志系统头文件
 - [x] Logger.cpp - 实现
 - [ ] Error.cpp - (可以稍后补充，大部分逻辑在头文件)
 
 ### 3. 前端模块 (Frontend)
+
 - [x] AST.h - 抽象语法树定义
 - [x] ASTBuilder.h - ParseTree → AST 构建器
 - [x] SemanticAnalyzer.h - 语义分析器
@@ -23,21 +26,25 @@
 - [x] SysY2022Parser.g4 - 语法规则
 
 ### 4. 中间表示模块 (IR)
+
 - [x] IR.h - 中间表示数据结构
 - [x] IRBuilder.h - AST → IR 构建器
 
 ### 5. 后端模块 (Backend)
+
 - [x] TargetCodeGen.h - IR → RV64 汇编生成
 - [x] RegisterAllocator.h - 寄存器分配器
 - [x] PeepholeOptimizer.h - 窥孔优化器
 
 ### 6. 主程序
+
 - [x] Compiler.h - 编译器主接口
 - [x] main.cpp - 程序入口
 
 ## 🔧 需要继续开发
 
 ### 阶段 2：实现所有 .cpp 文件
+
 需要为所有头文件编写对应的实现：
 
 ```
@@ -61,6 +68,7 @@ src/
 **关键步骤（需要你操作）**：
 
 1. **在 Ubuntu 24.04 上安装 ANTLR4**：
+
    ```bash
    sudo apt-get update
    sudo apt-get install -y antlr4 openjdk-17-jdk-headless
