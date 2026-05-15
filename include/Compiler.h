@@ -10,9 +10,8 @@
 #include "backend/RegisterAllocator.h"
 #include "backend/PeepholeOptimizer.h"
 
-#include "antlr4-runtime.h"
-#include "SysY2022Lexer.h"
-#include "SysY2022Parser.h"
+// 注意：ANTLR4 相关头文件不在 include/ 目录中
+// 它们将在编译时从生成目录引用，或者在 Compiler.cpp 中引用
 
 class Compiler {
 private:
@@ -25,14 +24,6 @@ public:
     bool compile();
 
 private:
-    // 词法和语法分析 - 返回 ParseTree
-    std::unique_ptr<SysY2022Parser::CompilationUnitContext> parse(antlr4::ANTLRInputStream& input);
-
-    // 直接从 ParseTree 生成 IR
-    std::unique_ptr<IR::Module> generateIR(SysY2022Parser::CompilationUnitContext* ctx);
-
-    // 后端处理
-    std::string generateAssembly(IR::Module& module);
-
-    bool writeOutput(const std::string& asmCode);
+    // 编译阶段 - 声明在这里，实现在 Compiler.cpp 中
+    bool runCompilePipeline();
 };
