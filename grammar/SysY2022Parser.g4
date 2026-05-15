@@ -4,81 +4,124 @@ options {
     tokenVocab=SysY2022Lexer;
 }
 
+// 编译单元
 compilationUnit: (decl | funcDef)* EOF;
 
+// 声明
 decl: constDecl | varDecl;
 
-constDecl: Const bType constDef (Comma constDef)* Semicolon;
+// 常量声明
+constDecl: CONST bType constDef (COMMA constDef)* SEMICOLON;
 
-constDef: Identifier (LBracket constExp RBracket)* Assign constInitVal;
+// 基本类型
+bType: INT | FLOAT;
 
-constInitVal: constExp | LBrace (constInitVal (Comma constInitVal)*)? RBrace;
+// 常量定义
+constDef: IDENTIFIER (L_BRACKET constExp R_BRACKET)* ASSIGN constInitVal;
 
-varDecl: bType varDef (Comma varDef)* Semicolon;
+// 常量初值
+constInitVal: 
+    constExp 
+    | L_BRACE (constInitVal (COMMA constInitVal)*)? R_BRACE;
 
-varDef: Identifier (LBracket constExp RBracket)* (Assign initVal)?;
+// 变量声明
+varDecl: bType varDef (COMMA varDef)* SEMICOLON;
 
-initVal: exp | LBrace (initVal (Comma initVal)*)? RBrace;
+// 变量定义
+varDef: 
+    IDENTIFIER (L_BRACKET constExp R_BRACKET)*
+    | IDENTIFIER (L_BRACKET constExp R_BRACKET)* ASSIGN initVal;
 
-bType: Int;
+// 变量初值
+initVal: 
+    exp 
+    | L_BRACE (initVal (COMMA initVal)*)? R_BRACE;
 
-funcDef: funcType Identifier LParen (funcFParams)? RParen block;
+// 函数定义
+funcDef: funcType IDENTIFIER L_PAREN (funcFParams)? R_PAREN block;
 
-funcType: Void | Int;
+// 函数类型
+funcType: VOID | INT | FLOAT;
 
-funcFParams: funcFParam (Comma funcFParam)*;
+// 函数形参表
+funcFParams: funcFParam (COMMA funcFParam)*;
 
-funcFParam: bType Identifier (LBracket RBracket (LBracket constExp RBracket)*)?;
+// 函数形参
+funcFParam: bType IDENTIFIER (L_BRACKET R_BRACKET (L_BRACKET exp R_BRACKET)*)?;
 
-block: LBrace (blockItem)* RBrace;
+// 语句块
+block: L_BRACE blockItem* R_BRACE;
 
+// 语句块项
 blockItem: decl | stmt;
 
-stmt:
-    lVal Assign exp Semicolon
-    | (exp)? Semicolon
+// 语句
+stmt: 
+    lVal ASSIGN exp SEMICOLON
+    | exp? SEMICOLON
     | block
-    | If LParen cond RParen stmt (Else stmt)?
-    | While LParen cond RParen stmt
-    | Break Semicolon
-    | Continue Semicolon
-    | Return (exp)? Semicolon
-    ;
+    | IF L_PAREN cond R_PAREN stmt (ELSE stmt)?
+    | WHILE L_PAREN cond R_PAREN stmt
+    | BREAK SEMICOLON
+    | CONTINUE SEMICOLON
+    | RETURN exp? SEMICOLON;
 
+// 表达式
 exp: addExp;
 
+// 条件表达式
 cond: lOrExp;
 
-lVal: Identifier (LBracket exp RBracket)*;
+// 左值表达式
+lVal: IDENTIFIER (L_BRACKET exp R_BRACKET)*;
 
-primaryExp: LParen exp RParen | lVal | number;
+// 基本表达式
+primaryExp: L_PAREN exp R_PAREN | lVal | number;
 
-number: DecInt | OctInt | HexInt;
+// 数值
+number: INTCONST | FLOATCONST;
 
-unaryExp: primaryExp | Identifier LParen (funcRParams)? RParen | unaryOp unaryExp;
+// 一元表达式
+unaryExp: 
+    primaryExp
+    | IDENTIFIER L_PAREN (funcRParams)? R_PAREN
+    | unaryOp unaryExp;
 
-unaryOp: Plus | Minus | Not;
+// 单目运算符
+unaryOp: PLUS | MINUS | NOT;
 
-funcRParams: exp (Comma exp)*;
+// 函数实参表
+funcRParams: exp (COMMA exp)*;
 
-mulExp: unaryExp (mulOp unaryExp)*;
+// 乘除模表达式
+mulExp:
+    unaryExp
+    | mulExp (STAR | DIV | MOD) unaryExp;
 
-mulOp: Star | Slash | Percent;
+// 加减表达式
+addExp:
+    mulExp
+    | addExp (PLUS | MINUS) mulExp;
 
-addExp: mulExp (addOp mulExp)*;
+// 关系表达式
+relExp:
+    addExp
+    | relExp (LT | GT | LE | GE) addExp;
 
-addOp: Plus | Minus;
+// 相等性表达式
+eqExp:
+    relExp
+    | eqExp (EQ | NE) relExp;
 
-relExp: addExp (relOp addExp)*;
+// 逻辑与表达式
+lAndExp:
+    eqExp
+    | lAndExp AND eqExp;
 
-relOp: Lt | Gt | Le | Ge;
+// 逻辑或表达式
+lOrExp:
+    lAndExp
+    | lOrExp OR lAndExp;
 
-eqExp: relExp (eqOp relExp)*;
-
-eqOp: Eq | Neq;
-
-lAndExp: eqExp (And eqExp)*;
-
-lOrExp: lAndExp (Or lAndExp)*;
-
+// 常量表达式
 constExp: addExp;

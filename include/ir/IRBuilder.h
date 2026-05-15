@@ -1,51 +1,67 @@
 #pragma once
 
 #include "IR.h"
-#include "frontend/AST.h"
+#include "SysY2022Parser.h"
+#include "SysY2022Lexer.h"
 #include "utils/Error.h"
-#include <unordered_map>
-#include <memory>
 
 namespace IR {
 
-class IRBuilder : public AST::Visitor {
+class IRBuilder : public SysY2022ParserBaseVisitor {
 private:
     std::unique_ptr<Module> module;
     Function* currentFunction;
     BasicBlock* currentBlock;
     ErrorReporter& errorReporter;
-    std::unordered_map<std::string, Value*> symbolTable;
-    std::vector<BasicBlock*> breakTargets;
-    std::vector<BasicBlock*> continueTargets;
     int tempCount;
+
+    // 符号表 - 存储变量分配
+    std::unordered_map<std::string, Value*> symbolTable;
+    std::vector<std::unordered_map<std::string, Value*>> scopeStack;
+
+    // 循环上下文
+    struct LoopContext {
+        BasicBlock* continueBlock;
+        BasicBlock* breakBlock;
+    };
+    std::vector<LoopContext> loopStack;
 
 public:
     explicit IRBuilder(ErrorReporter& reporter);
 
-    std::unique_ptr<Module> build(AST::CompilationUnit& cu);
+    std::unique_ptr<Module> build(SysY2022Parser::CompilationUnitContext* ctx);
 
-    void visit(AST::Number&) override;
-    void visit(AST::Identifier&) override;
-    void visit(AST::BinaryExpr&) override;
-    void visit(AST::UnaryExpr&) override;
-    void visit(AST::CallExpr&) override;
-    void visit(AST::ArrayAccess&) override;
-    void visit(AST::Block&) override;
-    void visit(AST::AssignStmt&) override;
-    void visit(AST::IfStmt&) override;
-    void visit(AST::WhileStmt&) override;
-    void visit(AST::BreakStmt&) override;
-    void visit(AST::ContinueStmt&) override;
-    void visit(AST::ReturnStmt&) override;
-    void visit(AST::ExprStmt&) override;
-    void visit(AST::VarDecl&) override;
-    void visit(AST::FuncDef&) override;
-    void visit(AST::CompilationUnit&) override;
+    // ===== Visitor 方法 =====
+    std::any visitCompilationUnit(SysY2022Parser::CompilationUnitContext* ctx) override;
+    std::any visitConstDecl(SysY2022Parser::ConstDeclContext* ctx) override;
+    std::any visitVarDecl(SysY2022Parser::VarDeclContext* ctx) override;
+    std::any visitFuncDef(SysY2022Parser::FuncDefContext* ctx) override;
+    std::any visitBlock(SysY2022Parser::BlockContext* ctx) override;
+    std::any visitStmt(SysY2022Parser::StmtContext* ctx) override;
+    std::any visitExp(SysY2022Parser::ExpContext* ctx) override;
+    std::any visitCond(SysY2022Parser::CondContext* ctx) override;
+    std::any visitLVal(SysY2022Parser::LValContext* ctx) override;
+    std::any visitPrimaryExp(SysY2022Parser::PrimaryExpContext* ctx) override;
+    std::any visitNumber(SysY2022Parser::NumberContext* ctx) override;
+    std::any visitUnaryExp(SysY2022Parser::UnaryExpContext* ctx) override;
+    std::any visitMulExp(SysY2022Parser::MulExpContext* ctx) override;
+    std::any visitAddExp(SysY2022Parser::AddExpContext* ctx) override;
+    std::any visitRelExp(SysY2022Parser::RelExpContext* ctx) override;
+    std::any visitEqExp(SysY2022Parser::EqExpContext* ctx) override;
+    std::any visitLAndExp(SysY2022Parser::LAndExpContext* ctx) override;
+    std::any visitLOrExp(SysY2022Parser::LOrExpContext* ctx) override;
+    std::any visitConstExp(SysY2022Parser::ConstExpContext* ctx) override;
 
 private:
+    // ===== 辅助方法 =====
     std::string newTemp();
-    Value* currentValue;
-    Instruction* createBinOp(IR::Opcode op, Value* lhs, Value* rhs, const std::string& name = "");
+
+    // 类型转换
+    Type typeFromToken(SysY2022Parser::BTypeContext* ctx);
+    Type typeFromFuncType(SysY2022Parser::FuncTypeContext* ctx);
+
+    // IR 指令构建
+    Instruction* createBinOp(Opcode op, Value* lhs, Value* rhs, const std::string& name = "");
     Instruction* createAlloca(Type type, const std::string& name = "");
     Instruction* createLoad(Value* ptr, const std::string& name = "");
     Instruction* createStore(Value* val, Value* ptr);
@@ -53,6 +69,15 @@ private:
     Instruction* createCondBr(Value* cond, BasicBlock* trueBB, BasicBlock* falseBB);
     Instruction* createRet(Value* val = nullptr);
     Instruction* createCall(Function* func, const std::vector<Value*>& args, const std::string& name = "");
+
+    // 作用域管理
+    void enterScope();
+    void exitScope();
+    void declareVariable(const std::string& name, Value* value);
+    Value* lookupVariable(const std::string& name);
+
+    // 运行时库函数声明
+    void declareRuntimeFunctions();
 };
 
 }

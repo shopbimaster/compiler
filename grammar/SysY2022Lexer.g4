@@ -1,48 +1,79 @@
 lexer grammar SysY2022Lexer;
 
-Int: 'int';
-Void: 'void';
-Const: 'const';
-If: 'if';
-Else: 'else';
-While: 'while';
-Break: 'break';
-Continue: 'continue';
-Return: 'return';
+// ===== 基础字符 =====
+fragment LETTER: [a-zA-Z];
+fragment DIGIT:  [0-9];
+fragment WORD:   LETTER | DIGIT | '_';
 
-LParen: '(';
-RParen: ')';
-LBracket: '[';
-RBracket: ']';
-LBrace: '{';
-RBrace: '}';
-Comma: ',';
-Semicolon: ';';
-Question: '?';
-Colon: ':';
+// ===== 关键字 =====
+INT:      'int';
+FLOAT:    'float';
+VOID:     'void';
+CONST:    'const';
+IF:       'if';
+ELSE:     'else';
+WHILE:    'while';
+BREAK:    'break';
+CONTINUE: 'continue';
+RETURN:   'return';
 
-Plus: '+';
-Minus: '-';
-Star: '*';
-Slash: '/';
-Percent: '%';
-Not: '!';
-Lt: '<';
-Gt: '>';
-Le: '<=';
-Ge: '>=';
-Eq: '==';
-Neq: '!=';
-And: '&&';
-Or: '||';
-Assign: '=';
+// ===== 分隔符 =====
+L_PAREN:    '(';
+R_PAREN:    ')';
+L_BRACKET:  '[';
+R_BRACKET:  ']';
+L_BRACE:    '{';
+R_BRACE:    '}';
+COMMA:      ',';
+SEMICOLON:  ';';
+QUESTION:   '?';
+COLON:      ':';
 
-Identifier: [a-zA-Z_][a-zA-Z0-9_]*;
+// ===== 算术运算符 =====
+PLUS:   '+';
+MINUS:  '-';
+STAR:   '*';
+DIV:    '/';
+MOD:    '%';
 
-DecInt: [1-9][0-9]*;
-OctInt: '0'[0-7]*;
-HexInt: '0'[xX][0-9a-fA-F]+;
+// ===== 逻辑运算符 =====
+NOT: '!';
+AND: '&&';
+OR:  '||';
 
-Whitespace: [ \t\r\n]+ -> skip;
-LineComment: '//' ~[\r\n]* -> skip;
-BlockComment: '/*' .*? '*/' -> skip;
+// ===== 关系运算符 =====
+LT: '<';
+GT: '>';
+LE: '<=';
+GE: '>=';
+EQ: '==';
+NE: '!=';
+
+// ===== 赋值运算符 =====
+ASSIGN: '=';
+
+// ===== 标识符 =====
+IDENTIFIER: ('_' | LETTER) WORD*;
+
+// ===== 整数常量 =====
+INTCONST:
+      '0'
+    | ([1-9] DIGIT*)
+    | ('0' [1-7] [0-7]*)
+    | ('0' ('x' | 'X') ([1-9a-fA-F] [0-9a-fA-F]*));
+
+// ===== 浮点常量 =====
+FLOATCONST:
+      (DIGIT+ '.' DIGIT* | '.' DIGIT+) (('e' | 'E') ('+' | '-')? DIGIT+)?
+    | DIGIT+ (('e' | 'E') ('+' | '-')? DIGIT+)
+    | ('0' ('x' | 'X')) 
+        (
+            ([0-9a-fA-F]+ '.' [0-9a-fA-F]* | '.' [0-9a-fA-F]+)
+            | ([0-9a-fA-F]+)
+        )
+        (('p' | 'P') ('+' | '-')? DIGIT+);
+
+// ===== 空白和注释 =====
+WHITESPACE:    [ \t\r\n]+ -> skip;
+LINE_COMMENT:  '//' ~[\r\n]* -> skip;
+BLOCK_COMMENT: '/*' .*? '*/' -> skip;
