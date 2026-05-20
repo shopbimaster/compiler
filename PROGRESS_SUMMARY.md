@@ -28,9 +28,19 @@
 - [x] ANTLR4 4.13.1 安装和配置
 - [x] **G4 语法文件验证通过！**（两个测试用例解析成功）
 
+### 第 4 阶段: IR 模块开发
+- [x] **IR.h 完整设计与实现**
+  - Type 类型系统（VOID, I1, I8, I16, I32, I64, FLOAT, PTR）
+  - Opcode 操作码定义
+  - Value 基类 + Constant, Register, Instruction, BasicBlock, Function, GlobalVariable
+  - Module 顶层容器
+- [x] **IR 打印功能**（类 LLVM IR 文本输出）
+- [x] **IRBuilder 基础框架**
+- [x] **IR 单元测试**（返回 0 的 main 函数 IR 生成成功）
+
 ---
 
-## 📁 项目结构 (当前)
+## 📂 项目结构（当前）
 
 ```
 compiler/
@@ -44,8 +54,8 @@ compiler/
 │   │   ├── RegisterAllocator.h
 │   │   └── PeepholeOptimizer.h
 │   ├── ir/
-│   │   ├── IR.h
-│   │   └── IRBuilder.h
+│   │   ├── IR.h             ✅ 完成！
+│   │   └── IRBuilder.h      ✅ 框架完成！
 │   └── utils/
 │       ├── Error.h
 │       └── Logger.h
@@ -53,19 +63,24 @@ compiler/
 │   ├── main.cpp
 │   ├── Compiler.cpp
 │   ├── ir/
-│   │   └── IRBuilder.cpp
+│   │   └── IRBuilder.cpp    ⏳ 待实现
 │   ├── utils/
 │   │   └── Logger.cpp
 │   └── test-grammar.cpp
 ├── test/
 │   ├── hello.sy
-│   └── float_test.sy
-└── [本文档]
+│   ├── float_test.sy
+│   └── test_ir.cpp          ✅ IR 测试！
+├── test_ir_build/
+│   └── CMakeLists.txt       ✅ IR 测试配置
+└── docs/
+    ├── DEVELOPMENT_PLAN.md  ✅ 开发规划
+    └── PROGRESS_SUMMARY.md  ✅ 本文档
 ```
 
 ---
 
-## 📋 Token 命名对照表 (规范)
+## 📋 Token 命名对照表（规范）
 
 详细见 `Token命名对照表.md`
 
@@ -85,23 +100,15 @@ compiler/
 | 2026-05-20 | G4 Parser | ✅ 成功 | ANTLR4 Java 版本生成 |
 | 2026-05-20 | 测试用例 hello.sy | ✅ 成功 | ParseTree 解析通过 |
 | 2026-05-20 | 测试用例 float_test.sy | ✅ 成功 | ParseTree 解析通过 |
-
----
-
-## 🔗 已废弃的旧文档（留档备查）
-
-- `DEVELOPMENT_GUIDE.md` - 旧版开发指南
-- `DEPLOY_TEST_GUIDE.md` - 旧版部署指南
-- `PROJECT_VERIFICATION.md` - 旧版验证记录
-- `PROJECT_SUMMARY.md` - 旧版项目总结
-- `QUICKSTART.md` - 旧版快速开始
-- `WSL_DEPLOYMENT_SUMMARY.md` - 旧版 WSL 部署
-- `SIMPLE_BUILD_GUIDE.md` - 旧版简化构建指南
+| 2026-05-20 | IR 数据结构设计 | ✅ 完成 | 类层次设计 |
+| 2026-05-20 | IR 打印功能 | ✅ 完成 | LLVM 风格文本输出 |
+| 2026-05-20 | IR 测试用例 | ✅ 完成 | 返回 0 的 main 函数 |
 
 ---
 
 ## 📝 备注
 
 - **已验证的语法**: 完整的 SysY2022 词法和语法
-- **当前状态**: 准备进入中后端开发
+- **当前状态**: ✅ IR 基础框架已搭建！准备进入后端开发
 - **环境**: WSL Ubuntu 26.04 LTS 可用
+- **下一步**: 继续完善 IRBuilder，或开始后端开发
