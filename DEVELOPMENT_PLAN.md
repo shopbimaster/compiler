@@ -9,126 +9,85 @@
 
 ---
 
-## 第 1 阶段: 中间表示 (IR) 设计与实现
+## ✅ 第 1 阶段: 中间表示 (IR) 设计（已完成）
 
-**优先级: 🔴 高**
+**完成日期**: 2026-05-20 | **测试**: 18/18 全部通过
 
-| 任务 | 文件 | 状态 |
-|-----|------|------|
-| 1.1 设计 IR 数据结构 | `include/ir/IR.h` | ✅ **完成** |
-| 1.2 实现 IR 基本块 (BasicBlock) | `include/ir/IR.h` | ✅ **完成** |
-| 1.3 实现 IR 指令 (Instruction) | `include/ir/IR.h` | ✅ **完成** |
-| 1.4 实现 IR 函数 (Function) | `include/ir/IR.h` | ✅ **完成** |
-| 1.5 IR 单元测试 | `test/test_ir.cpp` | ✅ **完成** |
-
----
-
-## 第 2 阶段: IR 构建器 (IRBuilder) 实现
-
-**优先级: 🔴 高**
-
-| 任务 | 文件 | 状态 |
-|-----|------|------|
-| 2.1 IRBuilder 基础框架 | `include/ir/IRBuilder.h` | ✅ **完成** |
-| 2.2 实现 Visitor 访问 ParseTree | `include/ir/IRBuilder.h` | ⏳ 待实现（需要 ANTLR4 集成） |
-| 2.3 处理表达式构建 IR | `src/ir/IRBuilder.cpp` | ⏳ 待实现 |
-| 2.4 处理语句构建 IR | `src/ir/IRBuilder.cpp` | ⏳ 待实现 |
-| 2.5 处理函数构建 IR | `src/ir/IRBuilder.cpp` | ⏳ 待实现 |
-| 2.6 IRBuilder 集成测试 | `test/` | ⏳ 待编写 |
+| 文件 | 内容 |
+|-----|------|
+| `include/ir/IR.h` | Type 系统 (7 种)、Value/User/Use、VReg、ConstantInt/Float、Instruction (19 opcodes)、BasicBlock、Function、Module |
+| `src/ir/IR.cpp` | 完整实现：全局单例 Type 缓存、Def-Use 链、工厂方法、dump() |
+| `include/ir/IRBuilder.h` | 符号表、作用域栈、构建辅助 |
+| `src/ir/IRBuilder.cpp` | buildSimpleMain() 端到端 |
+| `test/test_ir.cpp` | 18 项单元测试 |
 
 ---
 
-## 第 3 阶段: 后端实现 (RISC-V 代码生成)
+## 第 2 阶段: IRBuilder Visitor 集成 ANTLR4（下一步）
 
-**优先级: 🔴 高**
-
-| 任务 | 文件 | 状态 |
-|-----|------|------|
-| 3.1 寄存器分配器 | `include/backend/RegisterAllocator.h` | ⏳ 待实现 |
-| 3.2 IR 到 RISC-V 指令映射 | `include/backend/TargetCodeGen.h` | ⏳ 待实现 |
-| 3.3 窥孔优化 (Peephole) | `include/backend/PeepholeOptimizer.h` | ⏳ 待实现 |
-| 3.4 支持 medany 内存模型 | `src/backend/` | ⏳ 待实现 |
-
----
-
-## 第 4 阶段: 编译器集成
-
-**优先级: 🟡 中**
+**优先级: 🔴 高** | **状态: ⏳ 待开始**
 
 | 任务 | 文件 | 状态 |
 |-----|------|------|
-| 4.1 完整编译器主入口 | `src/main.cpp` | ⏳ 待完善 |
-| 4.2 Compiler 类集成 | `src/Compiler.cpp` | ⏳ 待完善 |
-| 4.3 命令行参数解析 | `src/` | ⏳ 待实现 |
-| 4.4 最终集成测试 | `test/` | ⏳ 待编写 |
+| 2.1 安装 ANTLR4 C++ Runtime | 环境 | ⏳ |
+| 2.2 生成 C++ 版 Lexer/Parser | `build/generated/` | ⏳ |
+| 2.3 IRBuilder 继承 SysY2022ParserBaseVisitor | `IRBuilder.h` | ⏳ |
+| 2.4 实现 visitCompUnit → Module | `IRBuilder.cpp` | ⏳ |
+| 2.5 实现 visitFuncDef → Function + BB | `IRBuilder.cpp` | ⏳ |
+| 2.6 实现 visitExp → Value* (表达式翻译) | `IRBuilder.cpp` | ⏳ |
+| 2.7 实现 visitStmt → (语句翻译) | `IRBuilder.cpp` | ⏳ |
+| 2.8 集成测试：编译 hello.sy | `test/` | ⏳ |
 
 ---
 
-## 第 5 阶段: 最终验证与优化
+## 第 3 阶段: 后端代码生成
 
-**优先级: 🟢 低**
+**优先级: 🔴 高** | **状态: ⏳ 待开始**
+
+| 任务 | 文件 | 状态 |
+|-----|------|------|
+| 3.1 IR → RV64 指令映射 | `TargetCodeGen.h` | ⏳ |
+| 3.2 函数序言/尾声生成 | `TargetCodeGen.cpp` | ⏳ |
+| 3.3 寄存器分配器 (线性扫描) | `RegisterAllocator.h` | ⏳ |
+| 3.4 窥孔优化 | `PeepholeOptimizer.h` | ⏳ |
+| 3.5 medany 内存模型支持 (.LCPI0_0 等) | `backend/` | ⏳ |
+
+---
+
+## 第 4 阶段: 编译器集成与验证
+
+**优先级: 🟡 中** | **状态: ⏳ 待开始**
 
 | 任务 | 状态 |
-|-----|
-| 5.1 基准测试程序验证 | ⏳ |
-| 5.2 可选优化 (可选) | ⏳ |
-| 5.3 文档完善 | ⏳ |
-
----
-
-## 🎯 近期任务（下一步工作)
-
-### 最小可行路径（推荐顺序）：
-
-1. **继续完善 IRBuilder**
-   - [ ] 添加更多指令支持（ADD, SUB, 等）
-   - [ ] 完善符号表和作用域管理
-   - [ ] 添加更多 IR 打印功能
-
-2. **开始后端开发**
-   - [ ] 实现简单的 RISC-V 汇编输出（仅文本输出，暂不汇编）
-   - [ ] 简单的寄存器分配（线性扫描）
-   - [ ] 将 IR 翻译成 RISC-V 指令
-
-3. **暂不追求完整编译环境，优先实现核心逻辑**
-
----
-
-## 📂 新增文件清单（最近）
-
-| 文件 | 描述 |
 |-----|------|
-| `test/test_ir.cpp` | IR 模块测试程序 |
-| `test_ir_build/CMakeLists.txt` | IR 测试专用 CMake 配置 |
+| 4.1 Compiler 类集成 | ⏳ |
+| 4.2 命令行参数解析 | ⏳ |
+| 4.3 基准测试验证 | ⏳ |
 
 ---
 
-## 🛠️ 环境配置说明
+## 🎯 近期目标
 
-### IR 模块测试（当前）
+1. **安装 ANTLR4 C++ Runtime**（解决网络问题后用 apt 或手动编译）
+2. **完成 IRBuilder Visitor**（继承 BaseVisitor，遍历 ParseTree 生成 IR）
+3. **后端代码生成**（先做最简单的 ret/常量，逐步扩展）
 
-IR 模块可以**完全独立测试**（不需要 ANTLR4）。
+---
 
-测试步骤（手动执行）：
-```bash
-# 进入测试构建目录
-cd test_ir_build
-# 配置
-cmake .
-# 编译
-make
-# 运行
-./test_ir
-```
+## 🛠️ 技术学习需求
 
-### 完整编译器
-
-后续集成 ANTLR4 时再配置完整环境。
+| 主题 | 优先级 | 用途 |
+|-----|--------|------|
+| ANTLR4 C++ Visitor 模式 | 🔴 高 | IRBuilder 实现 |
+| RISC-V RV64GC 指令集 | 🔴 高 | 后端代码生成 |
+| RISC-V 调用约定 | 🔴 高 | 函数序言/尾声 |
+| 寄存器分配 (线性扫描) | 🟡 中 | 虚拟寄存器 → 物理寄存器 |
+| LLVM IR 语法 | 🟢 低 | 参考对照 |
 
 ---
 
 ## 📝 备注
 
-- **当前日期**: 2026-05
-- **更新时间线**: 本文件将根据进度更新
-- **最新状态**: ✅ IR 基础框架已搭建完成，测试通过！
+- **当前日期**: 2026-05-20
+- **IR 框架**: 18 项测试通过，完整可用
+- **build-* 和临时文件**: 已配置 .gitignore 自动忽略

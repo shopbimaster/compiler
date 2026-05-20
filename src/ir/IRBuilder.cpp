@@ -1,64 +1,110 @@
 #include "ir/IRBuilder.h"
-
-// 注意：ANTLR4 生成的头文件会在实际编译时包含进来
-// 这里是骨架实现 - 待完善
+#include <cassert>
 
 namespace IR {
 
-IRBuilder::IRBuilder(ErrorReporter& reporter)
-    : errorReporter(reporter), tempCount(0) {
+IRBuilder::IRBuilder()
+    : module(nullptr)
+    , currentFunc(nullptr)
+    , currentBB(nullptr)
+    , tempCount(0) {}
+
+std::unique_ptr<Module> IRBuilder::buildModule() {
+    module = new Module();
+    return std::unique_ptr<Module>(module);
 }
 
-std::unique_ptr<Module> IRBuilder::buildFromFile(const std::string& filename) {
-    // TODO: 实现完整的构建过程
-    // 1. 读取文件
-    // 2. 使用 ANTLR4 解析
-    // 3. Visitor 遍历 ParseTree 生成 IR
+// ================================================================
+// 测试：构造 int main() { return <returnValue>; }
+// ================================================================
+std::unique_ptr<Module> IRBuilder::buildSimpleMain(int64_t returnValue) {
+    auto mod = buildModule();
 
-    // 临时返回空 Module
-    return std::make_unique<Module>();
+    // 创建 main 函数: define i32 @main()
+    Function* mainFunc = module->createFunction(
+        FunctionType::get(IntegerType::I32, {}),
+        "main"
+    );
+
+    // 创建 entry 基本块
+    BasicBlock* entryBB = mainFunc->createBlock("entry");
+    currentFunc = mainFunc;
+    currentBB = entryBB;
+
+    // 创建 ret 指令
+    Value* constVal = createConstantInt(returnValue, 32);
+    Instruction* ret = Instruction::createRet(constVal);
+    currentBB->pushBack(ret);
+
+    return mod;
 }
 
-std::string IRBuilder::newTemp() {
-    return "%t" + std::to_string(tempCount++);
+// ================================================================
+// IR 构建辅助方法
+// ================================================================
+
+Function* IRBuilder::createFunction(const std::string& name, Type* retTy,
+                                     const std::vector<Type*>& paramTys) {
+    auto* ft = FunctionType::get(retTy, paramTys);
+    Function* func = module->createFunction(ft, name);
+    return func;
 }
+
+BasicBlock* IRBuilder::createBlock(const std::string& name) {
+    assert(currentFunc && "no current function");
+    return currentFunc->createBlock(name);
+}
+
+Instruction* IRBuilder::createRet(Value* val) {
+    assert(currentBB && "no current block");
+    auto* inst = Instruction::createRet(val);
+    currentBB->pushBack(inst);
+    return inst;
+}
+
+Instruction* IRBuilder::createRetVoid() {
+    assert(currentBB && "no current block");
+    auto* inst = Instruction::createRet(nullptr);
+    currentBB->pushBack(inst);
+    return inst;
+}
+
+Value* IRBuilder::createConstantInt(int64_t value, unsigned bitWidth) {
+    return ConstantInt::get(IntegerType::get(bitWidth), value);
+}
+
+// ================================================================
+// 符号表
+// ================================================================
 
 void IRBuilder::enterScope() {
-    scopeStack.push_back(std::unordered_map<std::string, Value*>());
+    scopeStack.emplace_back();
 }
 
 void IRBuilder::exitScope() {
-    if (!scopeStack.empty()) {
-        scopeStack.pop_back();
-    }
+    assert(!scopeStack.empty() && "scope stack underflow");
+    scopeStack.pop_back();
 }
 
-void IRBuilder::declareVariable(const std::string& name, Value* value) {
-    if (!scopeStack.empty()) {
-        scopeStack.back()[name] = value;
-    } else {
-        symbolTable[name] = value;
-    }
+void IRBuilder::declare(const std::string& name, Value* val) {
+    assert(!scopeStack.empty() && "no active scope");
+    scopeStack.back()[name] = val;
 }
 
-Value* IRBuilder::lookupVariable(const std::string& name) {
-    // 先从当前作用域查找
+Value* IRBuilder::lookup(const std::string& name) {
     for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
         auto found = it->find(name);
-        if (found != it->end()) {
-            return found->second;
-        }
-    }
-    // 再从全局符号表查找
-    auto found = symbolTable.find(name);
-    if (found != symbolTable.end()) {
-        return found->second;
+        if (found != it->end()) return found->second;
     }
     return nullptr;
 }
 
-void IRBuilder::declareRuntimeFunctions() {
-    // TODO: 声明 SysY2022 运行时库函数
+// ================================================================
+// 工具
+// ================================================================
+
+std::string IRBuilder::newTempName() {
+    return "t" + std::to_string(tempCount++);
 }
 
-}
+} // namespace IR

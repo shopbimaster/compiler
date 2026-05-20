@@ -5,6 +5,7 @@
 - **目标平台**: RISC-V RV64GC (medany)
 - **开发语言**: C++20
 - **目标操作系统**: Ubuntu 24.04 (WSL)
+- **最后更新**: 2026-05-20
 
 ---
 
@@ -26,21 +27,24 @@
 - [x] WSL Ubuntu 26.04 LTS 环境配置
 - [x] Java 17 安装
 - [x] ANTLR4 4.13.1 安装和配置
-- [x] **G4 语法文件验证通过！**（两个测试用例解析成功）
+- [x] **G4 语法文件验证通过！**
 
-### 第 4 阶段: IR 模块开发
-- [x] **IR.h 完整设计与实现**
-  - Type 类型系统（VOID, I1, I8, I16, I32, I64, FLOAT, PTR）
-  - Opcode 操作码定义
-  - Value 基类 + Constant, Register, Instruction, BasicBlock, Function, GlobalVariable
-  - Module 顶层容器
-- [x] **IR 打印功能**（类 LLVM IR 文本输出）
-- [x] **IRBuilder 基础框架**
-- [x] **IR 单元测试**（返回 0 的 main 函数 IR 生成成功）
+### 第 4 阶段: IR 模块核心实现 ✅ [NEW]
+- [x] **Type 系统**: VoidType, LabelType, IntegerType, FloatType, PointerType, ArrayType, FunctionType（全局单例 + 指针恒等比较）
+- [x] **Value 基类**: name, type, uses 列表
+- [x] **Use/User**: Def-Use 链完整性（addOperand/setOperand/dropAllUses 自动维护 uses）
+- [x] **VReg**: SSA 虚拟寄存器
+- [x] **ConstantInt / ConstantFloat**: 常量值缓存
+- [x] **Instruction**: 19 种 opcode + LLVM 风格工厂方法（createRet, createBr, createBinOp, createAlloca, createLoad, createStore, createCall, createGEP, createCmp, createCast, createPhi）
+- [x] **BasicBlock**: 指令容器，terminator 检测
+- [x] **Function**: 基本块容器 + Argument 形参列表
+- [x] **Module**: 顶层 IR 容器，dump() 输出 LLVM IR 格式
+- [x] **IRBuilder**: buildSimpleMain() 端到端构造并输出 `define i32 @main() { ret i32 0 }`
+- [x] **18/18 单元测试全部通过**
 
 ---
 
-## 📂 项目结构（当前）
+## 📁 项目结构 (当前)
 
 ```
 compiler/
@@ -54,8 +58,8 @@ compiler/
 │   │   ├── RegisterAllocator.h
 │   │   └── PeepholeOptimizer.h
 │   ├── ir/
-│   │   ├── IR.h             ✅ 完成！
-│   │   └── IRBuilder.h      ✅ 框架完成！
+│   │   ├── IR.h              ✅ 完整类型系统+指令+BB+Function+Module
+│   │   └── IRBuilder.h       ✅ 符号表+作用域栈+构建辅助
 │   └── utils/
 │       ├── Error.h
 │       └── Logger.h
@@ -63,32 +67,51 @@ compiler/
 │   ├── main.cpp
 │   ├── Compiler.cpp
 │   ├── ir/
-│   │   └── IRBuilder.cpp    ⏳ 待实现
+│   │   ├── IR.cpp            ✅ 完整实现
+│   │   └── IRBuilder.cpp     ✅ 完整实现 + buildSimpleMain()
 │   ├── utils/
 │   │   └── Logger.cpp
 │   └── test-grammar.cpp
 ├── test/
 │   ├── hello.sy
 │   ├── float_test.sy
-│   └── test_ir.cpp          ✅ IR 测试！
-├── test_ir_build/
-│   └── CMakeLists.txt       ✅ IR 测试配置
-└── docs/
-    ├── DEVELOPMENT_PLAN.md  ✅ 开发规划
-    └── PROGRESS_SUMMARY.md  ✅ 本文档
+│   └── test_ir.cpp           ✅ IR 框架 18 项单元测试
+├── CMakeLists.txt             ✅ 独立编译 sysy_ir 库
+├── DEVELOPMENT_PLAN.md
+├── PROGRESS_SUMMARY.md
+├── Token命名对照表.md
+└── [旧文档留档]
 ```
 
 ---
 
-## 📋 Token 命名对照表（规范）
+## 📊 类继承体系
 
-详细见 `Token命名对照表.md`
+```
+Type (全局单例)
+  ├── VoidType
+  ├── LabelType
+  ├── IntegerType (I1, I8, I32)
+  ├── FloatType
+  ├── PointerType (pointee)
+  ├── ArrayType (elem × n)
+  └── FunctionType (ret × params)
 
-**规则**:
-- 关键字全大写: `INT`, `FLOAT`, `VOID`, `CONST`, `IF`, `ELSE` 等
-- 分隔符: `L_PAREN`, `R_PAREN`, `L_BRACE`, `R_BRACE`
-- 运算符: `PLUS`, `MINUS`, `STAR`, `DIV`, `AND`, `OR`
-- 其他: `IDENTIFIER`, `INTCONST`, `FLOATCONST`
+Value (name, type, uses)
+  ├── VReg (SSA temp, 无 operands)
+  ├── Argument (函数形参)
+  ├── BasicBlock (指令容器)
+  ├── Function (基本块容器 + 形参)
+  ├── User (基类: 有 operands)
+  │   ├── Constant
+  │   │   ├── ConstantInt (全局缓存)
+  │   │   ├── ConstantFloat
+  │   │   └── GlobalVariable
+  │   └── Instruction (19 opcodes)
+  └── Module (顶层容器)
+
+Use → { User*, operandNo }  // Def-Use 链
+```
 
 ---
 
@@ -96,19 +119,32 @@ compiler/
 
 | 日期 | 验证项 | 结果 | 备注 |
 |-----|--------|------|------|
-| 2026-05-20 | G4 Lexer | ✅ 成功 | ANTLR4 Java 版本生成 |
-| 2026-05-20 | G4 Parser | ✅ 成功 | ANTLR4 Java 版本生成 |
-| 2026-05-20 | 测试用例 hello.sy | ✅ 成功 | ParseTree 解析通过 |
-| 2026-05-20 | 测试用例 float_test.sy | ✅ 成功 | ParseTree 解析通过 |
-| 2026-05-20 | IR 数据结构设计 | ✅ 完成 | 类层次设计 |
-| 2026-05-20 | IR 打印功能 | ✅ 完成 | LLVM 风格文本输出 |
-| 2026-05-20 | IR 测试用例 | ✅ 完成 | 返回 0 的 main 函数 |
+| 2026-05-20 | G4 Lexer/Parser | ✅ 成功 | ANTLR4 Java 版本生成 |
+| 2026-05-20 | 测试用例 hello.sy / float_test.sy | ✅ 成功 | ParseTree 解析通过 |
+| 2026-05-20 | IR Type System 9 项 | ✅ 全部通过 | 唯一性、toString |
+| 2026-05-20 | Def-Use Chain 2 项 | ✅ 全部通过 | addUse/removeUse |
+| 2026-05-20 | Constants 1 项 | ✅ 通过 | 缓存验证 |
+| 2026-05-20 | Instructions 3 项 | ✅ 全部通过 | createRet/BinOp/Void |
+| 2026-05-20 | Module → Function → BB 1 项 | ✅ 通过 | dump() 输出 |
+| 2026-05-20 | IRBuilder end-to-end 2 项 | ✅ 全部通过 | main 返回 0 / 42 |
 
 ---
 
-## 📝 备注
+## 🛠️ 构建命令
 
-- **已验证的语法**: 完整的 SysY2022 词法和语法
-- **当前状态**: ✅ IR 基础框架已搭建！准备进入后端开发
-- **环境**: WSL Ubuntu 26.04 LTS 可用
-- **下一步**: 继续完善 IRBuilder，或开始后端开发
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+mkdir build && cd build
+cmake ..
+make -j4
+./test_ir    # 运行 IR 单元测试
+```
+
+---
+
+## 📝 当前状态
+
+- **语法解析**: G4 文件完全正确，已验证
+- **IR 框架**: 类型系统 + SSA IR + Module/dump 完整可用
+- **后端**: 代码生成器头文件已定义，待实现
+- **下一步**: 集成 ANTLR4 C++ Runtime → 实现 IRBuilder visitor → 后端代码生成
