@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/CMakeFiles/antlr4-populate"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/CMakeFiles/antlr4-populate.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/CMakeFiles/antlr4-populate-complete.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/antlr4-populate-prefix/src/antlr4-populate-stamp/antlr4-populate-build.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/antlr4-populate-prefix/src/antlr4-populate-stamp/antlr4-populate-configure.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/antlr4-populate-prefix/src/antlr4-populate-stamp/antlr4-populate-download.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/antlr4-populate-prefix/src/antlr4-populate-stamp/antlr4-populate-install.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/antlr4-populate-prefix/src/antlr4-populate-stamp/antlr4-populate-mkdir.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/antlr4-populate-prefix/src/antlr4-populate-stamp/antlr4-populate-patch.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/antlr4-populate-prefix/src/antlr4-populate-stamp/antlr4-populate-test.rule"
+		},
+		{
+			"file" : "/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/antlr4-populate-prefix/src/antlr4-populate-stamp/antlr4-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"antlr4-populate"
+		],
+		"name" : "antlr4-populate"
+	}
+}

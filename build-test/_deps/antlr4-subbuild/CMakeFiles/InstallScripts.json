@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/mnt/d/VSCodeProjects/compiler/build-test/_deps/antlr4-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
