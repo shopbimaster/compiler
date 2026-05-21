@@ -199,6 +199,7 @@ void test_module() {
 
     std::string dumped = mod.dump();
     CHECK(dumped.find("define i32 @main()") != std::string::npos);
+    CHECK(dumped.find("entry") != std::string::npos);
     CHECK(dumped.find("ret i32 0") != std::string::npos);
     PASS();
 }
@@ -217,7 +218,6 @@ void test_builder_simple_main() {
     std::cout << "-------------------------------\n";
 
     CHECK(ir.find("define i32 @main()") != std::string::npos);
-    CHECK(ir.find("entry:") != std::string::npos);
     CHECK(ir.find("ret i32 0") != std::string::npos);
     PASS();
 

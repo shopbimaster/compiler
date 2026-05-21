@@ -6,39 +6,78 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ================================================================
-# IR 模块库（无 ANTLR4 依赖，可独立编译和测试）
+# ANTLR4 C++ Runtime (系统包 libantlr4-runtime-dev)
 # ================================================================
-add_library(sysy_ir STATIC
-    src/ir/IR.cpp
-    src/ir/IRBuilder.cpp
+find_package(antlr4-runtime REQUIRED)
+
+set(ANTLR_GENERATED_DIR ${CMAKE_SOURCE_DIR}/src/antlr)
+
+set(ANTLR_SOURCES
+    ${ANTLR_GENERATED_DIR}/SysY2022Lexer.cpp
+    ${ANTLR_GENERATED_DIR}/SysY2022Parser.cpp
+    ${ANTLR_GENERATED_DIR}/SysY2022ParserBaseVisitor.cpp
+    ${ANTLR_GENERATED_DIR}/SysY2022ParserVisitor.cpp
+    ${ANTLR_GENERATED_DIR}/SysY2022ParserBaseListener.cpp
+    ${ANTLR_GENERATED_DIR}/SysY2022ParserListener.cpp
 )
 
-target_include_directories(sysy_ir PUBLIC include)
+set(ANTLR_INCLUDES
+    ${ANTLR_GENERATED_DIR}
+    ${ANTLR4_INCLUDE_DIR}
+)
 
 # ================================================================
-# IR 模块单元测试
+# IR 核心库（纯数据结构，不依赖 ANTLR）
+# ================================================================
+add_library(sysy_ir_core STATIC
+    src/ir/IR.cpp
+)
+target_include_directories(sysy_ir_core PUBLIC include)
+
+# ================================================================
+# IRBuilder 库（依赖 ANTLR）
+# ================================================================
+add_library(sysy_ir_builder STATIC
+    src/ir/IRBuilder.cpp
+)
+target_include_directories(sysy_ir_builder PUBLIC include ${ANTLR_INCLUDES})
+target_link_libraries(sysy_ir_builder PUBLIC sysy_ir_core antlr4_static)
+
+# ================================================================
+# Compiler 封装库
+# ================================================================
+add_library(sysy_compiler STATIC
+    src/Compiler.cpp
+)
+target_include_directories(sysy_compiler PUBLIC include)
+target_link_libraries(sysy_compiler PUBLIC sysy_ir_builder)
+
+# ================================================================
+# IR 核心单元测试（不依赖 ANTLR 输入，但需 ANTLR 运行时符号）
 # ================================================================
 add_executable(test_ir
     test/test_ir.cpp
+    ${ANTLR_SOURCES}
 )
-
-target_link_libraries(test_ir sysy_ir)
-
-# ================================================================
-# 完整编译器（需要 ANTLR4 —— 待后续集成）
-# ================================================================
-# add_executable(sysyc
-#     src/main.cpp
-#     src/Compiler.cpp
-#     src/utils/Logger.cpp
-#     ${GENERATED_ANTLR_SOURCES}
-# )
-# target_link_libraries(sysyc sysy_ir)
+target_include_directories(test_ir PRIVATE ${ANTLR_INCLUDES})
+target_link_libraries(test_ir sysy_ir_builder antlr4_static)
 
 # ================================================================
-# 生成 ANTLR4 前端（待网络可用时启用）
+# 编译器主入口 sysyc
 # ================================================================
-# find_program(ANTLR4_JAR NAMES antlr-4.13.1-complete.jar antlr4.jar)
-# if(NOT ANTLR4_JAR)
-#     message(WARNING "ANTLR4 JAR not found. Run setup-ubuntu.sh first.")
-# endif()
+add_executable(sysyc
+    src/main.cpp
+    ${ANTLR_SOURCES}
+)
+target_include_directories(sysyc PRIVATE include ${ANTLR_INCLUDES})
+target_link_libraries(sysyc sysy_compiler antlr4_static)
+
+# ================================================================
+# 集成测试
+# ================================================================
+add_executable(test_integration
+    test/test_integration.cpp
+    ${ANTLR_SOURCES}
+)
+target_include_directories(test_integration PRIVATE include ${ANTLR_INCLUDES})
+target_link_libraries(test_integration sysy_compiler antlr4_static)

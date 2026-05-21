@@ -22,25 +22,11 @@ sysyc
 *.out
 *.app
 
-# Generated ANTLR files (anywhere in the project)
+# Generated ANTLR files
+src/antlr/
 *.interp
 *.tokens
-SysY2022Lexer.cpp
-SysY2022Lexer.h
-SysY2022Parser.cpp
-SysY2022Parser.h
-SysY2022ParserBaseListener.cpp
-SysY2022ParserBaseListener.h
-SysY2022ParserListener.cpp
-SysY2022ParserListener.h
-SysY2022ParserBaseVisitor.cpp
-SysY2022ParserBaseVisitor.h
-SysY2022ParserVisitor.cpp
-SysY2022ParserVisitor.h
-*.class  # Java class files
-grammar/*.java
-grammar/*.tokens
-grammar/*.interp
+*.class
 
 # Compiled assembly
 *.s

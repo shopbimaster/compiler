@@ -1,25 +1,26 @@
 #include "Compiler.h"
+#include <fstream>
+#include <iostream>
 
-// 临时实现 - 待完善
+namespace IR {
 
-Compiler::Compiler(const std::string& in, const std::string& out)
-    : inputFile(in), outputFile(out)
-    , errorReporter(std::make_unique<ErrorReporter>(in)) {
+std::unique_ptr<Module> Compiler::compile(const std::string& sourcePath) {
+    IRBuilder builder;
+    return builder.compile(sourcePath);
 }
 
-bool Compiler::compile() {
-    Logger::getInstance().info("Starting compilation...");
-
-    // TODO: 实现完整的编译流程
-    // 1. Parse
-    // 2. Generate IR
-    // 3. Generate Assembly
-
-    return runCompilePipeline();
+void Compiler::emitIR(const std::string& sourcePath, std::ostream& out) {
+    auto mod = compile(sourcePath);
+    out << mod->dump();
 }
 
-bool Compiler::runCompilePipeline() {
-    // 临时返回成功
-    Logger::getInstance().info("Compile pipeline (placeholder)");
-    return true;
+void Compiler::emitIRToFile(const std::string& sourcePath, const std::string& outputPath) {
+    auto mod = compile(sourcePath);
+    std::ofstream ofs(outputPath);
+    if (!ofs.is_open()) {
+        throw std::runtime_error("Cannot open output file: " + outputPath);
+    }
+    ofs << mod->dump();
 }
+
+} // namespace IR

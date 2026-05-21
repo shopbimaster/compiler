@@ -1,4 +1,4 @@
-# SysY2022 编译器 — WSL 单元测试操作手册
+# SysY2022 编译器 — WSL 测试操作手册
 
 ## 前置条件
 
@@ -9,108 +9,32 @@
 > **如果 WSL 中尚需安装依赖，执行以下命令（仅首次）：**
 > ```bash
 > sudo apt-get update
-> sudo apt-get install -y build-essential cmake openjdk-17-jdk-headless
-> sudo wget -O /usr/local/lib/antlr-4.13.1-complete.jar \
->   https://www.antlr.org/download/antlr-4.13.1-complete.jar
-> sudo tee /usr/local/bin/antlr4 <<'EOF'
-> #!/bin/bash
-> exec java -jar /usr/local/lib/antlr-4.13.1-complete.jar "$@"
-> EOF
-> sudo chmod +x /usr/local/bin/antlr4
+> sudo apt-get install -y build-essential cmake openjdk-17-jdk-headless libantlr4-runtime-dev uuid-dev
 > ```
 
 ---
 
-## 一、前端 G4 语法文件测试
-
-### 第 1 步：进入 WSL Ubuntu 并定位项目
+## 一、构建项目
 
 ```bash
-# 在 PowerShell 中进入 WSL（或在现有 WSL 终端执行）
+# 在 PowerShell 中进入 WSL
 wsl -d Ubuntu
 ```
 
 ```bash
-# 定位到项目目录
+# 定位到项目目录并构建
 cd /mnt/d/VSCodeProjects/compiler
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
 ```
-
-### 第 2 步：用 ANTLR4 生成 Java 版本的分析器
-
-```bash
-# 创建临时输出目录
-mkdir -p /tmp/sysy-test
-```
-
-```bash
-# ⚠️ 关键：Lexer 和 Parser 必须用同一条命令生成到同一目录
-# Parser 依赖 Lexer 的 .tokens 文件，分开执行会导致 "cannot find tokens file" 报错
-antlr4 -Dlanguage=Java -o /tmp/sysy-test grammar/SysY2022Lexer.g4 grammar/SysY2022Parser.g4
-```
-
-### 第 3 步：编译 Java 分析器
-
-```bash
-# 使用 javac 编译生成的 .java 文件
-javac -cp ".:/usr/local/lib/antlr-4.13.1-complete.jar" /tmp/sysy-test/*.java
-```
-
-### 第 4 步：用 TestRig 测试真实用例
-
-```bash
-# 设置 CLASSPATH 包含 ANTLR JAR 和生成的类文件
-export CLASSPATH="/tmp/sysy-test:/usr/local/lib/antlr-4.13.1-complete.jar"
-```
-
-```bash
-# 测试 hello.sy（无输出 = 解析成功；有报错信息 = 语法错误）
-java org.antlr.v4.gui.TestRig SysY2022 compilationUnit test/hello.sy
-```
-
-```bash
-# 测试 float_test.sy
-java org.antlr.v4.gui.TestRig SysY2022 compilationUnit test/float_test.sy
-```
-
-> **期望结果**：两条命令均无报错，终端静默返回。表示 `hello.sy` 和 `float_test.sy` 的语法完全正确。
 
 ---
 
-## 二、IR 模块单元测试
-
-### 第 5 步：回到项目目录并创建构建目录
+## 二、IR 单元测试（18 项）
 
 ```bash
-cd /mnt/d/VSCodeProjects/compiler
-```
-
-```bash
-# 创建独立的构建目录（避免污染源码）
-mkdir -p build && cd build
-```
-
-### 第 6 步：CMake 配置
-
-```bash
-# 生成 Makefile（C++ 标准为 C++20）
-cmake ..
-```
-
-> **期望输出**：末尾显示 `Build files have been written to: .../build`
-
-### 第 7 步：编译
-
-```bash
-# 4 线程并行编译 sysy_ir 库 + 测试可执行文件
-make -j4
-```
-
-> **期望输出**：依次编译 `IR.cpp` → `IRBuilder.cpp` → `libsysy_ir.a` → `test_ir`，无 error。
-
-### 第 8 步：运行 IR 单元测试
-
-```bash
-# 执行全部 18 项单元测试
+cd /mnt/d/VSCodeProjects/compiler/build
 ./test_ir
 ```
 
@@ -123,49 +47,115 @@ make -j4
 > [Instructions]      3/3  PASSED
 > [Module/BB/Func]    1/1  PASSED
 > [IRBuilder E2E]     2/2  PASSED
-> 
-> -------- Generated IR --------
-> define i32 @main() {
-> entry:
->   ret i32 0
-> }
-> -------------------------------
-> 
 > === 结果: 18 passed, 0 failed ===
 > ```
 
-### 第 9 步（可选）：清理构建产物
+---
+
+## 三、.sy → IR 集成测试（7 项）
 
 ```bash
-cd /mnt/d/VSCodeProjects/compiler && rm -rf build
+cd /mnt/d/VSCodeProjects/compiler/build
+./test_integration
+```
+
+> **期望输出**：
+> ```
+> === 集成测试: .sy → IR ===
+>   TEST: int main() { return 0; } ... PASSED
+>   TEST: int main() { return 1+2*3; } ... PASSED
+>   TEST: int main() { int a; a = 42; return a; } ... PASSED
+>   TEST: if-else 分支 ... PASSED
+>   TEST: while 循环 ... PASSED
+>   TEST: 函数调用 ... PASSED
+>   TEST: 语法错误检测（缺少分号） ... PASSED
+> === 结果: 7 passed, 0 failed ===
+> ```
+
+---
+
+## 四、sysyc 命令行工具测试
+
+```bash
+cd /mnt/d/VSCodeProjects/compiler/build
+
+# 1. 最小程序
+./sysyc ../test/hello.sy
+# 期望: define i32 @main() { ret i32 0 }
+
+# 2. 算术表达式
+./sysyc ../test/arithmetic.sy
+# 期望: mul + add + ret
+
+# 3. 变量声明与赋值
+./sysyc ../test/variable.sy
+# 期望: alloca + store + load + ret
+
+# 4. 条件分支 if-else
+./sysyc ../test/ifelse.sy
+# 期望: icmp + br + then/else + ret
+
+# 5. while 循环
+./sysyc ../test/while_test.sy
+# 期望: while_cond/while_body/while_end + br
+
+# 6. 函数调用
+./sysyc ../test/func_call.sy
+# 期望: define add + define main + call
+
+# 7. 输出到文件
+./sysyc ../test/hello.sy -o output.ir
+cat output.ir
 ```
 
 ---
 
-## 三、一键快速测试脚本
+## 五、前端 G4 语法文件独立验证
 
-将以下内容复制到 WSL 终端中执行，一次性跑完前端语法测试 + IR 单元测试：
+> 仅在修改 G4 文件后需要执行
 
 ```bash
 cd /mnt/d/VSCodeProjects/compiler
-
-echo "========== 1/2: 前端 G4 语法测试 =========="
 mkdir -p /tmp/sysy-test
-antlr4 -Dlanguage=Java -o /tmp/sysy-test grammar/SysY2022Lexer.g4 grammar/SysY2022Parser.g4 \
-  && javac -cp ".:/usr/local/lib/antlr-4.13.1-complete.jar" /tmp/sysy-test/*.java \
-  && export CLASSPATH="/tmp/sysy-test:/usr/local/lib/antlr-4.13.1-complete.jar" \
-  && java org.antlr.v4.gui.TestRig SysY2022 compilationUnit test/hello.sy \
-  && java org.antlr.v4.gui.TestRig SysY2022 compilationUnit test/float_test.sy \
-  && echo "✅ G4 语法测试全部通过！"
 
-echo ""
-echo "========== 2/2: IR 模块单元测试 =========="
-rm -rf build && mkdir build && cd build \
-  && cmake .. && make -j4 && ./test_ir \
-  && echo "✅ IR 单元测试全部通过！"
+# 生成 Java 版本（Lexer + Parser 必须同一命令）
+java -jar lib/antlr-4.10.1.jar -Dlanguage=Java -o /tmp/sysy-test \
+  grammar/SysY2022Lexer.g4 grammar/SysY2022Parser.g4
 
-echo ""
-echo "🎉 全量测试完成！"
+# 编译
+javac -cp ".:lib/antlr-4.10.1.jar" /tmp/sysy-test/*.java
+
+# 测试
+export CLASSPATH="/tmp/sysy-test:lib/antlr-4.10.1.jar"
+java org.antlr.v4.gui.TestRig SysY2022 compilationUnit test/hello.sy
+# 期望: 无报错（静默返回）
+```
+
+---
+
+## 六、ANTLR C++ 文件重新生成
+
+> 修改 G4 文件后需要重新生成 C++ 代码
+
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+java -jar lib/antlr-4.10.1.jar -Dlanguage=Cpp -no-listener -visitor \
+  -o src/antlr grammar/SysY2022Lexer.g4 grammar/SysY2022Parser.g4
+
+# 然后重新构建
+cd build && cmake .. && make -j$(nproc)
+```
+
+---
+
+## 七、一键全量测试
+
+```bash
+cd /mnt/d/VSCodeProjects/compiler/build
+cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) && \
+./test_ir && \
+./test_integration && \
+echo "🎉 全量测试全部通过！(25/25)"
 ```
 
 ---
@@ -175,10 +165,16 @@ echo "🎉 全量测试完成！"
 | 模块 | 测试项 | 通过标志 |
 |-----|--------|---------|
 | 前端 G4 | `hello.sy` 解析 | 终端无报错 |
-| 前端 G4 | `float_test.sy` 解析 | 终端无报错 |
 | IR Type System | 唯一性、toString | 9/9 PASSED |
 | IR Def-Use | 引用链维护 | 2/2 PASSED |
 | IR Constants | 缓存验证 | 1/1 PASSED |
 | IR Instructions | 创建方法 | 3/3 PASSED |
 | IR Module | dump() 输出 | 1/1 PASSED |
-| IRBuilder | main→ret 端到端 | 2/2 PASSED |
+| IRBuilder E2E | main→ret | 2/2 PASSED |
+| 集成: hello.sy | 最小 main | IR 输出正确 |
+| 集成: arithmetic.sy | 表达式 | mul+add+ret |
+| 集成: variable.sy | 变量 | alloca+store+load |
+| 集成: ifelse.sy | 分支 | icmp+br+then/else |
+| 集成: while_test.sy | 循环 | while_cond/body/end |
+| 集成: func_call.sy | 函数调用 | define+call |
+| 集成: bad.sy | 错误检测 | 抛出异常 |

@@ -23,24 +23,34 @@
 
 ---
 
-## 第 2 阶段: IRBuilder Visitor 集成 ANTLR4（下一步）
+## ✅ 第 2 阶段: IRBuilder Visitor 集成 ANTLR4（已完成）
 
-**优先级: 🔴 高** | **状态: ⏳ 待开始**
+**完成日期**: 2026-05-21 | **测试**: 25/25 全部通过 (18 单元 + 7 集成)
 
 | 任务 | 文件 | 状态 |
 |-----|------|------|
-| 2.1 安装 ANTLR4 C++ Runtime | 环境 | ⏳ |
-| 2.2 生成 C++ 版 Lexer/Parser | `build/generated/` | ⏳ |
-| 2.3 IRBuilder 继承 SysY2022ParserBaseVisitor | `IRBuilder.h` | ⏳ |
-| 2.4 实现 visitCompUnit → Module | `IRBuilder.cpp` | ⏳ |
-| 2.5 实现 visitFuncDef → Function + BB | `IRBuilder.cpp` | ⏳ |
-| 2.6 实现 visitExp → Value* (表达式翻译) | `IRBuilder.cpp` | ⏳ |
-| 2.7 实现 visitStmt → (语句翻译) | `IRBuilder.cpp` | ⏳ |
-| 2.8 集成测试：编译 hello.sy | `test/` | ⏳ |
+| 2.1 安装 ANTLR4 C++ Runtime | 环境 | ✅ |
+| 2.2 生成 C++ 版 Lexer/Parser/Visitor | `src/antlr/` | ✅ |
+| 2.3 IRBuilder 继承 SysY2022ParserBaseVisitor | `IRBuilder.h` | ✅ |
+| 2.4 实现 visitCompUnit → Module | `IRBuilder.cpp` | ✅ |
+| 2.5 实现 visitFuncDef → Function + BB + 形参 | `IRBuilder.cpp` | ✅ |
+| 2.6 实现 visitExp → Value*（左递归表达式/短路求值） | `IRBuilder.cpp` | ✅ |
+| 2.7 实现 visitStmt（赋值/if-else/while/return） | `IRBuilder.cpp` | ✅ |
+| 2.8 Compiler 封装 + 命令行入口 sysyc | `Compiler.h/cpp`, `main.cpp` | ✅ |
+| 2.9 集成测试：7 项编译用例 | `test/test_integration.cpp` | ✅ 7/7 通过 |
+
+**已支持的语言特性**:
+- 变量声明与赋值 (int/float)
+- 算术表达式 (+ - * / %)
+- 比较表达式 (< > <= >= == !=)
+- 逻辑表达式 (&& || 短路求值)
+- 条件分支 (if-else)
+- 循环 (while)
+- 函数定义与调用（含形参传递）
 
 ---
 
-## 第 3 阶段: 后端代码生成
+## 第 3 阶段: 后端代码生成（下一步）
 
 **优先级: 🔴 高** | **状态: ⏳ 待开始**
 
@@ -60,17 +70,17 @@
 
 | 任务 | 状态 |
 |-----|------|
-| 4.1 Compiler 类集成 | ⏳ |
-| 4.2 命令行参数解析 | ⏳ |
+| 4.1 后端整合到 sysyc 管线 | ⏳ |
+| 4.2 在 RISC-V FPGA (BOOM) 上运行 | ⏳ |
 | 4.3 基准测试验证 | ⏳ |
 
 ---
 
 ## 🎯 近期目标
 
-1. **安装 ANTLR4 C++ Runtime**（解决网络问题后用 apt 或手动编译）
-2. **完成 IRBuilder Visitor**（继承 BaseVisitor，遍历 ParseTree 生成 IR）
-3. **后端代码生成**（先做最简单的 ret/常量，逐步扩展）
+1. **实现后端代码生成**（IR → RISC-V RV64GC 汇编）
+2. **寄存器分配**（虚拟寄存器 → 物理寄存器映射）
+3. **FPGA 上板验证**
 
 ---
 
@@ -78,7 +88,6 @@
 
 | 主题 | 优先级 | 用途 |
 |-----|--------|------|
-| ANTLR4 C++ Visitor 模式 | 🔴 高 | IRBuilder 实现 |
 | RISC-V RV64GC 指令集 | 🔴 高 | 后端代码生成 |
 | RISC-V 调用约定 | 🔴 高 | 函数序言/尾声 |
 | 寄存器分配 (线性扫描) | 🟡 中 | 虚拟寄存器 → 物理寄存器 |
@@ -88,6 +97,7 @@
 
 ## 📝 备注
 
-- **当前日期**: 2026-05-20
+- **当前日期**: 2026-05-21
 - **IR 框架**: 18 项测试通过，完整可用
-- **build-* 和临时文件**: 已配置 .gitignore 自动忽略
+- **前端→IR 管线**: 7 项集成测试通过，sysyc 可编译 .sy 到 IR
+- **build-* 和 src/antlr/**: 已配置 .gitignore 自动忽略
