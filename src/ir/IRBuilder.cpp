@@ -54,6 +54,8 @@ std::unique_ptr<Module> IRBuilder::compile(const std::string& sourcePath) {
 // ================================================================
 std::any IRBuilder::visitCompilationUnit(SysY2022Parser::CompilationUnitContext* ctx) {
     module = std::make_unique<Module>();
+    enterScope();
+    registerBuiltinFunctions();
 
     for (auto* child : ctx->children) {
         if (dynamic_cast<SysY2022Parser::DeclContext*>(child)) {
@@ -63,6 +65,7 @@ std::any IRBuilder::visitCompilationUnit(SysY2022Parser::CompilationUnitContext*
         }
     }
 
+    exitScope();
     return {};
 }
 
@@ -83,16 +86,53 @@ std::any IRBuilder::visitConstDecl(SysY2022Parser::ConstDeclContext* ctx) {
     Type* baseType = std::any_cast<Type*>(visitBType(ctx->bType()));
     for (auto* defCtx : ctx->constDef()) {
         std::string name = defCtx->IDENTIFIER()->getText();
-        Value* initVal = valFrom(visitConstInitVal(defCtx->constInitVal()));
 
-        auto* alloca = Instruction::createAlloca(baseType, name);
-        currentBB->pushBack(alloca);
-
-        if (initVal) {
-            auto* store = Instruction::createStore(initVal, alloca);
-            currentBB->pushBack(store);
+        // Compute array dimensions
+        Type* varType = baseType;
+        std::vector<int> dimensions;
+        for (size_t i = 0; i < defCtx->L_BRACKET().size(); ++i) {
+            Value* dimVal = valFrom(visitConstExp(defCtx->constExp(i)));
+            int dim = static_cast<int>(static_cast<ConstantInt*>(dimVal)->getValue());
+            dimensions.push_back(dim);
         }
-        declare(name, alloca);
+        for (auto it = dimensions.rbegin(); it != dimensions.rend(); ++it) {
+            varType = ArrayType::get(varType, *it);
+        }
+
+        if (currentFunc == nullptr) {
+            // ===== 全局常量 =====
+            Constant* init = nullptr;
+            if (defCtx->constInitVal()->constExp()) {
+                Value* iv = valFrom(visitConstExp(defCtx->constInitVal()->constExp()));
+                init = dynamic_cast<Constant*>(iv);
+            }
+            auto* gv = module->createGlobalVariable(
+                PointerType::get(varType), name, true, init);
+            declare(name, gv);
+        } else {
+            // ===== 局部常量 =====
+            auto* alloca = Instruction::createAlloca(varType, name);
+            currentBB->pushBack(alloca);
+
+            auto* initCtx = defCtx->constInitVal();
+            if (initCtx->constExp()) {
+                Value* initVal = valFrom(visitConstExp(initCtx->constExp()));
+                if (initVal) {
+                    auto* store = Instruction::createStore(initVal, alloca);
+                    currentBB->pushBack(store);
+                }
+            } else if (!initCtx->constInitVal().empty()) {
+                // Aggregate init for const array — emit GEP+store recursively
+                auto initChildren = initCtx->constInitVal();
+                std::vector<SysY2022Parser::ConstInitValContext*> childVec(
+                    initChildren.begin(), initChildren.end());
+                std::vector<Value*> baseIndices;
+                baseIndices.push_back(ConstantInt::get(IntegerType::I32, 0));
+                int flatIdx = 0;
+                emitInitStoresConst(varType, alloca, baseIndices, childVec, flatIdx);
+            }
+            declare(name, alloca);
+        }
     }
     return {};
 }
@@ -112,23 +152,68 @@ std::any IRBuilder::visitVarDecl(SysY2022Parser::VarDeclContext* ctx) {
     for (auto* defCtx : ctx->varDef()) {
         std::string name = defCtx->IDENTIFIER()->getText();
 
-        auto* alloca = Instruction::createAlloca(baseType, name);
-        currentBB->pushBack(alloca);
-
-        if (defCtx->ASSIGN()) {
-            Value* init = valFrom(visitInitVal(defCtx->initVal()));
-            if (init) {
-                auto* store = Instruction::createStore(init, alloca);
-                currentBB->pushBack(store);
-            }
+        // Compute array dimensions (if any)
+        Type* varType = baseType;
+        std::vector<int> dimensions;
+        for (size_t i = 0; i < defCtx->L_BRACKET().size(); ++i) {
+            Value* dimVal = valFrom(visitConstExp(defCtx->constExp(i)));
+            int dim = static_cast<int>(static_cast<ConstantInt*>(dimVal)->getValue());
+            dimensions.push_back(dim);
         }
-        declare(name, alloca);
+        // Wrap from right to left: int a[2][3] → ArrayType(ArrayType(I32, 3), 2)
+        for (auto it = dimensions.rbegin(); it != dimensions.rend(); ++it) {
+            varType = ArrayType::get(varType, *it);
+        }
+
+        if (currentFunc == nullptr) {
+            // ===== 全局变量 =====
+            Constant* init = nullptr;
+            if (defCtx->ASSIGN() && defCtx->initVal()) {
+                auto* initCtx = defCtx->initVal();
+                if (initCtx->exp()) {
+                    Value* iv = constEval(initCtx->exp()->addExp());
+                    if (!iv) {
+                        iv = valFrom(visitInitVal(defCtx->initVal()));
+                    }
+                    init = dynamic_cast<Constant*>(iv);
+                }
+            }
+            auto* gv = module->createGlobalVariable(
+                PointerType::get(varType), name, false, init);
+            declare(name, gv);
+        } else {
+            // ===== 局部变量 =====
+            auto* alloca = Instruction::createAlloca(varType, name);
+            currentBB->pushBack(alloca);
+
+            if (defCtx->ASSIGN() && defCtx->initVal()) {
+                auto* initCtx = defCtx->initVal();
+                if (initCtx->exp()) {
+                    // Scalar init
+                    Value* init = valFrom(visitExp(initCtx->exp()));
+                    if (init) {
+                        auto* store = Instruction::createStore(init, alloca);
+                        currentBB->pushBack(store);
+                    }
+                } else {
+                    // Aggregate init: emit GEP+store recursively
+                    auto children = initCtx->initVal();
+                    std::vector<SysY2022Parser::InitValContext*> childVec(
+                        children.begin(), children.end());
+                    std::vector<Value*> baseIndices;
+                    baseIndices.push_back(ConstantInt::get(IntegerType::I32, 0));
+                    int flatIdx = 0;
+                    emitInitStoresVar(varType, alloca, baseIndices, childVec, flatIdx);
+                }
+            }
+            declare(name, alloca);
+        }
     }
     return {};
 }
 
 // ================================================================
-// varDef: IDENTIFIER (L_BRACKET constExp R_BRACKET)* [ASSIGN initVal]
+// funcDef: funcType IDENTIFIER (L_BRACKET constExp R_BRACKET)* [ASSIGN initVal]
 // ================================================================
 std::any IRBuilder::visitVarDef(SysY2022Parser::VarDefContext* ctx) {
     return {}; // handled in visitVarDecl for simplicity
@@ -155,12 +240,17 @@ std::any IRBuilder::visitFuncDef(SysY2022Parser::FuncDefContext* ctx) {
     if (ctx->funcFParams()) {
         const auto& paramList = ctx->funcFParams()->funcFParam();
         for (auto* param : paramList) {
-            paramTypes.push_back(std::any_cast<Type*>(visitBType(param->bType())));
+            Type* pType = std::any_cast<Type*>(visitBType(param->bType()));
+            if (!param->L_BRACKET().empty()) {
+                pType = PointerType::get(pType);
+            }
+            paramTypes.push_back(pType);
         }
     }
 
     auto* ft = FunctionType::get(retType, paramTypes);
     Function* func = module->createFunction(ft, name);
+    funcTypeTable[name] = ft;
     currentFunc = func;
 
     enterScope();
@@ -172,6 +262,9 @@ std::any IRBuilder::visitFuncDef(SysY2022Parser::FuncDefContext* ctx) {
             auto* param = paramList[i];
             std::string pName = param->IDENTIFIER()->getText();
             Type* pType = std::any_cast<Type*>(visitBType(param->bType()));
+            if (!param->L_BRACKET().empty()) {
+                pType = PointerType::get(pType);
+            }
 
             auto* alloca = Instruction::createAlloca(pType, pName);
             if (!currentFunc->getEntryBlock()) {
@@ -351,6 +444,8 @@ std::any IRBuilder::visitStmt(SysY2022Parser::StmtContext* ctx) {
         auto* condBr = Instruction::createCondBr(condVal, bodyBB, endBB);
         currentBB->pushBack(condBr);
 
+        loopStack.push_back({condBB, endBB});
+
         currentBB = bodyBB;
         if (ctx->stmt(0)->block()) {
             auto* bCtx = ctx->stmt(0)->block();
@@ -365,13 +460,23 @@ std::any IRBuilder::visitStmt(SysY2022Parser::StmtContext* ctx) {
             currentBB->pushBack(loopBr);
         }
 
+        loopStack.pop_back();
         currentBB = endBB;
         return {};
     }
 
     // BREAK SEMICOLON | CONTINUE SEMICOLON
     if (ctx->BREAK() || ctx->CONTINUE()) {
-        // TODO: break/continue requires tracking loop exit blocks
+        if (loopStack.empty()) {
+            throw std::runtime_error("break/continue not in loop");
+        }
+        if (ctx->BREAK()) {
+            auto* br = Instruction::createBr(loopStack.back().breakBB);
+            currentBB->pushBack(br);
+        } else {
+            auto* br = Instruction::createBr(loopStack.back().continueBB);
+            currentBB->pushBack(br);
+        }
         return {};
     }
 
@@ -398,22 +503,38 @@ std::any IRBuilder::visitCond(SysY2022Parser::CondContext* ctx) {
 // ================================================================
 std::any IRBuilder::visitLVal(SysY2022Parser::LValContext* ctx) {
     std::string name = ctx->IDENTIFIER()->getText();
-    Value* alloca = lookup(name);
-    if (!alloca) {
+    Value* ptr = lookup(name);
+    if (!ptr) {
         throw std::runtime_error("Undefined variable: " + name);
     }
 
-    // For now: return pointer directly (store destination) or load (read)
-    // When used in expression context, the caller should load
-    // We use a flag: return the alloca pointer, loading is caller's job
-
     if (ctx->L_BRACKET().empty()) {
-        // Simple variable: return alloca pointer
-        return std::any(alloca);
+        return std::any(ptr);
     }
 
-    // Array access TBD
-    return std::any(alloca);
+    // Array access: compute GETELEMENTPTR for each index
+    PointerType* ptrTy = static_cast<PointerType*>(ptr->getType());
+    Type* pointee = ptrTy->getPointeeType();
+
+    // If this is an array parameter (alloca stores a pointer), load it first
+    if (pointee->isPointer()) {
+        auto* paramLoad = Instruction::createLoad(pointee, ptr, newTempName());
+        currentBB->pushBack(paramLoad);
+        ptr = paramLoad;
+        pointee = static_cast<PointerType*>(ptr->getType())->getPointeeType();
+    }
+
+    std::vector<Value*> indices;
+    indices.push_back(ConstantInt::get(IntegerType::I32, 0));
+
+    for (size_t i = 0; i < ctx->L_BRACKET().size(); ++i) {
+        Value* idx = valFrom(visitExp(ctx->exp(i)));
+        indices.push_back(idx);
+    }
+
+    auto* gep = Instruction::createGetElementPtr(pointee, ptr, indices, newTempName());
+    currentBB->pushBack(gep);
+    return std::any(static_cast<Value*>(gep));
 }
 
 // ================================================================
@@ -426,12 +547,18 @@ std::any IRBuilder::visitPrimaryExp(SysY2022Parser::PrimaryExpContext* ctx) {
     if (ctx->lVal()) {
         Value* ptr = valFrom(visitLVal(ctx->lVal()));
         if (ptr) {
-            // Load from alloca
-            auto* load = Instruction::createLoad(
-                static_cast<PointerType*>(ptr->getType())->getPointeeType(),
-                ptr,
-                newTempName()
-            );
+            PointerType* ptrTy = static_cast<PointerType*>(ptr->getType());
+            Type* pointee = ptrTy->getPointeeType();
+            if (pointee->isArray()) {
+                // Array decay to pointer to first element
+                std::vector<Value*> indices;
+                indices.push_back(ConstantInt::get(IntegerType::I32, 0));
+                indices.push_back(ConstantInt::get(IntegerType::I32, 0));
+                auto* gep = Instruction::createGetElementPtr(pointee, ptr, indices, newTempName());
+                currentBB->pushBack(gep);
+                return std::any(static_cast<Value*>(gep));
+            }
+            auto* load = Instruction::createLoad(pointee, ptr, newTempName());
             currentBB->pushBack(load);
             return std::any(static_cast<Value*>(load));
         }
@@ -481,24 +608,35 @@ std::any IRBuilder::visitUnaryExp(SysY2022Parser::UnaryExpContext* ctx) {
     if (ctx->IDENTIFIER() && !ctx->unaryOp()) {
         std::string calleeName = ctx->IDENTIFIER()->getText();
 
-        // Collect arguments
         std::vector<Value*> args;
+        std::vector<Type*> paramTypes;
         if (ctx->funcRParams()) {
             const auto& expList = ctx->funcRParams()->exp();
             for (auto* e : expList) {
                 Value* arg = valFrom(visitExp(e));
-                if (arg) args.push_back(arg);
+                if (arg) {
+                    args.push_back(arg);
+                    paramTypes.push_back(arg->getType());
+                }
             }
         }
 
-        // Build param types for FunctionType
-        std::vector<Type*> paramTypes;
-        for (auto* a : args) paramTypes.push_back(a->getType());
+        FunctionType* ft = nullptr;
+        auto it = funcTypeTable.find(calleeName);
+        if (it != funcTypeTable.end()) {
+            ft = it->second;
+        } else {
+            ft = FunctionType::get(IntegerType::I32, paramTypes);
+            funcTypeTable[calleeName] = ft;
+        }
 
-        // Create or find function
-        // For now: assume i32 return, later lookup from module
-        auto* ft = FunctionType::get(IntegerType::I32, paramTypes);
         Function* callee = module->createFunction(ft, calleeName, true);
+
+        if (ft->getReturnType()->isVoid()) {
+            auto* call = Instruction::createCall(ft, callee, args, "");
+            currentBB->pushBack(call);
+            return std::any(static_cast<Value*>(nullptr));
+        }
 
         auto* call = Instruction::createCall(ft, callee, args, newTempName());
         currentBB->pushBack(call);
@@ -554,7 +692,7 @@ std::any IRBuilder::visitMulExp(SysY2022Parser::MulExpContext* ctx) {
         else if (opText == "/") op = Instruction::Opcode::SDIV;
         else                    op = Instruction::Opcode::SREM;
 
-        auto* inst = Instruction::createBinOp(op, IntegerType::I32, newTempName(), left, rightVal);
+        auto* inst = Instruction::createBinOp(op, left->getType(), newTempName(), left, rightVal);
         currentBB->pushBack(inst);
         result = std::any(static_cast<Value*>(inst));
         i += 2;
@@ -582,12 +720,21 @@ std::any IRBuilder::visitAddExp(SysY2022Parser::AddExpContext* ctx) {
         }
         auto op = (opText == "+") ? Instruction::Opcode::ADD : Instruction::Opcode::SUB;
 
-        auto* inst = Instruction::createBinOp(op, IntegerType::I32, newTempName(), left, rightVal);
+        auto* inst = Instruction::createBinOp(op, left->getType(), newTempName(), left, rightVal);
         currentBB->pushBack(inst);
         result = std::any(static_cast<Value*>(inst));
         i += 2;
     }
     return result;
+}
+
+// ================================================================
+// constExp: exp (in constant context) → addExp
+// ================================================================
+std::any IRBuilder::visitConstExp(SysY2022Parser::ConstExpContext* ctx) {
+    Value* folded = constEval(ctx->addExp());
+    if (folded) return std::any(folded);
+    return visitAddExp(ctx->addExp());
 }
 
 // ================================================================
@@ -615,7 +762,7 @@ std::any IRBuilder::visitRelExp(SysY2022Parser::RelExpContext* ctx) {
         else                      op = Instruction::Opcode::ICMP;
         // Note: condition code differentiation for < > <= >= handled in codegen
 
-        auto* inst = Instruction::createBinOp(op, IntegerType::I32, newTempName(), left, rightVal);
+        auto* inst = Instruction::createBinOp(op, left->getType(), newTempName(), left, rightVal);
         currentBB->pushBack(inst);
         result = std::any(static_cast<Value*>(inst));
         i += 2;
@@ -638,7 +785,7 @@ std::any IRBuilder::visitEqExp(SysY2022Parser::EqExpContext* ctx) {
         Value* rightVal = valFrom(right);
 
         auto* inst = Instruction::createBinOp(
-            Instruction::Opcode::ICMP, IntegerType::I32, newTempName(), left, rightVal);
+            Instruction::Opcode::ICMP, left->getType(), newTempName(), left, rightVal);
         currentBB->pushBack(inst);
         result = std::any(static_cast<Value*>(inst));
         i += 2;
@@ -795,6 +942,434 @@ Type* IRBuilder::toIRType(const std::string& sysyType) {
     if (sysyType == "float") return FloatType::get();
     if (sysyType == "void")  return VoidType::get();
     return IntegerType::I32;
+}
+
+// ================================================================
+// 内置运行时函数注册（SysY I/O 函数）
+// ================================================================
+void IRBuilder::registerBuiltinFunctions() {
+    auto* i32 = IntegerType::I32;
+    auto* flt = FloatType::get();
+    auto* vd  = VoidType::get();
+
+    // int getint()
+    funcTypeTable["getint"] = FunctionType::get(i32, {});
+    module->createFunction(FunctionType::get(i32, {}), "getint", true);
+
+    // int getch()
+    funcTypeTable["getch"] = FunctionType::get(i32, {});
+    module->createFunction(FunctionType::get(i32, {}), "getch", true);
+
+    // int getarray(int a[])
+    funcTypeTable["getarray"] = FunctionType::get(i32, {PointerType::get(i32)});
+    module->createFunction(FunctionType::get(i32, {PointerType::get(i32)}), "getarray", true);
+
+    // float getfloat()
+    funcTypeTable["getfloat"] = FunctionType::get(flt, {});
+    module->createFunction(FunctionType::get(flt, {}), "getfloat", true);
+
+    // int getfarray(float a[])
+    funcTypeTable["getfarray"] = FunctionType::get(i32, {PointerType::get(flt)});
+    module->createFunction(FunctionType::get(i32, {PointerType::get(flt)}), "getfarray", true);
+
+    // void putint(int x)
+    funcTypeTable["putint"] = FunctionType::get(vd, {i32});
+    module->createFunction(FunctionType::get(vd, {i32}), "putint", true);
+
+    // void putch(int x)
+    funcTypeTable["putch"] = FunctionType::get(vd, {i32});
+    module->createFunction(FunctionType::get(vd, {i32}), "putch", true);
+
+    // void putarray(int n, int a[])
+    funcTypeTable["putarray"] = FunctionType::get(vd, {i32, PointerType::get(i32)});
+    module->createFunction(FunctionType::get(vd, {i32, PointerType::get(i32)}), "putarray", true);
+
+    // void putfloat(float x)
+    funcTypeTable["putfloat"] = FunctionType::get(vd, {flt});
+    module->createFunction(FunctionType::get(vd, {flt}), "putfloat", true);
+
+    // void putfarray(int n, float a[])
+    funcTypeTable["putfarray"] = FunctionType::get(vd, {i32, PointerType::get(flt)});
+    module->createFunction(FunctionType::get(vd, {i32, PointerType::get(flt)}), "putfarray", true);
+
+    // void starttime()
+    funcTypeTable["starttime"] = FunctionType::get(vd, {});
+    module->createFunction(FunctionType::get(vd, {}), "starttime", true);
+
+    // void stoptime()
+    funcTypeTable["stoptime"] = FunctionType::get(vd, {});
+    module->createFunction(FunctionType::get(vd, {}), "stoptime", true);
+}
+
+// ================================================================
+// 数组初始化辅助: 递归 emit GEP+store
+// ================================================================
+void IRBuilder::emitInitStoresVar(Type* targetType, Value* basePtr,
+                                  std::vector<Value*>& indices,
+                                  const std::vector<SysY2022Parser::InitValContext*>& children,
+                                  int& flatIdx) {
+    if (auto* arrTy = dynamic_cast<ArrayType*>(targetType)) {
+        Type* elemType = arrTy->getElementType();
+        unsigned total = arrTy->getNumElements();
+        unsigned pos = 0;
+
+        for (auto* child : children) {
+            if (pos >= total) break;
+
+            if (child->exp()) {
+                Value* val = valFrom(visitExp(child->exp()));
+                if (!val) val = zeroForType(elemType);
+                std::vector<Value*> gepIndices = indices;
+                gepIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(flatIdx)));
+                auto* gep = Instruction::createGetElementPtr(targetType, basePtr, gepIndices, newTempName());
+                currentBB->pushBack(gep);
+                auto* store = Instruction::createStore(val, gep);
+                currentBB->pushBack(store);
+                flatIdx++;
+                pos++;
+            } else {
+                auto subChildren = child->initVal();
+                if (elemType->isArray()) {
+                    std::vector<Value*> subIndices = indices;
+                    subIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(pos)));
+                    std::vector<SysY2022Parser::InitValContext*> subVec(
+                        subChildren.begin(), subChildren.end());
+                    int subIdx = 0;
+                    if (!subVec.empty()) {
+                        emitInitStoresVar(elemType, basePtr, subIndices, subVec, subIdx);
+                    }
+                    auto* subArrTy = static_cast<ArrayType*>(elemType);
+                    unsigned subTotal = subArrTy->getNumElements();
+                    // Zero-fill remaining sub-array elements
+                    while (subIdx < static_cast<int>(subTotal)) {
+                        Value* zv = zeroForType(subArrTy->getElementType());
+                        std::vector<Value*> zpIndices = subIndices;
+                        zpIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(subIdx)));
+                        auto* zgep = Instruction::createGetElementPtr(elemType, basePtr, zpIndices, newTempName());
+                        currentBB->pushBack(zgep);
+                        auto* zstore = Instruction::createStore(zv, zgep);
+                        currentBB->pushBack(zstore);
+                        subIdx++;
+                    }
+                    pos++;
+                    flatIdx = 0;
+                } else {
+                    // Scalar element type with brace init: {expr} takes first value
+                    if (!subChildren.empty() && subChildren[0]->exp()) {
+                        Value* val = valFrom(visitExp(subChildren[0]->exp()));
+                        if (!val) val = zeroForType(elemType);
+                        std::vector<Value*> gepIndices = indices;
+                        gepIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(flatIdx)));
+                        auto* gep = Instruction::createGetElementPtr(targetType, basePtr, gepIndices, newTempName());
+                        currentBB->pushBack(gep);
+                        auto* store = Instruction::createStore(val, gep);
+                        currentBB->pushBack(store);
+                    }
+                    flatIdx++;
+                    pos++;
+                }
+            }
+        }
+        // Zero-fill remaining top-level elements
+        while (pos < total) {
+            if (elemType->isArray()) {
+                auto* subArrTy = static_cast<ArrayType*>(elemType);
+                for (unsigned j = 0; j < static_cast<unsigned>(subArrTy->getNumElements()); ++j) {
+                    Value* zv = zeroForType(subArrTy->getElementType());
+                    std::vector<Value*> zpIndices = indices;
+                    zpIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(pos)));
+                    zpIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(j)));
+                    auto* zgep = Instruction::createGetElementPtr(targetType, basePtr, zpIndices, newTempName());
+                    currentBB->pushBack(zgep);
+                    auto* zstore = Instruction::createStore(zv, zgep);
+                    currentBB->pushBack(zstore);
+                }
+            } else {
+                Value* zv = zeroForType(elemType);
+                std::vector<Value*> zpIndices = indices;
+                zpIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(flatIdx)));
+                auto* zgep = Instruction::createGetElementPtr(targetType, basePtr, zpIndices, newTempName());
+                currentBB->pushBack(zgep);
+                auto* zstore = Instruction::createStore(zv, zgep);
+                currentBB->pushBack(zstore);
+                flatIdx++;
+            }
+            pos++;
+        }
+    }
+}
+
+void IRBuilder::emitInitStoresConst(Type* targetType, Value* basePtr,
+                                    std::vector<Value*>& indices,
+                                    const std::vector<SysY2022Parser::ConstInitValContext*>& children,
+                                    int& flatIdx) {
+    if (auto* arrTy = dynamic_cast<ArrayType*>(targetType)) {
+        Type* elemType = arrTy->getElementType();
+        unsigned total = arrTy->getNumElements();
+        unsigned pos = 0;
+
+        for (auto* child : children) {
+            if (pos >= total) break;
+
+            if (child->constExp()) {
+                Value* val = valFrom(visitConstExp(child->constExp()));
+                if (!val) val = zeroForType(elemType);
+                std::vector<Value*> gepIndices = indices;
+                gepIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(flatIdx)));
+                auto* gep = Instruction::createGetElementPtr(targetType, basePtr, gepIndices, newTempName());
+                currentBB->pushBack(gep);
+                auto* store = Instruction::createStore(val, gep);
+                currentBB->pushBack(store);
+                flatIdx++;
+                pos++;
+            } else {
+                auto subChildren = child->constInitVal();
+                if (elemType->isArray()) {
+                    std::vector<Value*> subIndices = indices;
+                    subIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(pos)));
+                    std::vector<SysY2022Parser::ConstInitValContext*> subVec(
+                        subChildren.begin(), subChildren.end());
+                    int subIdx = 0;
+                    if (!subVec.empty()) {
+                        emitInitStoresConst(elemType, basePtr, subIndices, subVec, subIdx);
+                    }
+                    auto* subArrTy = static_cast<ArrayType*>(elemType);
+                    unsigned subTotal = subArrTy->getNumElements();
+                    while (subIdx < static_cast<int>(subTotal)) {
+                        Value* zv = zeroForType(subArrTy->getElementType());
+                        std::vector<Value*> zpIndices = subIndices;
+                        zpIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(subIdx)));
+                        auto* zgep = Instruction::createGetElementPtr(elemType, basePtr, zpIndices, newTempName());
+                        currentBB->pushBack(zgep);
+                        auto* zstore = Instruction::createStore(zv, zgep);
+                        currentBB->pushBack(zstore);
+                        subIdx++;
+                    }
+                    pos++;
+                    flatIdx = 0;
+                } else {
+                    if (!subChildren.empty() && subChildren[0]->constExp()) {
+                        Value* val = valFrom(visitConstExp(subChildren[0]->constExp()));
+                        if (!val) val = zeroForType(elemType);
+                        std::vector<Value*> gepIndices = indices;
+                        gepIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(flatIdx)));
+                        auto* gep = Instruction::createGetElementPtr(targetType, basePtr, gepIndices, newTempName());
+                        currentBB->pushBack(gep);
+                        auto* store = Instruction::createStore(val, gep);
+                        currentBB->pushBack(store);
+                    }
+                    flatIdx++;
+                    pos++;
+                }
+            }
+        }
+        while (pos < total) {
+            if (elemType->isArray()) {
+                auto* subArrTy = static_cast<ArrayType*>(elemType);
+                for (unsigned j = 0; j < static_cast<unsigned>(subArrTy->getNumElements()); ++j) {
+                    Value* zv = zeroForType(subArrTy->getElementType());
+                    std::vector<Value*> zpIndices = indices;
+                    zpIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(pos)));
+                    zpIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(j)));
+                    auto* zgep = Instruction::createGetElementPtr(targetType, basePtr, zpIndices, newTempName());
+                    currentBB->pushBack(zgep);
+                    auto* zstore = Instruction::createStore(zv, zgep);
+                    currentBB->pushBack(zstore);
+                }
+            } else {
+                Value* zv = zeroForType(elemType);
+                std::vector<Value*> zpIndices = indices;
+                zpIndices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(flatIdx)));
+                auto* zgep = Instruction::createGetElementPtr(targetType, basePtr, zpIndices, newTempName());
+                currentBB->pushBack(zgep);
+                auto* zstore = Instruction::createStore(zv, zgep);
+                currentBB->pushBack(zstore);
+                flatIdx++;
+            }
+            pos++;
+        }
+    }
+}
+
+Value* IRBuilder::zeroForType(Type* ty) {
+    if (ty->isInteger()) return ConstantInt::get(static_cast<IntegerType*>(ty), 0);
+    if (ty->isFloat())   return ConstantFloat::get(static_cast<FloatType*>(ty), 0.0);
+    return ConstantInt::get(IntegerType::I32, 0);
+}
+
+// ================================================================
+// 常数表达式编译期求值 (constant folding)
+// ================================================================
+Value* IRBuilder::constFoldBinOp(Instruction::Opcode op, Value* left, Value* right) {
+    auto* lci = dynamic_cast<ConstantInt*>(left);
+    auto* rci = dynamic_cast<ConstantInt*>(right);
+    if (lci && rci) {
+        IntegerType* ty = static_cast<IntegerType*>(lci->getType());
+        int64_t lv = lci->getValue(), rv = rci->getValue();
+        switch (op) {
+        case Instruction::Opcode::ADD:  return ConstantInt::get(ty, lv + rv);
+        case Instruction::Opcode::SUB:  return ConstantInt::get(ty, lv - rv);
+        case Instruction::Opcode::MUL:  return ConstantInt::get(ty, lv * rv);
+        case Instruction::Opcode::SDIV:
+            return ConstantInt::get(ty, rv != 0 ? lv / rv : 0);
+        case Instruction::Opcode::SREM:
+            return ConstantInt::get(ty, rv != 0 ? lv % rv : 0);
+        default: return nullptr;
+        }
+    }
+
+    auto* lcf = dynamic_cast<ConstantFloat*>(left);
+    auto* rcf = dynamic_cast<ConstantFloat*>(right);
+    if (lcf && rcf) {
+        double lv = lcf->getValue(), rv = rcf->getValue();
+        switch (op) {
+        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), lv + rv);
+        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), lv - rv);
+        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), lv * rv);
+        case Instruction::Opcode::SDIV:
+            return ConstantFloat::get(FloatType::get(), rv != 0.0 ? lv / rv : 0.0);
+        case Instruction::Opcode::SREM: return nullptr;
+        default: return nullptr;
+        }
+    }
+
+    if (lcf && rci) {
+        double lv = lcf->getValue(), rv = static_cast<double>(rci->getValue());
+        switch (op) {
+        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), lv + rv);
+        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), lv - rv);
+        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), lv * rv);
+        case Instruction::Opcode::SDIV:
+            return ConstantFloat::get(FloatType::get(), rv != 0.0 ? lv / rv : 0.0);
+        default: return nullptr;
+        }
+    }
+
+    if (lci && rcf) {
+        double lv = static_cast<double>(lci->getValue()), rv = rcf->getValue();
+        switch (op) {
+        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), lv + rv);
+        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), lv - rv);
+        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), lv * rv);
+        case Instruction::Opcode::SDIV:
+            return ConstantFloat::get(FloatType::get(), rv != 0.0 ? lv / rv : 0.0);
+        default: return nullptr;
+        }
+    }
+
+    return nullptr;
+}
+
+Value* IRBuilder::constEval(SysY2022Parser::AddExpContext* ctx) {
+    Value* result;
+    if (auto* subAdd = dynamic_cast<SysY2022Parser::AddExpContext*>(ctx->children[0]))
+        result = constEval(subAdd);
+    else
+        result = constEvalMul(dynamic_cast<SysY2022Parser::MulExpContext*>(ctx->children[0]));
+
+    if (ctx->children.size() == 1) return result;
+
+    size_t i = 1;
+    while (i < ctx->children.size()) {
+        auto* opNode = ctx->children[i];
+        auto* rightCtx = dynamic_cast<SysY2022Parser::MulExpContext*>(ctx->children[i + 1]);
+        Value* rightVal = constEvalMul(rightCtx);
+        if (!result || !rightVal) return nullptr;
+
+        std::string opText;
+        if (auto* tn = dynamic_cast<antlr4::tree::TerminalNode*>(opNode))
+            opText = tn->getSymbol()->getText();
+
+        Instruction::Opcode op;
+        if (opText == "+")      op = Instruction::Opcode::ADD;
+        else                    op = Instruction::Opcode::SUB;
+
+        result = constFoldBinOp(op, result, rightVal);
+        if (!result) return nullptr;
+        i += 2;
+    }
+    return result;
+}
+
+Value* IRBuilder::constEvalMul(SysY2022Parser::MulExpContext* ctx) {
+    Value* result;
+    if (auto* subMul = dynamic_cast<SysY2022Parser::MulExpContext*>(ctx->children[0]))
+        result = constEvalMul(subMul);
+    else
+        result = constEvalUnary(dynamic_cast<SysY2022Parser::UnaryExpContext*>(ctx->children[0]));
+
+    if (ctx->children.size() == 1) return result;
+
+    size_t i = 1;
+    while (i < ctx->children.size()) {
+        auto* opNode = ctx->children[i];
+        auto* rightCtx = dynamic_cast<SysY2022Parser::UnaryExpContext*>(ctx->children[i + 1]);
+        Value* rightVal = constEvalUnary(rightCtx);
+        if (!result || !rightVal) return nullptr;
+
+        std::string opText;
+        if (auto* tn = dynamic_cast<antlr4::tree::TerminalNode*>(opNode))
+            opText = tn->getSymbol()->getText();
+
+        Instruction::Opcode op;
+        if (opText == "*")      op = Instruction::Opcode::MUL;
+        else if (opText == "/") op = Instruction::Opcode::SDIV;
+        else                    op = Instruction::Opcode::SREM;
+
+        result = constFoldBinOp(op, result, rightVal);
+        if (!result) return nullptr;
+        i += 2;
+    }
+    return result;
+}
+
+Value* IRBuilder::constEvalUnary(SysY2022Parser::UnaryExpContext* ctx) {
+    if (ctx->primaryExp()) {
+        return constEvalPrimary(ctx->primaryExp());
+    }
+    if (ctx->unaryExp()) {
+        auto* opNode = ctx->children[0];
+        std::string opText;
+        if (auto* tn = dynamic_cast<antlr4::tree::TerminalNode*>(opNode))
+            opText = tn->getSymbol()->getText();
+
+        Value* val = constEvalUnary(ctx->unaryExp());
+        if (!val) return nullptr;
+
+        if (opText == "-") {
+            if (auto* ci = dynamic_cast<ConstantInt*>(val))
+                return ConstantInt::get(static_cast<IntegerType*>(ci->getType()), -ci->getValue());
+            if (auto* cf = dynamic_cast<ConstantFloat*>(val))
+                return ConstantFloat::get(FloatType::get(), -cf->getValue());
+            return nullptr;
+        }
+        if (opText == "!") {
+            if (auto* ci = dynamic_cast<ConstantInt*>(val))
+                return ConstantInt::get(static_cast<IntegerType*>(ci->getType()), ci->getValue() ? 0 : 1);
+            if (auto* cf = dynamic_cast<ConstantFloat*>(val))
+                return ConstantInt::get(IntegerType::I32, cf->getValue() != 0.0 ? 0 : 1);
+            return nullptr;
+        }
+        return val;
+    }
+    if (ctx->IDENTIFIER()) return nullptr; // function call
+    return nullptr;
+}
+
+Value* IRBuilder::constEvalPrimary(SysY2022Parser::PrimaryExpContext* ctx) {
+    if (ctx->number()) return valFrom(visitNumber(ctx->number()));
+    if (ctx->exp())
+        return constEval(dynamic_cast<SysY2022Parser::AddExpContext*>(ctx->exp()->children[0]));
+    if (ctx->lVal()) {
+        std::string name = ctx->lVal()->IDENTIFIER()->getText();
+        Value* sym = lookup(name);
+        if (!sym) return nullptr;
+        if (auto* gv = dynamic_cast<GlobalVariable*>(sym)) {
+            if (gv->isConstant() && gv->getInitializer())
+                return gv->getInitializer();
+        }
+    }
+    return nullptr;
 }
 
 } // namespace IR

@@ -46,6 +46,9 @@ temp/
 /tmp
 /temp
 
+# Final_Test cases (not to be committed)
+test/Final_Test/
+
 # Backup files
 *.bak
 *.backup

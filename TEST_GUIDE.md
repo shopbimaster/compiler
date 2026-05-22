@@ -52,7 +52,7 @@ cd /mnt/d/VSCodeProjects/compiler/build
 
 ---
 
-## 三、.sy → IR 集成测试（7 项）
+## 三、.sy → IR 集成测试（23 项）
 
 ```bash
 cd /mnt/d/VSCodeProjects/compiler/build
@@ -69,7 +69,23 @@ cd /mnt/d/VSCodeProjects/compiler/build
 >   TEST: while 循环 ... PASSED
 >   TEST: 函数调用 ... PASSED
 >   TEST: 语法错误检测（缺少分号） ... PASSED
-> === 结果: 7 passed, 0 failed ===
+>   TEST: break 跳出循环 ... PASSED
+>   TEST: continue 跳过迭代 ... PASSED
+>   TEST: 全局变量 ... PASSED
+>   TEST: 一维数组存取 ... PASSED
+>   TEST: 二维数组存取 ... PASSED
+>   TEST: void 函数 ... PASSED
+>   TEST: 数组参数传递 ... PASSED
+>   TEST: const一维数组初始化 ... PASSED
+>   TEST: const二维数组初始化 ... PASSED
+>   TEST: constExpr作为数组维度 ... PASSED
+>   TEST: 全局const作为数组维度 ... PASSED
+>   TEST: 一维数组聚合初始化 ... PASSED
+>   TEST: 二维数组聚合初始化 ... PASSED
+>   TEST: I/O运行时函数声明与调用 ... PASSED
+>   TEST: 全局常量数组 ... PASSED
+>   TEST: 数组部分初始化（缺失元素补零） ... PASSED
+> === 结果: 23 passed, 0 failed ===
 > ```
 
 ---
@@ -106,6 +122,54 @@ cd /mnt/d/VSCodeProjects/compiler/build
 # 7. 输出到文件
 ./sysyc ../test/hello.sy -o output.ir
 cat output.ir
+
+# 8. break 循环跳出
+./sysyc ../test/break_test.sy
+
+# 9. continue 循环跳过
+./sysyc ../test/continue_test.sy
+
+# 10. 全局变量
+./sysyc ../test/global_var.sy
+
+# 11. 一维数组
+./sysyc ../test/array_1d.sy
+
+# 12. 二维数组
+./sysyc ../test/array_2d.sy
+
+# 13. void 无返回值函数
+./sysyc ../test/void_func.sy
+
+# 14. 数组作为参数传递
+./sysyc ../test/array_param.sy
+
+# 15. 一维数组初始化
+./sysyc ../test/array_init.sy
+
+# 16. 二维数组初始化
+./sysyc ../test/array_init2d.sy
+
+# 17. const 一维数组
+./sysyc ../test/const_1d.sy
+
+# 18. const 二维数组
+./sysyc ../test/const_2d.sy
+
+# 19. constExpr 作为数组维度
+./sysyc ../test/const_arr_dim.sy
+
+# 20. 全局 const 作为数组维度
+./sysyc ../test/global_const_dim.sy
+
+# 21. I/O 运行时函数
+./sysyc ../test/io_test.sy
+
+# 22. 全局常量数组
+./sysyc ../test/global_const_arr.sy
+
+# 23. 数组部分初始化
+./sysyc ../test/arr_partial.sy
 ```
 
 ---
@@ -155,8 +219,56 @@ cd /mnt/d/VSCodeProjects/compiler/build
 cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) && \
 ./test_ir && \
 ./test_integration && \
-echo "🎉 全量测试全部通过！(25/25)"
+echo "🎉 全量测试全部通过！（18 单元 + 23 集成 = 41/41）"
 ```
+
+---
+
+## 八、Final_Test 批量编译验证
+
+> 验证所有官方测试用例从 .sy → IR 编译通过
+
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+
+# functional（100 项）
+pass=0 fail=0
+for f in test/Final_Test/functional/*.sy; do
+    if build/sysyc "$f" > /dev/null 2>&1; then
+        pass=$((pass+1))
+    else
+        echo "[FAIL] $(basename "$f")"
+        fail=$((fail+1))
+    fi
+done
+echo "functional: $pass passed, $fail failed"
+
+# h_functional（40 项）
+pass=0 fail=0
+for f in test/Final_Test/h_functional/*.sy; do
+    if build/sysyc "$f" > /dev/null 2>&1; then
+        pass=$((pass+1))
+    else
+        echo "[FAIL] $(basename "$f")"
+        fail=$((fail+1))
+    fi
+done
+echo "h_functional: $pass passed, $fail failed"
+
+# performance（60 项）
+pass=0 fail=0
+for f in test/Final_Test/performance/*.sy; do
+    if build/sysyc "$f" > /dev/null 2>&1; then
+        pass=$((pass+1))
+    else
+        echo "[FAIL] $(basename "$f")"
+        fail=$((fail+1))
+    fi
+done
+echo "performance: $pass passed, $fail failed"
+```
+
+> **当前期望**：functional 100/100，h_functional 40/40，performance 60/60，**总计 200/200 全部通过**
 
 ---
 
@@ -178,3 +290,22 @@ echo "🎉 全量测试全部通过！(25/25)"
 | 集成: while_test.sy | 循环 | while_cond/body/end |
 | 集成: func_call.sy | 函数调用 | define+call |
 | 集成: bad.sy | 错误检测 | 抛出异常 |
+| 集成: break_test.sy | break | br to while_end |
+| 集成: continue_test.sy | continue | br to while_cond |
+| 集成: global_var.sy | 全局变量 | global 声明 |
+| 集成: array_1d.sy | 一维数组 | alloca+getelementptr |
+| 集成: array_2d.sy | 二维数组 | alloca+getelementptr |
+| 集成: void_func.sy | void 函数 | define void |
+| 集成: array_param.sy | 数组参数 | pointer type param |
+| 集成: const_1d.sy | const 1D 数组 | alloca+store |
+| 集成: const_2d.sy | const 2D 数组 | alloca+store |
+| 集成: const_arr_dim.sy | constExpr 维度 | const 表达式求值 |
+| 集成: global_const_dim.sy | 全局const引用 | global+constant |
+| 集成: array_init.sy | 数组聚合初始化 | getelementptr+store |
+| 集成: array_init2d.sy | 2D 聚合初始化 | getelementptr+store |
+| 集成: io_test.sy | I/O 内置函数 | declare+call |
+| 集成: global_const_arr.sy | 全局const数组 | global array |
+| 集成: arr_partial.sy | 部分初始化 | 缺失元素补零 |
+| Final_Test | functional 批量 | 100/100 ✅ |
+| Final_Test | h_functional 批量 | 40/40 ✅ |
+| Final_Test | performance 批量 | 60/60 ✅ |

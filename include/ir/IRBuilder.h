@@ -44,6 +44,7 @@ public:
     std::any visitEqExp(SysY2022Parser::EqExpContext* ctx) override;
     std::any visitLAndExp(SysY2022Parser::LAndExpContext* ctx) override;
     std::any visitLOrExp(SysY2022Parser::LOrExpContext* ctx) override;
+    std::any visitConstExp(SysY2022Parser::ConstExpContext* ctx) override;
 
     // ===== 测试辅助 =====
     std::unique_ptr<Module> buildSimpleMain(int64_t returnValue);
@@ -66,6 +67,23 @@ private:
     std::string     newTempName();
     Type*           toIRType(const std::string& sysyType);
     Instruction*    emitBinOp(Instruction::Opcode op, Value* lhs, Value* rhs);
+    void            registerBuiltinFunctions();
+    void            emitInitStoresVar(Type* targetType, Value* basePtr,
+                                  std::vector<Value*>& indices,
+                                  const std::vector<SysY2022Parser::InitValContext*>& children,
+                                  int& flatIdx);
+    void            emitInitStoresConst(Type* targetType, Value* basePtr,
+                                  std::vector<Value*>& indices,
+                                  const std::vector<SysY2022Parser::ConstInitValContext*>& children,
+                                  int& flatIdx);
+    Value*          zeroForType(Type* ty);
+
+    // ===== 常数表达式编译期求值 =====
+    Value* constEval(SysY2022Parser::AddExpContext* ctx);
+    Value* constEvalMul(SysY2022Parser::MulExpContext* ctx);
+    Value* constEvalUnary(SysY2022Parser::UnaryExpContext* ctx);
+    Value* constEvalPrimary(SysY2022Parser::PrimaryExpContext* ctx);
+    Value* constFoldBinOp(Instruction::Opcode op, Value* left, Value* right);
 
     // ===== 左递归表达式通用处理 =====
     Value* visitLeftRecursiveBinary(
@@ -73,6 +91,12 @@ private:
         antlr4::tree::ParseTree* opChild,
         antlr4::tree::ParseTree* rightChild,
         Instruction::Opcode opcode);
+
+    // ===== 循环上下文（用于 break/continue）=====
+    struct LoopContext {
+        BasicBlock* continueBB;
+        BasicBlock* breakBB;
+    };
 
     // ===== 成员状态 =====
     std::unique_ptr<Module>  module;
@@ -83,6 +107,12 @@ private:
 
     // 符号表: 作用域栈, 变量名 → 栈上地址 (alloca)
     std::vector<std::unordered_map<std::string, Value*>> scopeStack;
+
+    // 循环栈: 用于 break/continue 跳转目标
+    std::vector<LoopContext> loopStack;
+
+    // 函数表: 用于函数调用时查找已声明函数的类型
+    std::unordered_map<std::string, FunctionType*> funcTypeTable;
 };
 
 } // namespace IR

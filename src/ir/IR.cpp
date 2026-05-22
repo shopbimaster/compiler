@@ -252,7 +252,13 @@ namespace IR {
     Instruction* Instruction::createGetElementPtr(Type* pointee, Value* ptr,
                                                 const std::vector<Value*>& indices,
                                                 const std::string& name) {
-        auto* inst = new Instruction(Opcode::GETELEMENTPTR, PointerType::get(pointee), name,
+        Type* resultTy = pointee;
+        for (size_t i = 1; i < indices.size(); ++i) {
+            if (auto* at = dynamic_cast<ArrayType*>(resultTy)) {
+                resultTy = at->getElementType();
+            }
+        }
+        auto* inst = new Instruction(Opcode::GETELEMENTPTR, PointerType::get(resultTy), name,
                                     1 + indices.size());
         inst->addOperand(ptr);
         for (auto* idx : indices) inst->addOperand(idx);
@@ -344,6 +350,9 @@ namespace IR {
     // ================================================================
 
     Function* Module::createFunction(FunctionType* ft, const std::string& name, bool external) {
+        for (auto& f : functions) {
+            if (f->getName() == name) return f.get();
+        }
         auto func = std::make_unique<Function>(ft, name, external);
         func->setParent(this);
         Function* ptr = func.get();
@@ -362,7 +371,9 @@ namespace IR {
     std::string Module::dump() const {
         std::ostringstream oss;
         for (auto& gv : globals) {
-            oss << "@" << gv->getName() << " = global " << gv->getType()->toString() << "\n";
+            PointerType* gvTy = static_cast<PointerType*>(gv->getType());
+            oss << "@" << gv->getName() << " = global "
+                << gvTy->getPointeeType()->toString() << "\n";
         }
         for (auto& func : functions) {
             auto* ft = func->getFunctionType();
@@ -411,6 +422,44 @@ namespace IR {
                         if (!inst->getName().empty())
                             oss << "%" << inst->getName() << " = ";
                         switch (op) {
+                        case Instruction::Opcode::ALLOCA: {
+                            auto* ptrTy = static_cast<PointerType*>(inst->getType());
+                            oss << "alloca " << ptrTy->getPointeeType()->toString() << "\n";
+                            continue;
+                        }
+                        case Instruction::Opcode::STORE: {
+                            auto* val = inst->getOperand(0);
+                            auto* ptr = inst->getOperand(1);
+                            oss << "store " << val->getType()->toString() << " ";
+                            if (auto* ci = dynamic_cast<ConstantInt*>(val))
+                                oss << ci->getValue();
+                            else
+                                oss << "%" << val->getName();
+                            oss << ", " << ptr->getType()->toString() << " %" << ptr->getName() << "\n";
+                            continue;
+                        }
+                        case Instruction::Opcode::LOAD: {
+                            auto* ptr = inst->getOperand(0);
+                            oss << "load " << inst->getType()->toString() << ", "
+                                << ptr->getType()->toString() << " %" << ptr->getName() << "\n";
+                            continue;
+                        }
+                        case Instruction::Opcode::CALL: {
+                            auto* callee = inst->getOperand(0);
+                            auto* ft = static_cast<FunctionType*>(callee->getType());
+                            oss << "call " << ft->getReturnType()->toString() << " %" << callee->getName() << "(";
+                            for (unsigned i = 1; i < inst->getNumOperands(); ++i) {
+                                if (i > 1) oss << ", ";
+                                auto* v = inst->getOperand(i);
+                                oss << v->getType()->toString() << " ";
+                                if (auto* ci = dynamic_cast<ConstantInt*>(v))
+                                    oss << ci->getValue();
+                                else
+                                    oss << "%" << v->getName();
+                            }
+                            oss << ")\n";
+                            continue;
+                        }
                         case Instruction::Opcode::ADD:  oss << "add ";  break;
                         case Instruction::Opcode::SUB:  oss << "sub ";  break;
                         case Instruction::Opcode::MUL:  oss << "mul ";  break;
@@ -419,11 +468,8 @@ namespace IR {
                         case Instruction::Opcode::AND:  oss << "and ";  break;
                         case Instruction::Opcode::OR:   oss << "or ";   break;
                         case Instruction::Opcode::XOR:  oss << "xor ";  break;
-                        case Instruction::Opcode::ALLOCA: oss << "alloca "; break;
-                        case Instruction::Opcode::LOAD: oss << "load "; break;
-                        case Instruction::Opcode::STORE: oss << "store "; break;
-                        case Instruction::Opcode::CALL: oss << "call "; break;
                         case Instruction::Opcode::ICMP: oss << "icmp "; break;
+                        case Instruction::Opcode::GETELEMENTPTR: oss << "getelementptr "; break;
                         default: oss << "unknown "; break;
                         }
                         oss << inst->getType()->toString();

@@ -180,5 +180,8 @@ make -j$(nproc)
 - **语法解析**: G4 文件完全正确，C++ 版 ANTLR 运行时已集成
 - **IR 框架**: 类型系统 + SSA IR + Module/dump 完整可用
 - **前端→IR 管线**: sysyc 可从 .sy 源文件自动生成 LLVM 风格 IR
+- **已支持特性**: 变量/赋值、四则运算、比较、短路求值、if-else、while、函数+参数
+- **待实现特性**: break/continue、数组、全局变量、float、void 函数、作用域、I/O 等
 - **后端**: 代码生成器头文件已定义，待实现
-- **下一步**: 后端 RV64 代码生成 (IR → RISC-V 汇编)
+- **测试用例**: Final_Test 目录包含 functional (100) + h_functional (40) + performance (~50) 共 ~190 条
+- **下一步**: 前端补全 → 后端 O0 代码生成 (IR → RISC-V 汇编)
