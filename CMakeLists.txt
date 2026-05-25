@@ -53,6 +53,15 @@ target_include_directories(sysy_compiler PUBLIC include)
 target_link_libraries(sysy_compiler PUBLIC sysy_ir_builder)
 
 # ================================================================
+# 后端代码生成库
+# ================================================================
+add_library(sysy_backend STATIC
+    src/backend/TargetCodeGen.cpp
+)
+target_include_directories(sysy_backend PUBLIC include)
+target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
+
+# ================================================================
 # IR 核心单元测试（不依赖 ANTLR 输入，但需 ANTLR 运行时符号）
 # ================================================================
 add_executable(test_ir
@@ -70,7 +79,7 @@ add_executable(sysyc
     ${ANTLR_SOURCES}
 )
 target_include_directories(sysyc PRIVATE include ${ANTLR_INCLUDES})
-target_link_libraries(sysyc sysy_compiler antlr4_static)
+target_link_libraries(sysyc sysy_compiler sysy_backend antlr4_static)
 
 # ================================================================
 # 集成测试

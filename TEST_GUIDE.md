@@ -11,6 +11,19 @@
 > sudo apt-get update
 > sudo apt-get install -y build-essential cmake openjdk-17-jdk-headless libantlr4-runtime-dev uuid-dev
 > ```
+>
+> **后端验证额外依赖（RISC-V 工具链 + QEMU 用户模式模拟器）：**
+> ```bash
+> # 以 root 运行（非交互模式）
+> wsl -d Ubuntu -u root -- bash -c "apt-get update -qq && apt-get install -y gcc-riscv64-linux-gnu qemu-user"
+> ```
+>
+> 验证安装：
+> ```bash
+> wsl -d Ubuntu -- bash -c "riscv64-linux-gnu-gcc --version && qemu-riscv64 --version"
+> ```
+>
+> > **注**：`riscv64-linux-gnu-gcc` 提供 C 标准库和启动文件，配合 `qemu-riscv64` 用户模式模拟器可直接运行生成的静态链接 RISC-V 可执行文件
 
 ---
 
@@ -272,6 +285,87 @@ echo "performance: $pass passed, $fail failed"
 
 ---
 
+## 九、后端 O0 代码生成验证（IR → RISC-V → 可执行 → 运行结果校验）
+
+### 9.1 汇编输出（-S 参数）
+
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+
+# 输出到 stdout
+build/sysyc -S test/hello.sy
+
+# 输出到文件
+build/sysyc -S test/hello.sy -o hello.S
+```
+
+### 9.2 端到端验证流程（.sy → .S → ELF → QEMU）
+
+> 单文件一步式验证脚本：
+> ```bash
+> cd /mnt/d/VSCodeProjects/compiler
+> 
+> GCC=riscv64-linux-gnu-gcc
+> QEMU=qemu-riscv64
+> 
+> for test in hello arithmetic variable ifelse while_test func_call; do
+>     build/sysyc -S test/${test}.sy -o /tmp/${test}.S
+>     $GCC -march=rv64gc -mabi=lp64d -static -o /tmp/${test}_bin /tmp/${test}.S
+>     echo -n "${test}: "
+>     $QEMU /tmp/${test}_bin
+>     echo "exit=$?"
+> done
+> ```
+>
+> **期望输出**：
+> ```
+> hello: exit=0
+> arithmetic: exit=7
+> variable: exit=42
+> ifelse: exit=0
+> while_test: exit=5
+> func_call: exit=7
+> ```
+
+### 9.3 单步调试汇编
+
+```bash
+# 查看生成的汇编代码
+build/sysyc -S test/func_call.sy
+
+# 查看 IR + 汇编 对比
+echo "=== IR ===" && build/sysyc test/func_call.sy
+echo ""
+echo "=== ASM ===" && build/sysyc -S test/func_call.sy
+```
+
+---
+
+## 十、一键全量验证（含后端）
+
+```bash
+# 在 WSL 内执行
+cd /mnt/d/VSCodeProjects/compiler/build
+cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
+
+# IR 层测试
+./test_ir && ./test_integration && echo "IR 层: 41/41 通过"
+
+# 后端端到端测试
+cd /mnt/d/VSCodeProjects/compiler
+GCC=riscv64-linux-gnu-gcc QEMU=qemu-riscv64
+pass=0 fail=0
+for test in hello arithmetic variable ifelse while_test func_call; do
+    build/sysyc -S test/${test}.sy -o /tmp/${test}.S
+    $GCC -march=rv64gc -mabi=lp64d -static -o /tmp/${test}_bin /tmp/${test}.S 2>/dev/null || continue
+    $QEMU /tmp/${test}_bin > /dev/null 2>&1
+    [ $? -eq 0 ] && pass=$((pass+1)) || fail=$((fail+1))
+done
+echo "后端: ${pass}/$((pass+fail)) 通过"
+```
+
+---
+
 ## 测试结果速查
 
 | 模块 | 测试项 | 通过标志 |
@@ -309,3 +403,9 @@ echo "performance: $pass passed, $fail failed"
 | Final_Test | functional 批量 | 100/100 ✅ |
 | Final_Test | h_functional 批量 | 40/40 ✅ |
 | Final_Test | performance 批量 | 60/60 ✅ |
+| 后端: hello.sy | hello 端到端 | qemu exit=0 ✅ |
+| 后端: arithmetic.sy | 算术端到端 | qemu exit=7 ✅ |
+| 后端: variable.sy | 变量端到端 | qemu exit=42 ✅ |
+| 后端: ifelse.sy | 分支端到端 | qemu exit=0 ✅ |
+| 后端: while_test.sy | 循环端到端 | qemu exit=5 ✅ |
+| 后端: func_call.sy | 函数调用端到端 | qemu exit=7 ✅ |

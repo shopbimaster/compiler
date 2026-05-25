@@ -1,4 +1,5 @@
 #include "Compiler.h"
+#include "backend/TargetCodeGen.h"
 #include <fstream>
 #include <iostream>
 
@@ -21,6 +22,22 @@ void Compiler::emitIRToFile(const std::string& sourcePath, const std::string& ou
         throw std::runtime_error("Cannot open output file: " + outputPath);
     }
     ofs << mod->dump();
+}
+
+void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out) {
+    auto mod = compile(sourcePath);
+    Backend::TargetCodeGen cg;
+    out << cg.generate(*mod);
+}
+
+void Compiler::emitAsmToFile(const std::string& sourcePath, const std::string& outputPath) {
+    auto mod = compile(sourcePath);
+    Backend::TargetCodeGen cg;
+    std::ofstream ofs(outputPath);
+    if (!ofs.is_open()) {
+        throw std::runtime_error("Cannot open output file: " + outputPath);
+    }
+    ofs << cg.generate(*mod);
 }
 
 } // namespace IR
