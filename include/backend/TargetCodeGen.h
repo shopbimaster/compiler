@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ir/IR.h"
+#include "backend/RegisterAllocator.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -43,6 +44,7 @@ private:
     std::unordered_map<IR::Value*, int> vregStackOffset;
     std::unordered_map<IR::Value*, int> allocaOffset;
     std::unordered_map<IR::Argument*, int> paramOffsets;
+    RegisterAllocator regAlloc;
 
     void emitGlobal(IR::GlobalVariable* gv);
     void emitGlobalInitData(IR::Constant* init, IR::Type* type, const std::string& indent);

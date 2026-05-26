@@ -102,7 +102,7 @@
 
 ## 🟡 第 4 阶段: 后端代码生成 — O0 基本正确性
 
-**优先级: 🔴 高（当前阶段）** | **目标: sysyc 输出可执行的 RISC-V 汇编** | **已完成: 6/6 基础用例端到端通过**
+**优先级: 🔴 高（当前阶段）** | **目标: sysyc 输出可执行的 RISC-V 汇编** | **已完成: 8/8 用例端到端通过（含浮点+全局变量）**
 
 ### 4.1 指令选择 (Instruction Selection)
 | 任务 | IR → RISC-V | 难度 | 状态 |
@@ -113,8 +113,8 @@
 | 4.1d 内存指令 | ALLOCA/LOAD/STORE → addi sp/lw/sw | ⭐⭐⭐ | ✅ |
 | 4.1e 调用指令 | CALL → jal/jalr (含 call 寄存器) | ⭐⭐⭐ | ✅ |
 | 4.1f 返回指令 | RET → ret (jalr zero, ra, 0) | ⭐ | ✅ |
-| 4.1g 浮点指令 | FADD/FSUB/FMUL/FDIV → fadd.s/fsub.s/fmul.s/fdiv.s | ⭐⭐ | 🟡 |
-| 4.1h 全局变量访问 | GLOBAL_ADDR → lui+addi (medany) | ⭐⭐⭐ | 🟡 |
+| 4.1g 浮点指令 | FADD/FSUB/FMUL/FDIV → fadd.s/fsub.s/fmul.s/fdiv.s | ⭐⭐ | ✅ |
+| 4.1h 全局变量访问 | GLOBAL_ADDR → lui+addi (medany) | ⭐⭐⭐ | ✅ |
 | 4.1i GETELEMENTPTR | 地址计算 → slli+add | ⭐⭐ | ✅ |
 | 4.1j ICMP/FCMP | 整数/浮点比较 → 条件组合 | ⭐⭐ | ✅ |
 
@@ -124,13 +124,13 @@
 | 4.2a 函数序言 | 保存 ra、分配栈空间 | ✅ |
 | 4.2b 函数尾声 | 恢复 ra、释放栈空间 | ✅ |
 | 4.2c 栈变量分配 | alloca 指令 → 栈偏移计算 | ✅ |
-| 4.2d 数组栈分配 | 大数组的栈空间计算 | 🟡 |
+| 4.2d 数组栈分配 | 大数组的栈空间计算 | ✅ |
 
 ### 4.3 寄存器分配
 | 任务 | 内容 | 状态 |
 |------|------|------|
 | 4.3a 虚拟寄存器 → 栈槽 | naive 方案：每个值分配一个栈槽 | ✅ |
-| 4.3b 线性扫描分配 | 进阶：线性扫描寄存器分配器 | ⬜ |
+| 4.3b 线性扫描分配 | 进阶：线性扫描寄存器分配器 | ✅ |
 
 ### 4.4 调用约定 (RV64 LP64)
 | 寄存器 | 用途 |
@@ -152,6 +152,11 @@
 | ifelse | `if(a<5) return 1; else return 0` | 0 | 0 | ✅ |
 | while_test | `while(a<5) a=a+1; return a` | 5 | 5 | ✅ |
 | func_call | `return add(3,4)` | 7 | 7 | ✅ |
+| global_var | `g=42; return g` | 42 | 42 | ✅ |
+| float_cmp | `float a=3.0; a<4.0 → return 1` | 1 | 1 | ✅ |
+| array_1d | `int a[3]; a[0]=1;a[1]=2;a[2]=3; return sum` | 6 | 6 | ✅ |
+| array_2d | `int a[2][3]; a[0][0]=1;a[1][2]=6; return sum` | 7 | 7 | ✅ |
+| array_init | `int a[3]={1,2,3}; return a[0]+a[1]+a[2]` | 6 | 6 | ✅ |
 
 > **验证环境**: WSL Ubuntu + riscv64-linux-gnu-gcc (14.2.0) + qemu-riscv64 (10.2.1)
 > **验证命令**: `build/sysyc -S test/xxx.sy -o xxx.S && riscv64-linux-gnu-gcc -static -o xxx xxx.S && qemu-riscv64 xxx`
@@ -296,8 +301,8 @@
 
 ## 📝 备注
 
-- **当前日期**: 2026-05-23
-- **当前阶段**: 第 4 阶段（后端 O0 代码生成）进行中 — 核心指令选择/栈帧/调用约定已实现，6/6 基础用例端到端通过 ✅
+- **当前日期**: 2026-05-25
+- **当前阶段**: 第 4 阶段（后端 O0 代码生成）— 栈帧管理 ✅ + 线性扫描寄存器分配器 ✅，11/11 端到端测试通过
 - **架构决策**: Visitor 直接生成 IR，无中间 AST；无 SemanticAnalyzer
 - **测试策略**: 单元测试 + 集成测试 + 端到端对比 diff
 - **本地验证**: QEMU/Spike RISC-V 模拟器可代替 FPGA 进行功能验证

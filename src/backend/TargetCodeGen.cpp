@@ -64,32 +64,37 @@ void TargetCodeGen::emitGlobal(IR::GlobalVariable* gv) {
     if (!ptrTy) return;
     IR::Type* pointee = ptrTy->getPointeeType();
 
-    std::string section = gv->isConstant() ? ".section .rodata" : ".data";
-    std::string globType = gv->isConstant() ? "const" : "global";
+    std::string section;
+    if (gv->isConstant()) {
+        section = ".section .rodata";
+    } else if (gv->getInitializer()) {
+        section = ".data";
+    } else {
+        section = ".bss";
+    }
+    emitter.emitData("");
     emitter.emitData("  " + section);
+
+    emitter.emitData("  .globl  " + gv->getName());
+    emitter.emitData("  .type   " + gv->getName() + ", @object");
 
     if (pointee->isArray()) {
         auto* arrTy = dynamic_cast<IR::ArrayType*>(pointee);
-        std::string sizeStr = std::to_string(getTypeSize(arrTy));
+        int totalSize = getTypeSize(arrTy);
 
         if (gv->getInitializer()) {
-            emitter.emitData("  .globl  " + gv->getName());
-            emitter.emitData("  .type   " + gv->getName() + ", @object");
+            emitter.emitData("  .align  2");
+            emitter.emitData("  .size   " + gv->getName() + ", " + std::to_string(totalSize));
             emitter.emitData(gv->getName() + ":");
             emitGlobalInitData(gv->getInitializer(), pointee, "  ");
         } else {
-            emitter.emitData("  .globl  " + gv->getName());
-            emitter.emitData("  .bss");
             emitter.emitData("  .align  2");
-            emitter.emitData("  .type   " + gv->getName() + ", @object");
-            emitter.emitData("  .size   " + gv->getName() + ", " + sizeStr);
+            emitter.emitData("  .size   " + gv->getName() + ", " + std::to_string(totalSize));
             emitter.emitData(gv->getName() + ":");
-            emitter.emitData("  .zero   " + sizeStr);
+            emitter.emitData("  .zero   " + std::to_string(totalSize));
         }
     } else if (pointee->isInteger() || pointee->isFloat()) {
-        emitter.emitData("  .globl  " + gv->getName());
         emitter.emitData("  .align  2");
-        emitter.emitData("  .type   " + gv->getName() + ", @object");
         emitter.emitData("  .size   " + gv->getName() + ", 4");
         emitter.emitData(gv->getName() + ":");
 
@@ -126,6 +131,13 @@ void TargetCodeGen::emitGlobalInitData(IR::Constant* init, IR::Type* type, const
 void TargetCodeGen::emitFunction(IR::Function& func) {
     currentFunc = &func;
     computeStackLayout(func);
+
+    regAlloc.allocate(func);
+
+    int savedRegCount = static_cast<int>(regAlloc.getUsedCalleeSaved().size());
+    int savedRegSpace = savedRegCount * 8;
+    stackSize += savedRegSpace;
+    stackSize = (stackSize + 15) & ~15;
 
     emitter.emitText("  .globl  " + func.getName());
     emitter.emitText("  .type   " + func.getName() + ", @function");
@@ -177,6 +189,7 @@ void TargetCodeGen::computeStackLayout(IR::Function& func) {
                 if (opVal && !dynamic_cast<IR::Constant*>(opVal)
                     && !dynamic_cast<IR::BasicBlock*>(opVal)
                     && !dynamic_cast<IR::Function*>(opVal)
+                    && allocaOffset.find(opVal) == allocaOffset.end()
                     && vregStackOffset.find(opVal) == vregStackOffset.end()) {
                     vregStackOffset[opVal] = stackSize;
                     stackSize += 8;
@@ -187,6 +200,7 @@ void TargetCodeGen::computeStackLayout(IR::Function& func) {
                 && inst->getOpcode() != IR::Instruction::Opcode::BR
                 && inst->getOpcode() != IR::Instruction::Opcode::COND_BR
                 && inst->getOpcode() != IR::Instruction::Opcode::STORE
+                && inst->getOpcode() != IR::Instruction::Opcode::ALLOCA
                 && inst->getType() && !inst->getType()->isVoid()) {
                 vregStackOffset[vr] = stackSize;
                 stackSize += 8;
@@ -230,8 +244,19 @@ int TargetCodeGen::getTypeSize(IR::Type* t) {
 
 void TargetCodeGen::emitPrologue(IR::Function& func) {
     emitter.emitText("  addi    sp, sp, -" + std::to_string(stackSize));
+
     if (stackSize > 0) {
         emitter.emitText("  sd      ra, " + std::to_string(stackSize - 8) + "(sp)");
+    }
+
+    int csrOffset = stackSize - 8;
+    for (auto& reg : regAlloc.getUsedCalleeSaved()) {
+        csrOffset -= 8;
+        if (reg[0] == 'f') {
+            emitter.emitText("  fsd     " + reg + ", " + std::to_string(csrOffset) + "(sp)");
+        } else {
+            emitter.emitText("  sd      " + reg + ", " + std::to_string(csrOffset) + "(sp)");
+        }
     }
 
     auto* ft = func.getFunctionType();
@@ -249,10 +274,35 @@ void TargetCodeGen::emitPrologue(IR::Function& func) {
             emitter.emitText("  sd      " + argReg + ", " + std::to_string(offset) + "(sp)");
         }
     }
+
+    for (unsigned i = 0; i < func.getNumArgs(); ++i) {
+        auto* arg = func.getArg(i);
+        if (regAlloc.hasReg(arg)) {
+            int offset = getStackOffset(arg);
+            std::string r = regAlloc.getReg(arg);
+            auto* pt = ft->getParamTypes()[i];
+            if (pt->isFloat()) {
+                emitter.emitText("  flw     " + r + ", " + std::to_string(offset) + "(sp)");
+            } else if (pt->isPointer()) {
+                emitter.emitText("  ld      " + r + ", " + std::to_string(offset) + "(sp)");
+            } else {
+                emitter.emitText("  lw      " + r + ", " + std::to_string(offset) + "(sp)");
+            }
+        }
+    }
 }
 
 void TargetCodeGen::emitEpilogue(IR::Function& func) {
     if (stackSize > 0) {
+        int csrOffset = stackSize - 8;
+        for (auto& reg : regAlloc.getUsedCalleeSaved()) {
+            csrOffset -= 8;
+            if (reg[0] == 'f') {
+                emitter.emitText("  fld     " + reg + ", " + std::to_string(csrOffset) + "(sp)");
+            } else {
+                emitter.emitText("  ld      " + reg + ", " + std::to_string(csrOffset) + "(sp)");
+            }
+        }
         emitter.emitText("  ld      ra, " + std::to_string(stackSize - 8) + "(sp)");
         emitter.emitText("  addi    sp, sp, " + std::to_string(stackSize));
     }
@@ -332,17 +382,38 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
     }
 }
 
+static bool isFloatReg(const std::string& reg) {
+    return !reg.empty() && reg[0] == 'f';
+}
+
 std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg) {
     std::string result;
+    bool destIsFloat = isFloatReg(destReg);
 
     if (auto* ci = dynamic_cast<IR::ConstantInt*>(val)) {
-        result += "  li      " + destReg + ", " + std::to_string(ci->getValue()) + "\n";
+        result += "  li      t2, " + std::to_string(ci->getValue()) + "\n";
+        if (!destIsFloat) {
+            result += "  mv      " + destReg + ", t2\n";
+        } else {
+            result += "  fmv.w.x " + destReg + ", t2\n";
+        }
         return result;
     }
     if (auto* cf = dynamic_cast<IR::ConstantFloat*>(val)) {
         union { float f; uint32_t i; } u;
         u.f = static_cast<float>(cf->getValue());
-        result += "  li      " + destReg + ", " + std::to_string(u.i) + "\n";
+        result += "  li      t2, " + std::to_string(u.i) + "\n";
+        if (!destIsFloat) {
+            result += "  mv      " + destReg + ", t2\n";
+        } else {
+            result += "  fmv.w.x " + destReg + ", t2\n";
+        }
+        return result;
+    }
+
+    if (auto* gv = dynamic_cast<IR::GlobalVariable*>(val)) {
+        result += "  la      t2, " + gv->getName() + "\n";
+        result += "  mv      " + destReg + ", t2\n";
         return result;
     }
 
@@ -357,15 +428,29 @@ std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg)
         return result;
     }
 
-    auto* ty = val->getType();
-    if (ty->isPointer()) {
-        if (offset != 0) {
-            result += "  addi    " + destReg + ", sp, " + std::to_string(offset) + "\n";
-        } else {
-            result += "  mv      " + destReg + ", sp\n";
+    if (regAlloc.hasReg(val)) {
+        std::string r = regAlloc.getReg(val);
+        if (r != destReg) {
+            bool srcFloat = isFloatReg(r);
+            bool dstFloat = isFloatReg(destReg);
+            if (srcFloat && dstFloat) {
+                result += "  fmv.s   " + destReg + ", " + r + "\n";
+            } else if (srcFloat && !dstFloat) {
+                result += "  fmv.x.w " + destReg + ", " + r + "\n";
+            } else if (!srcFloat && dstFloat) {
+                result += "  fmv.w.x " + destReg + ", " + r + "\n";
+            } else {
+                result += "  mv      " + destReg + ", " + r + "\n";
+            }
         }
-    } else if (ty->isFloat()) {
+        return result;
+    }
+
+    auto* ty = val->getType();
+    if (ty->isFloat()) {
         result += "  flw     " + destReg + ", " + std::to_string(offset) + "(sp)\n";
+    } else if (ty->isPointer()) {
+        result += "  ld      " + destReg + ", " + std::to_string(offset) + "(sp)\n";
     } else {
         result += "  lw      " + destReg + ", " + std::to_string(offset) + "(sp)\n";
     }
@@ -375,12 +460,42 @@ std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg)
 std::string TargetCodeGen::storeFromReg(IR::Value* val, const std::string& srcReg, bool addNew) {
     (void)addNew;
     std::string result;
+
+    if (regAlloc.hasReg(val)) {
+        std::string r = regAlloc.getReg(val);
+        if (r != srcReg) {
+            bool srcFloat = isFloatReg(srcReg);
+            bool dstFloat = isFloatReg(r);
+            if (srcFloat && dstFloat) {
+                result += "  fmv.s   " + r + ", " + srcReg + "\n";
+            } else if (srcFloat && !dstFloat) {
+                result += "  fmv.x.w " + r + ", " + srcReg + "\n";
+            } else if (!srcFloat && dstFloat) {
+                result += "  fmv.w.x " + r + ", " + srcReg + "\n";
+            } else {
+                result += "  mv      " + r + ", " + srcReg + "\n";
+            }
+        }
+        int offset = getStackOffset(val);
+        auto* ty = val->getType();
+        if (ty && ty->isFloat()) {
+            result += "  fsw     " + r + ", " + std::to_string(offset) + "(sp)\n";
+        } else if (ty && ty->isPointer()) {
+            result += "  sd      " + r + ", " + std::to_string(offset) + "(sp)\n";
+        } else {
+            result += "  sw      " + r + ", " + std::to_string(offset) + "(sp)\n";
+        }
+        return result;
+    }
+
     int offset = getStackOffset(val);
     auto* ty = val->getType();
-    if (ty->isPointer() || ty->isInteger()) {
-        result += "  sw      " + srcReg + ", " + std::to_string(offset) + "(sp)\n";
-    } else if (ty->isFloat()) {
+    if (ty && ty->isFloat()) {
         result += "  fsw     " + srcReg + ", " + std::to_string(offset) + "(sp)\n";
+    } else if (ty && ty->isPointer()) {
+        result += "  sd      " + srcReg + ", " + std::to_string(offset) + "(sp)\n";
+    } else {
+        result += "  sw      " + srcReg + ", " + std::to_string(offset) + "(sp)\n";
     }
     return result;
 }
@@ -421,12 +536,15 @@ std::string TargetCodeGen::emitGlobalAddr(IR::GlobalVariable* gv, const std::str
 }
 
 std::string TargetCodeGen::emitValueToReg(IR::Value* val, const std::string& destReg) {
-    if (auto* gv = dynamic_cast<IR::GlobalVariable*>(val)) {
-        return emitGlobalAddr(gv, destReg);
-    }
     if (auto* ci = dynamic_cast<IR::ConstantInt*>(val)) {
+        bool destIsFloat = isFloatReg(destReg);
         std::string result;
-        result += "  li      " + destReg + ", " + std::to_string(ci->getValue()) + "\n";
+        result += "  li      t2, " + std::to_string(ci->getValue()) + "\n";
+        if (destIsFloat) {
+            result += "  fmv.w.x " + destReg + ", t2\n";
+        } else {
+            result += "  mv      " + destReg + ", t2\n";
+        }
         return result;
     }
     return loadToReg(val, destReg);
@@ -434,8 +552,14 @@ std::string TargetCodeGen::emitValueToReg(IR::Value* val, const std::string& des
 
 void TargetCodeGen::emitRet(IR::Instruction& inst) {
     if (inst.getNumOperands() > 0) {
-        std::string code = emitValueToReg(inst.getOperand(0), "a0");
-        emitter.emitText(code);
+        auto* retTy = inst.getOperand(0)->getType();
+        if (retTy && retTy->isFloat()) {
+            std::string code = emitValueToReg(inst.getOperand(0), "fa0");
+            emitter.emitText(code);
+        } else {
+            std::string code = emitValueToReg(inst.getOperand(0), "a0");
+            emitter.emitText(code);
+        }
     }
     emitter.emitText("  j       " + currentFunc->getName() + "_exit");
 }
@@ -446,7 +570,13 @@ void TargetCodeGen::emitBr(IR::Instruction& inst) {
 }
 
 void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
-    std::string code = loadToReg(inst.getOperand(0), "t0");
+    std::string code;
+    if (regAlloc.hasReg(inst.getOperand(0))) {
+        code += "  mv      t0, " + regAlloc.getReg(inst.getOperand(0)) + "\n";
+    } else {
+        int offset = getStackOffset(inst.getOperand(0));
+        code += "  lw      t0, " + std::to_string(offset) + "(sp)\n";
+    }
     auto* thenBB = dynamic_cast<IR::BasicBlock*>(inst.getOperand(1));
     auto* elseBB = dynamic_cast<IR::BasicBlock*>(inst.getOperand(2));
     code += "  bnez    t0, ." + thenBB->getName() + "\n";
@@ -500,7 +630,24 @@ void TargetCodeGen::emitIcmp(IR::Instruction& inst) {
     auto* condType = inst.getOperand(0)->getType();
     bool isFloat = condType && condType->isFloat();
 
-    if (isFloat) return;
+    if (isFloat) {
+        std::string code;
+        code += loadToReg(inst.getOperand(0), "ft0");
+        code += loadToReg(inst.getOperand(1), "ft1");
+
+        std::string cond = inst.getName();
+        if (cond == "eq")  code += "  feq.s   t0, ft0, ft1\n";
+        else if (cond == "ne") code += "  feq.s   t0, ft0, ft1\n  xori    t0, t0, 1\n";
+        else if (cond == "slt") code += "  flt.s   t0, ft0, ft1\n";
+        else if (cond == "sle") code += "  fle.s   t0, ft0, ft1\n";
+        else if (cond == "sgt") code += "  flt.s   t0, ft1, ft0\n";
+        else if (cond == "sge") code += "  fle.s   t0, ft1, ft0\n";
+        else code += "  flt.s   t0, ft0, ft1\n";
+
+        code += storeFromReg(&inst, "t0");
+        emitter.emitText(code);
+        return;
+    }
 
     std::string code;
     code += loadToReg(inst.getOperand(0), "t0");
@@ -540,16 +687,29 @@ void TargetCodeGen::emitFcmp(IR::Instruction& inst) {
 void TargetCodeGen::emitLoad(IR::Instruction& inst) {
     std::string code;
     code += loadToReg(inst.getOperand(0), "t0");
-    code += "  lw      t0, 0(t0)\n";
-    code += storeFromReg(&inst, "t0");
+    auto* loadTy = inst.getType();
+    if (loadTy && loadTy->isFloat()) {
+        code += "  flw     ft0, 0(t0)\n";
+        code += storeFromReg(&inst, "ft0");
+    } else {
+        code += "  lw      t0, 0(t0)\n";
+        code += storeFromReg(&inst, "t0");
+    }
     emitter.emitText(code);
 }
 
 void TargetCodeGen::emitStore(IR::Instruction& inst) {
     std::string code;
-    code += loadToReg(inst.getOperand(0), "t0");
-    code += loadToReg(inst.getOperand(1), "t1");
-    code += "  sw      t0, 0(t1)\n";
+    auto* valTy = inst.getOperand(0)->getType();
+    if (valTy && valTy->isFloat()) {
+        code += loadToReg(inst.getOperand(0), "ft0");
+        code += loadToReg(inst.getOperand(1), "t0");
+        code += "  fsw     ft0, 0(t0)\n";
+    } else {
+        code += loadToReg(inst.getOperand(0), "t0");
+        code += loadToReg(inst.getOperand(1), "t1");
+        code += "  sw      t0, 0(t1)\n";
+    }
     emitter.emitText(code);
 }
 
@@ -558,8 +718,15 @@ void TargetCodeGen::emitCall(IR::Instruction& inst) {
 
     unsigned numArgs = inst.getNumOperands() - 1;
     for (unsigned i = 0; i < numArgs; ++i) {
-        std::string argReg = (i < 8) ? std::string("a") + std::to_string(i) : "t1";
-        code += loadToReg(inst.getOperand(i + 1), argReg);
+        auto* argVal = inst.getOperand(i + 1);
+        auto* argTy = argVal->getType();
+        if (argTy && argTy->isFloat() && i < 8) {
+            std::string fReg = std::string("fa") + std::to_string(i);
+            code += loadToReg(argVal, fReg);
+        } else {
+            std::string argReg = (i < 8) ? std::string("a") + std::to_string(i) : "t1";
+            code += loadToReg(argVal, argReg);
+        }
     }
 
     std::string calleeName = inst.getOperand(0)->getName();
@@ -567,7 +734,11 @@ void TargetCodeGen::emitCall(IR::Instruction& inst) {
 
     auto* retTy = inst.getType();
     if (!retTy->isVoid()) {
-        code += storeFromReg(&inst, "a0");
+        if (retTy->isFloat()) {
+            code += storeFromReg(&inst, "fa0");
+        } else {
+            code += storeFromReg(&inst, "a0");
+        }
     }
 
     emitter.emitText(code);
@@ -578,10 +749,37 @@ void TargetCodeGen::emitGetElementPtr(IR::Instruction& inst) {
 
     code += loadToReg(inst.getOperand(0), "t0");
 
-    if (inst.getNumOperands() > 2) {
-        code += loadToReg(inst.getOperand(1), "t1");
-        code += "  slli    t1, t1, 2\n";
-        code += "  add     t0, t0, t1\n";
+    unsigned numOps = inst.getNumOperands();
+    if (numOps >= 3) {
+        auto* ptrTy = dynamic_cast<IR::PointerType*>(inst.getOperand(0)->getType());
+        IR::Type* curPointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
+
+        unsigned i = 1;
+        if (numOps >= 4) {
+            i = 2;
+        }
+
+        for (; i < numOps; ++i) {
+            int stride = 4;
+            if (curPointee && curPointee->isArray()) {
+                auto* arrTy = dynamic_cast<IR::ArrayType*>(curPointee);
+                stride = getTypeSize(arrTy->getElementType());
+                curPointee = arrTy->getElementType();
+            }
+            code += loadToReg(inst.getOperand(i), "t1");
+            if (stride == 1) {
+            } else if (stride == 2) {
+                code += "  slli    t1, t1, 1\n";
+            } else if (stride == 4) {
+                code += "  slli    t1, t1, 2\n";
+            } else if (stride == 8) {
+                code += "  slli    t1, t1, 3\n";
+            } else {
+                code += "  li      t2, " + std::to_string(stride) + "\n";
+                code += "  mul     t1, t1, t2\n";
+            }
+            code += "  add     t0, t0, t1\n";
+        }
     }
 
     code += storeFromReg(&inst, "t0");

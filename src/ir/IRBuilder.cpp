@@ -760,9 +760,8 @@ std::any IRBuilder::visitRelExp(SysY2022Parser::RelExpContext* ctx) {
         else if (opText == ">")   op = Instruction::Opcode::ICMP;
         else if (opText == "<=")  op = Instruction::Opcode::ICMP;
         else                      op = Instruction::Opcode::ICMP;
-        // Note: condition code differentiation for < > <= >= handled in codegen
 
-        auto* inst = Instruction::createBinOp(op, left->getType(), newTempName(), left, rightVal);
+        auto* inst = Instruction::createBinOp(op, IntegerType::I1, newTempName(), left, rightVal);
         currentBB->pushBack(inst);
         result = std::any(static_cast<Value*>(inst));
         i += 2;
@@ -785,7 +784,7 @@ std::any IRBuilder::visitEqExp(SysY2022Parser::EqExpContext* ctx) {
         Value* rightVal = valFrom(right);
 
         auto* inst = Instruction::createBinOp(
-            Instruction::Opcode::ICMP, left->getType(), newTempName(), left, rightVal);
+            Instruction::Opcode::ICMP, IntegerType::I1, newTempName(), left, rightVal);
         currentBB->pushBack(inst);
         result = std::any(static_cast<Value*>(inst));
         i += 2;

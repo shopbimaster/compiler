@@ -308,7 +308,7 @@ build/sysyc -S test/hello.sy -o hello.S
 > GCC=riscv64-linux-gnu-gcc
 > QEMU=qemu-riscv64
 > 
-> for test in hello arithmetic variable ifelse while_test func_call; do
+> for test in hello arithmetic variable ifelse while_test func_call global_var float_cmp; do
 >     build/sysyc -S test/${test}.sy -o /tmp/${test}.S
 >     $GCC -march=rv64gc -mabi=lp64d -static -o /tmp/${test}_bin /tmp/${test}.S
 >     echo -n "${test}: "
@@ -325,6 +325,8 @@ build/sysyc -S test/hello.sy -o hello.S
 > ifelse: exit=0
 > while_test: exit=5
 > func_call: exit=7
+> global_var: exit=42
+> float_cmp: exit=1
 > ```
 
 ### 9.3 单步调试汇编
@@ -355,7 +357,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
 cd /mnt/d/VSCodeProjects/compiler
 GCC=riscv64-linux-gnu-gcc QEMU=qemu-riscv64
 pass=0 fail=0
-for test in hello arithmetic variable ifelse while_test func_call; do
+for test in hello arithmetic variable ifelse while_test func_call global_var float_cmp; do
     build/sysyc -S test/${test}.sy -o /tmp/${test}.S
     $GCC -march=rv64gc -mabi=lp64d -static -o /tmp/${test}_bin /tmp/${test}.S 2>/dev/null || continue
     $QEMU /tmp/${test}_bin > /dev/null 2>&1
@@ -409,3 +411,5 @@ echo "后端: ${pass}/$((pass+fail)) 通过"
 | 后端: ifelse.sy | 分支端到端 | qemu exit=0 ✅ |
 | 后端: while_test.sy | 循环端到端 | qemu exit=5 ✅ |
 | 后端: func_call.sy | 函数调用端到端 | qemu exit=7 ✅ |
+| 后端: global_var.sy | 全局变量端到端 | qemu exit=42 ✅ |
+| 后端: float_cmp.sy | 浮点比较端到端 | qemu exit=1 ✅ |

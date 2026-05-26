@@ -57,6 +57,7 @@ target_link_libraries(sysy_compiler PUBLIC sysy_ir_builder)
 # ================================================================
 add_library(sysy_backend STATIC
     src/backend/TargetCodeGen.cpp
+    src/backend/RegisterAllocator.cpp
 )
 target_include_directories(sysy_backend PUBLIC include)
 target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
