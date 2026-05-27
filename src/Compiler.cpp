@@ -28,6 +28,7 @@ void Compiler::emitIRToFile(const std::string& sourcePath, const std::string& ou
 void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out) {
     auto mod = compile(sourcePath);
     Opt::runO1(mod.get());
+    Opt::runO2(mod.get());
     Backend::TargetCodeGen cg;
     std::string asmCode = cg.generate(*mod);
     out << Opt::peepholeOptimize(asmCode);
@@ -36,6 +37,7 @@ void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out) {
 void Compiler::emitAsmToFile(const std::string& sourcePath, const std::string& outputPath) {
     auto mod = compile(sourcePath);
     Opt::runO1(mod.get());
+    Opt::runO2(mod.get());
     Backend::TargetCodeGen cg;
     std::ofstream ofs(outputPath);
     if (!ofs.is_open()) {

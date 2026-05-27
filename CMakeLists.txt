@@ -63,13 +63,16 @@ target_include_directories(sysy_backend PUBLIC include)
 target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
 
 # ================================================================
-# O1 优化库
+# O1 + O2 优化库
 # ================================================================
 add_library(sysy_opt STATIC
     src/opt/Optimizer.cpp
     src/opt/ConstantFolding.cpp
     src/opt/DeadCodeElimination.cpp
     src/opt/PeepholeOptimizer.cpp
+    src/opt/InlineExpansion.cpp
+    src/opt/CSE.cpp
+    src/opt/LICM.cpp
 )
 target_include_directories(sysy_opt PUBLIC include)
 target_link_libraries(sysy_opt PUBLIC sysy_ir_core)

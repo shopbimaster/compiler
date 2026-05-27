@@ -2,6 +2,7 @@
 
 // ================================================================
 // O1 优化器 — 常量折叠 + 死代码消除 + 窥孔优化
+// O2 优化器 — 函数内联 + CSE + 循环不变量外提
 // ================================================================
 
 #include "ir/IR.h"
@@ -10,19 +11,19 @@
 namespace Opt {
 
 // ================================================================
-// 个体 Pass（对 Module 原地修改）
+// O1 Pass
 // ================================================================
 void constantFolding(IR::Module* mod);
 void deadCodeElimination(IR::Module* mod);
-
-// ================================================================
-// 汇编级窥孔优化（输入/输出为汇编文本）
-// ================================================================
 std::string peepholeOptimize(const std::string& asmCode);
+void runO1(IR::Module* mod);
 
 // ================================================================
-// O1 统一入口：对 IR Module 执行所有 O1 Pass
+// O2 Pass
 // ================================================================
-void runO1(IR::Module* mod);
+void inlineExpansion(IR::Module* mod);
+void commonSubexpressionElimination(IR::Module* mod);
+void loopInvariantCodeMotion(IR::Module* mod);
+void runO2(IR::Module* mod);
 
 } // namespace Opt
