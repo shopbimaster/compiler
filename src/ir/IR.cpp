@@ -123,6 +123,13 @@ namespace IR {
         }
     }
 
+    void Value::replaceAllUsesWith(Value* newVal) {
+        auto usesCopy = uses;
+        for (auto& u : usesCopy) {
+            u.user->setOperand(u.operandNo, newVal);
+        }
+    }
+
     // ================================================================
     // User
     // ================================================================

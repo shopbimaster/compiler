@@ -1,5 +1,6 @@
 #include "Compiler.h"
 #include "backend/TargetCodeGen.h"
+#include "opt/Optimizer.h"
 #include <fstream>
 #include <iostream>
 
@@ -26,18 +27,22 @@ void Compiler::emitIRToFile(const std::string& sourcePath, const std::string& ou
 
 void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out) {
     auto mod = compile(sourcePath);
+    Opt::runO1(mod.get());
     Backend::TargetCodeGen cg;
-    out << cg.generate(*mod);
+    std::string asmCode = cg.generate(*mod);
+    out << Opt::peepholeOptimize(asmCode);
 }
 
 void Compiler::emitAsmToFile(const std::string& sourcePath, const std::string& outputPath) {
     auto mod = compile(sourcePath);
+    Opt::runO1(mod.get());
     Backend::TargetCodeGen cg;
     std::ofstream ofs(outputPath);
     if (!ofs.is_open()) {
         throw std::runtime_error("Cannot open output file: " + outputPath);
     }
-    ofs << cg.generate(*mod);
+    std::string asmCode = cg.generate(*mod);
+    ofs << Opt::peepholeOptimize(asmCode);
 }
 
 } // namespace IR

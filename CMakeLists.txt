@@ -63,6 +63,18 @@ target_include_directories(sysy_backend PUBLIC include)
 target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
 
 # ================================================================
+# O1 优化库
+# ================================================================
+add_library(sysy_opt STATIC
+    src/opt/Optimizer.cpp
+    src/opt/ConstantFolding.cpp
+    src/opt/DeadCodeElimination.cpp
+    src/opt/PeepholeOptimizer.cpp
+)
+target_include_directories(sysy_opt PUBLIC include)
+target_link_libraries(sysy_opt PUBLIC sysy_ir_core)
+
+# ================================================================
 # IR 核心单元测试（不依赖 ANTLR 输入，但需 ANTLR 运行时符号）
 # ================================================================
 add_executable(test_ir
@@ -70,7 +82,7 @@ add_executable(test_ir
     ${ANTLR_SOURCES}
 )
 target_include_directories(test_ir PRIVATE ${ANTLR_INCLUDES})
-target_link_libraries(test_ir sysy_ir_builder antlr4_static)
+target_link_libraries(test_ir sysy_ir_builder sysy_opt antlr4_static)
 
 # ================================================================
 # 编译器主入口 sysyc
@@ -80,7 +92,7 @@ add_executable(sysyc
     ${ANTLR_SOURCES}
 )
 target_include_directories(sysyc PRIVATE include ${ANTLR_INCLUDES})
-target_link_libraries(sysyc sysy_compiler sysy_backend antlr4_static)
+target_link_libraries(sysyc sysy_compiler sysy_backend sysy_opt antlr4_static)
 
 # ================================================================
 # 集成测试
@@ -90,4 +102,4 @@ add_executable(test_integration
     ${ANTLR_SOURCES}
 )
 target_include_directories(test_integration PRIVATE include ${ANTLR_INCLUDES})
-target_link_libraries(test_integration sysy_compiler antlr4_static)
+target_link_libraries(test_integration sysy_compiler sysy_opt antlr4_static)
