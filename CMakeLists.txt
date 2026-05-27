@@ -63,7 +63,7 @@ target_include_directories(sysy_backend PUBLIC include)
 target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
 
 # ================================================================
-# O1 + O2 优化库
+# O1 + O2 + O3 优化库
 # ================================================================
 add_library(sysy_opt STATIC
     src/opt/Optimizer.cpp
@@ -73,6 +73,9 @@ add_library(sysy_opt STATIC
     src/opt/InlineExpansion.cpp
     src/opt/CSE.cpp
     src/opt/LICM.cpp
+    src/opt/AlgebraicSimplification.cpp
+    src/opt/LoopUnrolling.cpp
+    src/opt/TailRecursionElimination.cpp
 )
 target_include_directories(sysy_opt PUBLIC include)
 target_link_libraries(sysy_opt PUBLIC sysy_ir_core)

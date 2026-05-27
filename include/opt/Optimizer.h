@@ -3,6 +3,7 @@
 // ================================================================
 // O1 优化器 — 常量折叠 + 死代码消除 + 窥孔优化
 // O2 优化器 — 函数内联 + CSE + 循环不变量外提
+// O3 优化器 — 代数化简 + 循环展开 + 尾递归消除
 // ================================================================
 
 #include "ir/IR.h"
@@ -25,5 +26,13 @@ void inlineExpansion(IR::Module* mod);
 void commonSubexpressionElimination(IR::Module* mod);
 void loopInvariantCodeMotion(IR::Module* mod);
 void runO2(IR::Module* mod);
+
+// ================================================================
+// O3 Pass
+// ================================================================
+void algebraicSimplification(IR::Module* mod);
+void loopUnrolling(IR::Module* mod);
+void tailRecursionElimination(IR::Module* mod);
+void runO3(IR::Module* mod);
 
 } // namespace Opt

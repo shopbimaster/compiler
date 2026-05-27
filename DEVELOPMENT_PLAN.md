@@ -201,7 +201,7 @@
 | O0 | 无优化（仅正确翻译） | 1× |
 | O1 | 常量折叠、死代码消除、窥孔优化 | ✅ 已实现 |
 | O2 | 函数内联、CSE、循环不变量外提、线性扫描寄存器分配 | ✅ 已实现 |
-| O3 | +循环交换、循环分块、循环展开、指令调度、位运算模式识别 | 5~100× |
+| O3 | 代数化简+强度削减、循环展开、尾递归消除 | ✅ 已实现 |
 
 ### 6.2 O2 实现详情
 
@@ -212,6 +212,18 @@
 | LICM | `src/opt/LICM.cpp` | 支配树 + 自然循环检测 + 前置块外提（保守跳过头块含 PHI 的循环） | ✅ |
 
 **O2 流水线**: `inlineExpansion → constantFolding → deadCodeElimination → CSE → LICM → constantFolding → deadCodeElimination`
+
+### 6.2b O3 实现详情
+
+| Pass | 文件 | 策略 | 状态 |
+|------|------|------|------|
+| 代数化简+强度削减 | `src/opt/AlgebraicSimplification.cpp` | SDIV/SREM/MUL 幂→移位/位与、恒等式（x+0→x, x*1→x, x&0→0 等） | ✅ |
+| 循环展开 | `src/opt/LoopUnrolling.cpp` | 支配树检测自然循环、迭代次数≤32、2×展开、更新 ICMP 常量 | ✅ |
+| 尾递归消除 | `src/opt/TailRecursionElimination.cpp` | 检测 CALL self 后 RET → store 新参数 → br 回函数体 | ✅ |
+
+**O3 流水线**: `algebraicSimplification → constantFolding → DCE → loopUnrolling → constantFolding → DCE → tailRecursionElimination → constantFolding → DCE`
+
+> 注：循环交换、循环分块、指令调度涉及深度 CFG 重构和后端调度，留待后续迭代实现。
 
 ### 6.3 关键优化详解
 
@@ -312,7 +324,7 @@
 ## 📝 备注
 
 - **当前日期**: 2026-05-27
-- **当前阶段**: 第 6 阶段（O2 优化）— O1 ✅ + O2 ✅（内联+CSE+LICM），52/52 全部测试通过
+- **当前阶段**: 第 6 阶段（O1/O2/O3 优化）— O1 ✅ + O2 ✅（内联+CSE+LICM）+ O3 ✅（代数化简+循环展开+尾递归消除），52/52 全部测试通过
 - **架构决策**: Visitor 直接生成 IR，无中间 AST；无 SemanticAnalyzer
 - **测试策略**: 单元测试 + 集成测试 + 端到端对比 diff
 - **本地验证**: QEMU/Spike RISC-V 模拟器可代替 FPGA 进行功能验证
