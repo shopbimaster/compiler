@@ -46,6 +46,12 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
     std::unordered_map<IR::Value*, int> firstSeen;
     std::unordered_map<IR::Value*, int> lastSeen;
 
+    for (unsigned i = 0; i < func.getNumArgs(); ++i) {
+        auto* arg = func.getArg(i);
+        firstSeen[arg] = 0;
+        lastSeen[arg] = 0;
+    }
+
     for (auto& bb : func.getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
             int curId = instId[inst.get()];

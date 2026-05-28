@@ -31,7 +31,7 @@ run_test() {
 run_test hello 0
 run_test arithmetic 7
 run_test variable 42
-run_test ifelse 0
+run_test ifelse 1
 run_test while_test 5
 run_test func_call 7
 run_test global_var 42

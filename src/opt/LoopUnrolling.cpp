@@ -176,25 +176,61 @@ bool isSimpleBody(IR::BasicBlock* bodyBB) {
     return true;
 }
 
-// ---- 克隆一条非终止指令，给新名字避免冲突 ----
-IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId) {
+// ---- 克隆一条非终止指令，给新名字避免冲突，支持操作数重映射 ----
+IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId,
+                                   std::unordered_map<IR::Value*, IR::Value*>& valueMap) {
     auto op = src->getOpcode();
     using Opc = IR::Instruction::Opcode;
 
+    if (op == Opc::BR || op == Opc::COND_BR || op == Opc::RET) return nullptr;
+    if (op == Opc::PHI || op == Opc::CALL || op == Opc::ALLOCA) return nullptr;
+
     std::string newName = src->getName() + ".u" + std::to_string(copyId);
 
-    if (op == Opc::ALLOCA || op == Opc::LOAD || op == Opc::STORE) return nullptr;
-    if (op == Opc::BR || op == Opc::COND_BR || op == Opc::RET) return nullptr;
-    if (op == Opc::PHI || op == Opc::CALL || op == Opc::GETELEMENTPTR) return nullptr;
+    auto lookup = [&](IR::Value* v) -> IR::Value* {
+        if (!v) return nullptr;
+        auto it = valueMap.find(v);
+        return (it != valueMap.end()) ? it->second : v;
+    };
 
-    // 二元运算 / ICMP / 类型转换 — 直接克隆操作数引用
-    if (src->getNumOperands() >= 2)
-        return IR::Instruction::createBinOp(
-            op, src->getType(), newName,
-            src->getOperand(0), src->getOperand(1));
-    if (src->getNumOperands() >= 1)
-        return IR::Instruction::createCast(
-            op, src->getType(), src->getOperand(0), newName);
+    if (op == Opc::LOAD) {
+        auto* ptr = lookup(src->getOperand(0));
+        return IR::Instruction::createLoad(src->getType(), ptr, newName);
+    }
+
+    if (op == Opc::STORE) {
+        auto* val = lookup(src->getOperand(0));
+        auto* ptr = src->getOperand(1);
+        return IR::Instruction::createStore(val, ptr);
+    }
+
+    if (op == Opc::GETELEMENTPTR) {
+        auto* ptr = lookup(src->getOperand(0));
+        auto* ptrType = dynamic_cast<IR::PointerType*>(src->getOperand(0)->getType());
+        IR::Type* pointee = ptrType ? ptrType->getPointeeType() : src->getType();
+        std::vector<IR::Value*> indices;
+        for (unsigned i = 1; i < src->getNumOperands(); ++i)
+            indices.push_back(lookup(src->getOperand(i)));
+        return IR::Instruction::createGetElementPtr(pointee, ptr, indices, newName);
+    }
+
+    if (op == Opc::ICMP || op == Opc::FCMP) {
+        auto* lhs = lookup(src->getOperand(0));
+        auto* rhs = lookup(src->getOperand(1));
+        return IR::Instruction::createCmp(op, lhs, rhs, src->getName());
+    }
+
+    if (src->getNumOperands() >= 2) {
+        auto* lhs = lookup(src->getOperand(0));
+        auto* rhs = lookup(src->getOperand(1));
+        return IR::Instruction::createBinOp(op, src->getType(), newName, lhs, rhs);
+    }
+
+    if (src->getNumOperands() >= 1) {
+        auto* op0 = lookup(src->getOperand(0));
+        return IR::Instruction::createCast(op, src->getType(), op0, newName);
+    }
+
     return nullptr;
 }
 
@@ -219,6 +255,8 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     if (tc < 0) tc = inferTripCount(loop.header);
     loop.tripCount = tc;
     if (tc < 2 || tc > 32) return false;
+    unsigned factor = 2;
+    if (tc % factor != 0) return false;
 
     // 收集可克隆的非终止指令
     std::vector<IR::Instruction*> toClone;
@@ -230,35 +268,23 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
         toClone.push_back(inst.get());
     }
     if (toClone.empty()) return false;
-
-    // 在 bodyBB 的终止指令之前插入克隆指令
-    unsigned factor = 2;
-    auto termIt = bodyBB->end();
-    --termIt; // 指向终止指令
-
+    std::unordered_map<IR::Value*, IR::Value*> valueMap;
+    std::vector<IR::Instruction*> clonedInsts;
     for (unsigned u = 1; u < factor; ++u) {
         for (auto* src : toClone) {
-            auto* cloned = cloneNonTermInst(src, u);
+            auto* cloned = cloneNonTermInst(src, u, valueMap);
             if (cloned) {
-                bodyBB->insert(termIt, cloned);
+                valueMap[src] = cloned;
+                clonedInsts.push_back(cloned);
             }
         }
     }
+    if (clonedInsts.empty()) return false;
 
-    // 更新 header 中的迭代条件，步长翻倍
-    // 找 header 中的 ICMP 常量，除以 factor
-    for (auto& inst : loop.header->getInstructions()) {
-        if (inst->getOpcode() != IR::Instruction::Opcode::ICMP) continue;
-        if (inst->getNumOperands() < 2) continue;
-        auto* rc = dynamic_cast<IR::ConstantInt*>(inst->getOperand(1));
-        if (!rc) continue;
-        int64_t oldVal = rc->getValue();
-        if (oldVal > 1) {
-            int64_t newVal = (oldVal + factor - 1) / factor; // 向上取整
-            auto* newConst = IR::ConstantInt::get(
-                dynamic_cast<IR::IntegerType*>(rc->getType()), newVal);
-            inst->setOperand(1, newConst);
-        }
+    for (auto* cloned : clonedInsts) {
+        auto termIt = bodyBB->end();
+        --termIt;
+        bodyBB->insert(termIt, cloned);
     }
 
     return true;

@@ -164,14 +164,18 @@ bool eliminateOnFunction(IR::Function* func) {
     auto argAllocas = findParamAllocas(func);
     if (argAllocas.empty()) return false;
 
-    bool changed = false;
+    std::vector<IR::Instruction*> tailCalls;
     for (auto& bb : func->getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
             if (isTailCall(inst.get())) {
-                if (eliminateTailCall(inst.get(), func, argAllocas))
-                    changed = true;
+                tailCalls.push_back(inst.get());
             }
         }
+    }
+    bool changed = false;
+    for (auto* call : tailCalls) {
+        if (eliminateTailCall(call, func, argAllocas))
+            changed = true;
     }
     return changed;
 }

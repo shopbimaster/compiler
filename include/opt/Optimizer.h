@@ -35,4 +35,11 @@ void loopUnrolling(IR::Module* mod);
 void tailRecursionElimination(IR::Module* mod);
 void runO3(IR::Module* mod);
 
+// ================================================================
+// P0 Pass — 语义级优化
+// ================================================================
+void recursiveMulToNative(IR::Module* mod);
+void bitOpPatternRecognition(IR::Module* mod);
+void runP0(IR::Module* mod);
+
 } // namespace Opt

@@ -655,10 +655,10 @@ std::any IRBuilder::visitUnaryExp(SysY2022Parser::UnaryExpContext* ctx) {
             currentBB->pushBack(inst);
             return std::any(static_cast<Value*>(inst));
         } else if (op == "!") {
-            // !x → eq x, 0
+            // !x → icmp eq x, 0
             Value* zero = ConstantInt::get(IntegerType::I32, 0);
             auto* inst = Instruction::createCmp(
-                Instruction::Opcode::ICMP, operand, zero, newTempName());
+                Instruction::Opcode::ICMP, operand, zero, "eq");
             currentBB->pushBack(inst);
             return std::any(static_cast<Value*>(inst));
         }
@@ -755,13 +755,14 @@ std::any IRBuilder::visitRelExp(SysY2022Parser::RelExpContext* ctx) {
         if (dynamic_cast<tree::TerminalNode*>(opNode)) {
             opText = static_cast<tree::TerminalNode*>(opNode)->getSymbol()->getText();
         }
-        Instruction::Opcode op;
-        if (opText == "<")        op = Instruction::Opcode::ICMP;
-        else if (opText == ">")   op = Instruction::Opcode::ICMP;
-        else if (opText == "<=")  op = Instruction::Opcode::ICMP;
-        else                      op = Instruction::Opcode::ICMP;
+        std::string cond;
+        if (opText == "<")        cond = "slt";
+        else if (opText == ">")   cond = "sgt";
+        else if (opText == "<=")  cond = "sle";
+        else                      cond = "sge";
 
-        auto* inst = Instruction::createBinOp(op, IntegerType::I1, newTempName(), left, rightVal);
+        auto* inst = Instruction::createCmp(
+            Instruction::Opcode::ICMP, left, rightVal, cond);
         currentBB->pushBack(inst);
         result = std::any(static_cast<Value*>(inst));
         i += 2;
@@ -783,8 +784,14 @@ std::any IRBuilder::visitEqExp(SysY2022Parser::EqExpContext* ctx) {
         Value* left = valFrom(result);
         Value* rightVal = valFrom(right);
 
-        auto* inst = Instruction::createBinOp(
-            Instruction::Opcode::ICMP, IntegerType::I1, newTempName(), left, rightVal);
+        std::string opText;
+        if (dynamic_cast<tree::TerminalNode*>(opNode)) {
+            opText = static_cast<tree::TerminalNode*>(opNode)->getSymbol()->getText();
+        }
+        std::string cond = (opText == "==") ? "eq" : "ne";
+
+        auto* inst = Instruction::createCmp(
+            Instruction::Opcode::ICMP, left, rightVal, cond);
         currentBB->pushBack(inst);
         result = std::any(static_cast<Value*>(inst));
         i += 2;

@@ -76,6 +76,8 @@ add_library(sysy_opt STATIC
     src/opt/AlgebraicSimplification.cpp
     src/opt/LoopUnrolling.cpp
     src/opt/TailRecursionElimination.cpp
+    src/opt/RecursiveMulToNative.cpp
+    src/opt/BitOpPatternRecognition.cpp
 )
 target_include_directories(sysy_opt PUBLIC include)
 target_link_libraries(sysy_opt PUBLIC sysy_ir_core)

@@ -30,6 +30,7 @@ void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out) {
     Opt::runO1(mod.get());
     Opt::runO2(mod.get());
     Opt::runO3(mod.get());
+    Opt::runP0(mod.get());
     Backend::TargetCodeGen cg;
     std::string asmCode = cg.generate(*mod);
     out << Opt::peepholeOptimize(asmCode);
@@ -40,6 +41,7 @@ void Compiler::emitAsmToFile(const std::string& sourcePath, const std::string& o
     Opt::runO1(mod.get());
     Opt::runO2(mod.get());
     Opt::runO3(mod.get());
+    Opt::runP0(mod.get());
     Backend::TargetCodeGen cg;
     std::ofstream ofs(outputPath);
     if (!ofs.is_open()) {

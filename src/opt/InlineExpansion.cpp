@@ -101,9 +101,9 @@ IR::Instruction* cloneInstruction(
         cloned = IR::Instruction::createGetElementPtr(
             pointee, lookup(src->getOperand(0)), indices, src->getName() + ".i");
     } else if (op == Opc::ICMP || op == Opc::FCMP) {
-        cloned = IR::Instruction::createBinOp(
-            op, src->getType(), src->getName() + ".i",
-            lookup(src->getOperand(0)), lookup(src->getOperand(1)));
+        cloned = IR::Instruction::createCmp(
+            op, lookup(src->getOperand(0)), lookup(src->getOperand(1)),
+            src->getName());
     } else if (op == Opc::ZEXT || op == Opc::SEXT || op == Opc::TRUNC ||
                op == Opc::SITOFP || op == Opc::FPTOSI) {
         cloned = IR::Instruction::createCast(

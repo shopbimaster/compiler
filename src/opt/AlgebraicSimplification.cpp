@@ -74,6 +74,9 @@ bool trySimplify(IR::Instruction* inst) {
             if (op == id.opcode && rv == id.val) {
                 inst->replaceAllUsesWith(l);
                 inst->dropAllUses();
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) { bb->erase(it); break; }
+                }
                 return true;
             }
         }
@@ -86,6 +89,9 @@ bool trySimplify(IR::Instruction* inst) {
             if (op == z.opcode && rv == z.val) {
                 inst->replaceAllUsesWith(rc);
                 inst->dropAllUses();
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) { bb->erase(it); break; }
+                }
                 return true;
             }
         }
@@ -149,21 +155,33 @@ bool trySimplify(IR::Instruction* inst) {
             if ((op == Opc::ADD || op == Opc::OR || op == Opc::XOR) && lv == 0) {
                 inst->replaceAllUsesWith(r);
                 inst->dropAllUses();
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) { bb->erase(it); break; }
+                }
                 return true;
             }
             if (op == Opc::MUL && lv == 1) {
                 inst->replaceAllUsesWith(r);
                 inst->dropAllUses();
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) { bb->erase(it); break; }
+                }
                 return true;
             }
             if (op == Opc::MUL && lv == 0) {
                 inst->replaceAllUsesWith(lc);
                 inst->dropAllUses();
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) { bb->erase(it); break; }
+                }
                 return true;
             }
             if (op == Opc::AND && lv == 0) {
                 inst->replaceAllUsesWith(lc);
                 inst->dropAllUses();
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) { bb->erase(it); break; }
+                }
                 return true;
             }
         }
