@@ -25,6 +25,7 @@ static void runOptPasses(Module* mod, OptLevel opt) {
         Opt::runO2(mod);
         Opt::runO3(mod);
         Opt::runP0(mod);
+        Opt::runP3(mod);
         break;
     case OptLevel::O0:
     default:

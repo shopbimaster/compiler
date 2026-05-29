@@ -264,6 +264,29 @@ void test_loop_interchange_integration() {
     PASS();
 }
 
+void test_instruction_scheduling_integration() {
+    TEST("InstructionScheduling 优化集成（P3 流水线）");
+    IRBuilder builder;
+    auto mod = builder.compile("../test/instr_sched_basic.sy");
+    std::string before = mod->dump();
+
+    CHECK(before.find("define i32 @compute") != std::string::npos);
+    CHECK(before.find("define i32 @main()") != std::string::npos);
+
+    // Run full optimization pipeline including P3
+    Opt::runO1(mod.get());
+    Opt::runO2(mod.get());
+    Opt::runO3(mod.get());
+    Opt::runP0(mod.get());
+    Opt::runP3(mod.get());
+    std::string after = mod->dump();
+
+    CHECK(after.find("define i32 @compute") != std::string::npos);
+    CHECK(after.find("define i32 @main()") != std::string::npos);
+
+    PASS();
+}
+
 int main() {
     std::cout << "=== 集成测试: .sy -> IR ===\n\n";
 
@@ -291,6 +314,7 @@ int main() {
     test_global_const_arr();
     test_arr_partial();
     test_loop_interchange_integration();
+    test_instruction_scheduling_integration();
 
     std::cout << "\n=== 结果: " << passed << " passed, "
               << failed << " failed ===\n";

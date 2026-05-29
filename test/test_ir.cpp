@@ -494,6 +494,290 @@ void test_loop_interchange_computation_body() {
 }
 
 // ================================================================
+// 测试 10: 循环展开 — 2× 基础展开
+// ================================================================
+void test_loop_unrolling_basic() {
+    TEST("LoopUnrolling 2× 基础展开");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+
+    auto* entry  = func->createBlock("entry");
+    auto* header = func->createBlock("while_cond");
+    auto* body   = func->createBlock("while_body");
+    auto* exitBB = func->createBlock("while_exit");
+
+    auto* iVar = Instruction::createAlloca(IntegerType::I32, "i");
+    auto* sumVar = Instruction::createAlloca(IntegerType::I32, "sum");
+
+    entry->pushBack(iVar);
+    entry->pushBack(sumVar);
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), iVar));
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), sumVar));
+    entry->pushBack(Instruction::createBr(header));
+
+    auto* iLoadCmp = createLoadInstruction(iVar, "i_ld");
+    header->pushBack(iLoadCmp);
+    header->pushBack(Instruction::createCmp(Instruction::Opcode::ICMP,
+        iLoadCmp, ConstantInt::get(IntegerType::I32, 10), "slt"));
+    header->pushBack(Instruction::createCondBr(
+        header->getInstructions().back().get(), body, exitBB));
+
+    auto* sLoad = createLoadInstruction(sumVar, "s_ld");
+    body->pushBack(sLoad);
+    body->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "s_next", sLoad, ConstantInt::get(IntegerType::I32, 2)));
+    body->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(body->getInstructions().back().get()), sumVar));
+    auto* iLoadInc = createLoadInstruction(iVar, "i_ld2");
+    body->pushBack(iLoadInc);
+    body->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "i_next", iLoadInc, ConstantInt::get(IntegerType::I32, 1)));
+    body->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(body->getInstructions().back().get()), iVar));
+    body->pushBack(Instruction::createBr(header));
+
+    exitBB->pushBack(Instruction::createRet(ConstantInt::get(IntegerType::I32, 0)));
+
+    Opt::loopUnrolling(&mod);
+    std::string after = mod.dump();
+
+    // tc=10 → 2× 展开，1 份克隆体（.u1 后缀）
+    CHECK(after.find("s_next.u1") != std::string::npos);
+    CHECK(after.find("i_next.u1") != std::string::npos);
+
+    PASS();
+}
+
+// ================================================================
+// 测试 11: 循环展开 — 4× 增强展开（P3-4）
+// ================================================================
+void test_loop_unrolling_4x() {
+    TEST("LoopUnrolling 4× 增强展开（P3-4）");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+
+    auto* entry  = func->createBlock("entry");
+    auto* header = func->createBlock("while_cond");
+    auto* body   = func->createBlock("while_body");
+    auto* exitBB = func->createBlock("while_exit");
+
+    auto* iVar = Instruction::createAlloca(IntegerType::I32, "i");
+    auto* aVar = Instruction::createAlloca(IntegerType::I32, "a");
+
+    entry->pushBack(iVar);
+    entry->pushBack(aVar);
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), iVar));
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), aVar));
+    entry->pushBack(Instruction::createBr(header));
+
+    auto* iLoadCmp = createLoadInstruction(iVar, "i_ld");
+    header->pushBack(iLoadCmp);
+    header->pushBack(Instruction::createCmp(Instruction::Opcode::ICMP,
+        iLoadCmp, ConstantInt::get(IntegerType::I32, 8), "slt"));
+    header->pushBack(Instruction::createCondBr(
+        header->getInstructions().back().get(), body, exitBB));
+
+    auto* aLoad1 = createLoadInstruction(aVar, "a_ld");
+    body->pushBack(aLoad1);
+    body->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "a_next", aLoad1, ConstantInt::get(IntegerType::I32, 1)));
+    body->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(body->getInstructions().back().get()), aVar));
+    auto* iLoadInc = createLoadInstruction(iVar, "i_ld2");
+    body->pushBack(iLoadInc);
+    body->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "i_next", iLoadInc, ConstantInt::get(IntegerType::I32, 1)));
+    body->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(body->getInstructions().back().get()), iVar));
+    body->pushBack(Instruction::createBr(header));
+
+    exitBB->pushBack(Instruction::createRet(ConstantInt::get(IntegerType::I32, 0)));
+
+    Opt::loopUnrolling(&mod);
+    std::string after = mod.dump();
+
+    // tc=8 应触发 4× 展开（3 份克隆体）
+    CHECK(after.find("a_next.u1") != std::string::npos);
+    CHECK(after.find("a_next.u2") != std::string::npos);
+    CHECK(after.find("a_next.u3") != std::string::npos);
+
+    CHECK(after.find("i_next.u1") != std::string::npos);
+    CHECK(after.find("i_next.u2") != std::string::npos);
+    CHECK(after.find("i_next.u3") != std::string::npos);
+
+    PASS();
+}
+
+// ================================================================
+// 测试 11: 循环展开 — tc=6 回退 2×
+// ================================================================
+void test_loop_unrolling_fallback_2x() {
+    TEST("LoopUnrolling tc=6 回退 2× 展开");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+
+    auto* entry  = func->createBlock("entry");
+    auto* header = func->createBlock("while_cond");
+    auto* body   = func->createBlock("while_body");
+    auto* exitBB = func->createBlock("while_exit");
+
+    auto* iVar = Instruction::createAlloca(IntegerType::I32, "i");
+    auto* aVar = Instruction::createAlloca(IntegerType::I32, "a");
+
+    entry->pushBack(iVar);
+    entry->pushBack(aVar);
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), iVar));
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), aVar));
+    entry->pushBack(Instruction::createBr(header));
+
+    auto* iLoadCmp = createLoadInstruction(iVar, "i_ld");
+    header->pushBack(iLoadCmp);
+    header->pushBack(Instruction::createCmp(Instruction::Opcode::ICMP,
+        iLoadCmp, ConstantInt::get(IntegerType::I32, 6), "slt"));
+    header->pushBack(Instruction::createCondBr(
+        header->getInstructions().back().get(), body, exitBB));
+
+    auto* aLoad1 = createLoadInstruction(aVar, "a_ld");
+    body->pushBack(aLoad1);
+    body->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "a_next", aLoad1, ConstantInt::get(IntegerType::I32, 1)));
+    body->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(body->getInstructions().back().get()), aVar));
+    auto* iLoadInc = createLoadInstruction(iVar, "i_ld2");
+    body->pushBack(iLoadInc);
+    body->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "i_next", iLoadInc, ConstantInt::get(IntegerType::I32, 1)));
+    body->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(body->getInstructions().back().get()), iVar));
+    body->pushBack(Instruction::createBr(header));
+
+    exitBB->pushBack(Instruction::createRet(ConstantInt::get(IntegerType::I32, 0)));
+
+    Opt::loopUnrolling(&mod);
+    std::string after = mod.dump();
+
+    // tc=6 → 回退 2×，只有 1 份克隆体
+    CHECK(after.find("a_next.u1") != std::string::npos);
+    CHECK(after.find("a_next.u2") == std::string::npos);
+
+    PASS();
+}
+
+// ================================================================
+// 测试 13: 指令调度 — LOAD 提前
+// ================================================================
+void test_instruction_scheduling_load_hoist() {
+    TEST("InstructionScheduling LOAD 指令提前（P3-3）");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+
+    auto* bb = func->createBlock("entry");
+
+    // 创建一个场景：add（独立运算）在前，load 在后
+    auto* a = Instruction::createAlloca(IntegerType::I32, "a");
+    auto* b = Instruction::createAlloca(IntegerType::I32, "b");
+    bb->pushBack(a);
+    bb->pushBack(b);
+
+    // 先 store 一些值
+    bb->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 1), a));
+    bb->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 2), b));
+
+    // 独立运算（不依赖 load）
+    auto* c1 = Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "c1", ConstantInt::get(IntegerType::I32, 3),
+        ConstantInt::get(IntegerType::I32, 4));
+    bb->pushBack(c1);
+
+    auto* c2 = Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "c2", ConstantInt::get(IntegerType::I32, 5),
+        ConstantInt::get(IntegerType::I32, 6));
+    bb->pushBack(c2);
+
+    // LOAD（被调度后应该提前到 c1, c2 之前）
+    auto* aLoad = Instruction::createLoad(IntegerType::I32, a, "a_val");
+    bb->pushBack(aLoad);
+
+    auto* bLoad = Instruction::createLoad(IntegerType::I32, b, "b_val");
+    bb->pushBack(bLoad);
+
+    // 使用 load 结果的运算
+    auto* sum = Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "sum", aLoad, bLoad);
+    bb->pushBack(sum);
+
+    bb->pushBack(Instruction::createRet(sum));
+
+    Opt::instructionScheduling(&mod);
+    std::string after = mod.dump();
+
+    // LOAD 应该被调度到独立运算之前（更早的位置）
+    auto aLoadPos = after.find("%a_val");
+    auto c1Pos = after.find("%c1");
+    auto c2Pos = after.find("%c2");
+
+    CHECK(aLoadPos != std::string::npos);
+    CHECK(c1Pos != std::string::npos);
+    CHECK(c2Pos != std::string::npos);
+
+    // LOAD 应该在独立运算之前
+    CHECK(aLoadPos < c1Pos);
+
+    PASS();
+}
+
+// ================================================================
+// 测试 14: 指令调度 — 依赖链保持顺序
+// ================================================================
+void test_instruction_scheduling_dep_chain() {
+    TEST("InstructionScheduling 依赖链保持顺序不变");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+
+    auto* bb = func->createBlock("entry");
+
+    auto* a = Instruction::createAlloca(IntegerType::I32, "a");
+    bb->pushBack(a);
+    bb->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 1), a));
+
+    auto* v1 = Instruction::createLoad(IntegerType::I32, a, "v1");
+    bb->pushBack(v1);
+
+    auto* v2 = Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "v2", v1, ConstantInt::get(IntegerType::I32, 1));
+    bb->pushBack(v2);
+
+    auto* v3 = Instruction::createBinOp(Instruction::Opcode::MUL,
+        IntegerType::I32, "v3", v2, ConstantInt::get(IntegerType::I32, 2));
+    bb->pushBack(v3);
+
+    bb->pushBack(Instruction::createRet(v3));
+
+    std::string before = mod.dump();
+    Opt::instructionScheduling(&mod);
+    std::string after = mod.dump();
+
+    auto v1Pos = after.find("%v1");
+    auto v2Pos = after.find("%v2");
+    auto v3Pos = after.find("%v3");
+
+    CHECK(v1Pos < v2Pos);
+    CHECK(v2Pos < v3Pos);
+
+    PASS();
+}
+
+// ================================================================
 // main
 // ================================================================
 int main() {
@@ -521,6 +805,15 @@ int main() {
     test_loop_interchange_basic();
     test_loop_interchange_noop_single();
     test_loop_interchange_computation_body();
+
+    std::cout << "\n[Loop Unrolling]\n";
+    test_loop_unrolling_basic();
+    test_loop_unrolling_4x();
+    test_loop_unrolling_fallback_2x();
+
+    std::cout << "\n[Instruction Scheduling]\n";
+    test_instruction_scheduling_load_hoist();
+    test_instruction_scheduling_dep_chain();
 
     std::cout << "\n=== 结果: " << passed << " passed, "
               << failed << " failed ===\n";

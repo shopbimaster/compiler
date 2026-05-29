@@ -34,7 +34,13 @@ void algebraicSimplification(IR::Module* mod);
 void loopUnrolling(IR::Module* mod);
 void loopInterchange(IR::Module* mod);
 void tailRecursionElimination(IR::Module* mod);
+void instructionScheduling(IR::Module* mod);
 void runO3(IR::Module* mod);
+
+// ================================================================
+// P3 Pass — 高级优化
+// ================================================================
+void runP3(IR::Module* mod);
 
 // ================================================================
 // P0 Pass — 语义级优化

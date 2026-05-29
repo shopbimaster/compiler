@@ -234,7 +234,7 @@ IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId,
     return nullptr;
 }
 
-// ---- 对单个循环做 2 倍展开 ----
+// ---- 对单个循环做展开（优先 4×，回退 2×） ----
 bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     // 仅处理单 BB 循环体
     if (loop.body.size() > 2) return false; // header + body
@@ -255,8 +255,12 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     if (tc < 0) tc = inferTripCount(loop.header);
     loop.tripCount = tc;
     if (tc < 2 || tc > 32) return false;
-    unsigned factor = 2;
-    if (tc % factor != 0) return false;
+
+    // 优先 4× 展开，回退到 2×
+    unsigned factor = 0;
+    if (tc % 4 == 0 && tc >= 4) factor = 4;
+    else if (tc % 2 == 0)      factor = 2;
+    if (factor == 0) return false;
 
     // 收集可克隆的非终止指令
     std::vector<IR::Instruction*> toClone;
@@ -268,6 +272,7 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
         toClone.push_back(inst.get());
     }
     if (toClone.empty()) return false;
+
     std::unordered_map<IR::Value*, IR::Value*> valueMap;
     std::vector<IR::Instruction*> clonedInsts;
     for (unsigned u = 1; u < factor; ++u) {

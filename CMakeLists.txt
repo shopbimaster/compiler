@@ -77,6 +77,7 @@ add_library(sysy_opt STATIC
     src/opt/LoopUnrolling.cpp
     src/opt/LoopInterchange.cpp
     src/opt/TailRecursionElimination.cpp
+    src/opt/InstructionScheduling.cpp
     src/opt/RecursiveMulToNative.cpp
     src/opt/BitOpPatternRecognition.cpp
 )

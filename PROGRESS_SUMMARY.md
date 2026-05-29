@@ -5,7 +5,7 @@
 - **目标平台**: RISC-V RV64GC (medany)
 - **开发语言**: C++20
 - **目标操作系统**: Ubuntu 24.04 (WSL)
-- **最后更新**: 2026-05-29（P1-3 循环交换优化完成）
+- **最后更新**: 2026-05-29（P3 高级优化完成）
 
 ---
 
@@ -137,8 +137,10 @@ compiler/
 │   │   ├── CSE.cpp                       ✅ O2
 │   │   ├── DeadCodeElimination.cpp       ✅ O1
 │   │   ├── InlineExpansion.cpp           ✅ O2
+│   │   ├── InstructionScheduling.cpp     ✅ P3-3
 │   │   ├── LICM.cpp                      ✅ O2
-│   │   ├── LoopUnrolling.cpp             ✅ O3
+│   │   ├── LoopInterchange.cpp           ✅ P1-3
+│   │   ├── LoopUnrolling.cpp             ✅ O3/P3-4
 │   │   ├── Optimizer.cpp                 ✅ 优化流水线
 │   │   ├── PeepholeOptimizer.cpp         ✅ O1
 │   │   ├── RecursiveMulToNative.cpp      ✅ P0-3
@@ -154,11 +156,16 @@ compiler/
 │   ├── func_call.sy              ✅ 函数调用
 │   ├── bad.sy                    ✅ 语法错误测试
 │   ├── float_test.sy
-│   ├── test_ir.cpp               ✅ IR 单元测试 (18/18)
-│   └── test_integration.cpp      ✅ 集成测试 (23/23)
+│   ├── nested_loop_test.sy       ✅ 嵌套循环测试
+│   ├── loop_unroll_4x.sy         ✅ 循环展开 4× 测试
+│   ├── instr_sched_basic.sy      ✅ 指令调度测试
+│   ├── test_ir.cpp               ✅ IR 单元测试 (26/26)
+│   └── test_integration.cpp      ✅ 集成测试 (25/25)
 ├── build_backend.sh               ✅ 后端构建
 ├── test_backend.sh                ✅ QEMU 端到端 (11/11)
 ├── test_qemu_extra.sh             ✅ QEMU 端到端 额外 (5/5)
+├── test_qemu_unroll.sh            ✅ 循环展开 QEMU 测试
+├── test_qemu_sched.sh             ✅ 指令调度 QEMU 测试
 ├── CMakeLists.txt                ✅ 3 库 + 3 可执行文件
 ├── DEVELOPMENT_PLAN.md
 ├── PROGRESS_SUMMARY.md
@@ -227,6 +234,9 @@ Use → { User*, operandNo }  // Def-Use 链
 | 2026-05-28 | Bug #2/#3 死循环修复 | ✅ | AlgebraicSimplification + BitOpPatternRecognition erase修复 |
 | 2026-05-28 | LoopUnrolling 克隆修复 | ✅ | cloneNonTermInst 支持 LOAD/STORE/GEP + valueMap 操作数重映射，分离克隆创建与BB插入避免迭代器/指针失效；仅展开 tripCount%2==0 的循环；loop_unroll_test.sy QEMU exit=10 通过 |
 | 2026-05-29 | P1-3 循环交换实现 + 单元测试 | ✅ | 21/21 单元 + 24/24 集成 + 10/10 QEMU端到端（O0+O3）全部通过；新增 3 个 LoopInterchange 单元测试（basic/noop/computation）和 1 个集成测试；修复振荡 bug（maxIters=1） |
+| 2026-05-29 | P3-4 循环展开 4× 增强 | ✅ | LoopUnrolling 优先 4× 展开（tripCount%4==0），回退 2×；新增 3 个单元测试（basic/4×/fallback）+ 3 个集成测试用例 + QEMU 端到端验证（6/6） |
+| 2026-05-29 | P3-3 指令调度 | ✅ | 基本块内列表调度：构建数据依赖 DAG，优先调度 LOAD 和多使用者指令，stable_sort 原地重排避免迭代器失效；新增 2 个单元测试（load_hoist/dep_chain）+ 1 个集成测试 + QEMU 端到端验证（2/2） |
+| 2026-05-29 | P3 全量回归 | ✅ | 26 单元 + 25 集成 + 8 QEMU端到端（2 test suites）全部通过（59/59） |
 
 ---
 
@@ -252,7 +262,7 @@ make -j$(nproc)
 - **前端→IR 管线**: sysyc 可从 .sy 源文件自动生成 LLVM 风格 IR
 - **已支持特性**: 全部 SysY2022 语言特性（数组、全局变量、float、void、作用域、I/O 等）
 - **后端**: 代码生成器完整实现（指令选择 + 栈帧 + 线性扫描寄存器分配）
-- **优化**: O1/O2/O3/P0 全部实现，优化流水线完整（含循环交换）
+- **优化**: O1/O2/O3/P0/P3 全部实现，优化流水线完整（含循环交换、循环展开4×、指令调度）
 - **测试用例**: test/ 目录包含 functional (100) + h_functional (40) + performance (68) 共 208 条最终测试用例
 - **已知问题**: 无
 - **下一步**: 对接 final test 测试套件：I/O 运行时库 → 功能测试适配脚本 → functional/h_functional 全量回归 → 性能基准测量

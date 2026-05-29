@@ -1,9 +1,10 @@
 // ================================================================
-// O1/O2/O3/P0 优化器统一入口
+// O1/O2/O3/P0/P3 优化器统一入口
 // O1: 常量折叠 → 死代码消除
 // O2: 函数内联 → O1 → CSE → LICM → O1
-// O3: 代数化简 → O1 → 循环展开 → 尾递归消除 → O1
+// O3: 代数化简 → O1 → 循环交换 → O1 → 循环展开 → O1 → 尾递归消除 → O1
 // P0: 递归乘→原生MUL → 位运算模式识别 → O3 → O1
+// P3: 指令调度 → O1
 // ================================================================
 
 #include "opt/Optimizer.h"
@@ -43,6 +44,12 @@ void runO3(IR::Module* mod) {
 void runP0(IR::Module* mod) {
     recursiveMulToNative(mod);
     bitOpPatternRecognition(mod);
+    constantFolding(mod);
+    deadCodeElimination(mod);
+}
+
+void runP3(IR::Module* mod) {
+    instructionScheduling(mod);
     constantFolding(mod);
     deadCodeElimination(mod);
 }
