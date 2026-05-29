@@ -29,6 +29,9 @@ void runO3(IR::Module* mod) {
     algebraicSimplification(mod);
     constantFolding(mod);
     deadCodeElimination(mod);
+    loopInterchange(mod);
+    constantFolding(mod);
+    deadCodeElimination(mod);
     loopUnrolling(mod);
     constantFolding(mod);
     deadCodeElimination(mod);

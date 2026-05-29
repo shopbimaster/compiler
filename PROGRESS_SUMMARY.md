@@ -5,7 +5,7 @@
 - **目标平台**: RISC-V RV64GC (medany)
 - **开发语言**: C++20
 - **目标操作系统**: Ubuntu 24.04 (WSL)
-- **最后更新**: 2026-05-28（LoopUnrolling 克隆修复 + 性能保证完成）
+- **最后更新**: 2026-05-29（P1-3 循环交换优化完成）
 
 ---
 
@@ -93,8 +93,9 @@
   - P0-2: 位运算模式识别（BitOpPatternRecognition）
   - P0-3: 递归乘法→原生乘法（RecursiveMulToNative）
 - [x] P0 优化流水线: recursiveMulToNative → bitOpPatternRecognition → constantFolding → deadCodeElimination
+- [x] P1-3 **循环交换 (Loop Interchange)**: 二重嵌套循环变量交换（entry初始化→outerBody初始化→innerBody/outerLatch自增→ICMP条件），支持直接嵌套检测，单次 pass 避免振荡；21 单元测试 + 24 集成测试 + 10 QEMU端到端 全部通过
 - [x] LoopUnrolling 克隆修复：LOAD/STORE/GEP 完整支持 + 操作数重映射 + valueMap 分离克隆与插入避免指针失效
-- [x] **41/41 全部测试通过（18 单元 + 23 集成）**
+- [x] **21/21 单元 + 24/24 集成 全部通过（45/45）**
 
 ---
 
@@ -225,6 +226,7 @@ Use → { User*, operandNo }  // Def-Use 链
 | 2026-05-28 | Bug #1 InlineExpansion ICMP 条件名 | ✅ | createBinOp→createCmp，ifelse 结果正确 |
 | 2026-05-28 | Bug #2/#3 死循环修复 | ✅ | AlgebraicSimplification + BitOpPatternRecognition erase修复 |
 | 2026-05-28 | LoopUnrolling 克隆修复 | ✅ | cloneNonTermInst 支持 LOAD/STORE/GEP + valueMap 操作数重映射，分离克隆创建与BB插入避免迭代器/指针失效；仅展开 tripCount%2==0 的循环；loop_unroll_test.sy QEMU exit=10 通过 |
+| 2026-05-29 | P1-3 循环交换实现 + 单元测试 | ✅ | 21/21 单元 + 24/24 集成 + 10/10 QEMU端到端（O0+O3）全部通过；新增 3 个 LoopInterchange 单元测试（basic/noop/computation）和 1 个集成测试；修复振荡 bug（maxIters=1） |
 
 ---
 
@@ -250,7 +252,7 @@ make -j$(nproc)
 - **前端→IR 管线**: sysyc 可从 .sy 源文件自动生成 LLVM 风格 IR
 - **已支持特性**: 全部 SysY2022 语言特性（数组、全局变量、float、void、作用域、I/O 等）
 - **后端**: 代码生成器完整实现（指令选择 + 栈帧 + 线性扫描寄存器分配）
-- **优化**: O1/O2/O3/P0 全部实现，优化流水线完整
-- **测试用例**: Final_Test 目录包含 functional (100) + h_functional (40) + performance (~50) 共 ~190 条
+- **优化**: O1/O2/O3/P0 全部实现，优化流水线完整（含循环交换）
+- **测试用例**: test/ 目录包含 functional (100) + h_functional (40) + performance (68) 共 208 条最终测试用例
 - **已知问题**: 无
-- **下一步**: 对接 Final_Test 测试套件、I/O 运行时库实现、性能测试逐个攻关
+- **下一步**: 对接 final test 测试套件：I/O 运行时库 → 功能测试适配脚本 → functional/h_functional 全量回归 → 性能基准测量

@@ -75,6 +75,7 @@ add_library(sysy_opt STATIC
     src/opt/LICM.cpp
     src/opt/AlgebraicSimplification.cpp
     src/opt/LoopUnrolling.cpp
+    src/opt/LoopInterchange.cpp
     src/opt/TailRecursionElimination.cpp
     src/opt/RecursiveMulToNative.cpp
     src/opt/BitOpPatternRecognition.cpp

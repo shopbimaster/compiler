@@ -32,6 +32,7 @@ void runO2(IR::Module* mod);
 // ================================================================
 void algebraicSimplification(IR::Module* mod);
 void loopUnrolling(IR::Module* mod);
+void loopInterchange(IR::Module* mod);
 void tailRecursionElimination(IR::Module* mod);
 void runO3(IR::Module* mod);
 

@@ -1,8 +1,0 @@
-int main() {
-    float a = 3.0;
-    float b = 4.0;
-    if (a < b) {
-        return 1;
-    }
-    return 0;
-}

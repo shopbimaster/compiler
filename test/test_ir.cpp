@@ -1,7 +1,9 @@
 #include <iostream>
 #include <cassert>
+#include <string>
 #include "ir/IR.h"
 #include "ir/IRBuilder.h"
+#include "opt/Optimizer.h"
 
 using namespace IR;
 
@@ -230,6 +232,268 @@ void test_builder_simple_main() {
 }
 
 // ================================================================
+// 测试 7: 循环交换（Loop Interchange）
+// ================================================================
+
+static Instruction* createLoadInstruction(Value* ptr, const std::string& name) {
+    auto* ty = dynamic_cast<PointerType*>(ptr->getType());
+    Type* loadTy = ty ? ty->getPointeeType() : ptr->getType();
+    return Instruction::createLoad(loadTy, ptr, name);
+}
+
+void test_loop_interchange_basic() {
+    TEST("LoopInterchange 交换二重嵌套循环变量");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+
+    auto* entry   = func->createBlock("entry");
+    auto* outerH  = func->createBlock("while_cond_i");
+    auto* outerB  = func->createBlock("while_body_i");
+    auto* innerH  = func->createBlock("while_cond_j");
+    auto* innerB  = func->createBlock("while_body_j");
+    auto* outerL  = func->createBlock("while_latch_i");
+    auto* exitBB  = func->createBlock("while_exit");
+
+    auto* iVar = Instruction::createAlloca(IntegerType::I32, "i");
+    auto* jVar = Instruction::createAlloca(IntegerType::I32, "j");
+
+    // entry: store 0, %i; br outer_header
+    entry->pushBack(iVar);
+    entry->pushBack(jVar);
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), iVar));
+    entry->pushBack(Instruction::createBr(outerH));
+
+    // outer_header: icmp load i < 10; cond_br outer_body, exit
+    auto* iLoad1 = createLoadInstruction(iVar, "i_ld1");
+    outerH->pushBack(iLoad1);
+    auto* cmpI = Instruction::createCmp(Instruction::Opcode::ICMP,
+        iLoad1, ConstantInt::get(IntegerType::I32, 10), "cmp_i");
+    outerH->pushBack(cmpI);
+    outerH->pushBack(Instruction::createCondBr(cmpI, outerB, exitBB));
+
+    // outer_body: store 0, %j; br inner_header
+    outerB->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), jVar));
+    outerB->pushBack(Instruction::createBr(innerH));
+
+    // inner_header: icmp load j < 10; cond_br inner_body, outer_latch
+    auto* jLoad1 = createLoadInstruction(jVar, "j_ld1");
+    innerH->pushBack(jLoad1);
+    auto* cmpJ = Instruction::createCmp(Instruction::Opcode::ICMP,
+        jLoad1, ConstantInt::get(IntegerType::I32, 10), "cmp_j");
+    innerH->pushBack(cmpJ);
+    innerH->pushBack(Instruction::createCondBr(cmpJ, innerB, outerL));
+
+    // inner_body: load j; add 1; store j; br inner_header
+    auto* jLoad2 = createLoadInstruction(jVar, "j_ld2");
+    innerB->pushBack(jLoad2);
+    innerB->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "j_next", jLoad2, ConstantInt::get(IntegerType::I32, 1)));
+    innerB->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(innerB->getInstructions().back().get()), jVar));
+    innerB->pushBack(Instruction::createBr(innerH));
+
+    // outer_latch: load i; add 1; store i; br outer_header
+    auto* iLoad2 = createLoadInstruction(iVar, "i_ld2");
+    outerL->pushBack(iLoad2);
+    outerL->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "i_next", iLoad2, ConstantInt::get(IntegerType::I32, 1)));
+    outerL->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(outerL->getInstructions().back().get()), iVar));
+    outerL->pushBack(Instruction::createBr(outerH));
+
+    // exit: ret 0
+    exitBB->pushBack(Instruction::createRet(ConstantInt::get(IntegerType::I32, 0)));
+
+    std::string before = mod.dump();
+    CHECK(before.find("while_cond_i") != std::string::npos);
+    CHECK(before.find("while_cond_j") != std::string::npos);
+
+    // Run loop interchange
+    Opt::loopInterchange(&mod);
+
+    std::string after = mod.dump();
+    std::cout << "\n-------- Before Interchange --------\n" << before
+              << "-------- After Interchange --------\n" << after
+              << "--------------------------------------\n";
+
+    // After interchange:
+    // entry should have store 0, j (new outer var)
+    // while_body_i should have store 0, i (new inner var)
+    // while_cond_i checks j (new outer var)
+    // while_cond_j checks i (new inner var)
+    // while_body_j increments i (new inner var)
+    // while_latch_i increments j (new outer var)
+    CHECK(after.find("define i32 @main()") != std::string::npos);
+
+    // entry initializes j (the new outer variable)
+    CHECK(after.find("store i32 0, i32* %j") != std::string::npos);
+
+    // outer_body (while_body_i) should store 0 to i (new inner var)  
+    // AND br to while_cond_j (new outer header)
+    CHECK(after.find("store i32 0, i32* %i") != std::string::npos);
+
+    // Verify ICMP swaps: while_cond_i checks j, while_cond_j checks i
+    auto icmp_i_pos = after.find("while_cond_i:");
+    auto icmp_j_pos = after.find("while_cond_j:");
+    CHECK(icmp_i_pos != std::string::npos);
+    CHECK(icmp_j_pos != std::string::npos);
+
+    // Check that while_cond_i's ICMP references %j (new outer)
+    auto icmpImg_i = after.find("%j", icmp_i_pos);
+    CHECK(icmpImg_i != std::string::npos);
+
+    // Check that while_cond_j's ICMP references %i (new inner)  
+    auto icmpImg_j = after.find("%i", icmp_j_pos);
+    CHECK(icmpImg_j != std::string::npos);
+
+    PASS();
+}
+
+// ================================================================
+// 测试 8: 循环交换 — 单循环不变
+// ================================================================
+void test_loop_interchange_noop_single() {
+    TEST("LoopInterchange 单层循环不修改");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+
+    auto* entry  = func->createBlock("entry");
+    auto* cond   = func->createBlock("while_cond");
+    auto* body   = func->createBlock("while_body");
+    auto* exitBB = func->createBlock("while_exit");
+
+    auto* iVar = Instruction::createAlloca(IntegerType::I32, "i");
+
+    entry->pushBack(iVar);
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), iVar));
+    entry->pushBack(Instruction::createBr(cond));
+
+    auto* iLoad1 = createLoadInstruction(iVar, "i_ld1");
+    cond->pushBack(iLoad1);
+    cond->pushBack(Instruction::createCmp(Instruction::Opcode::ICMP,
+        iLoad1, ConstantInt::get(IntegerType::I32, 10), "cmp_i"));
+    cond->pushBack(Instruction::createCondBr(cond->getInstructions().back().get(), body, exitBB));
+
+    auto* iLoad2 = createLoadInstruction(iVar, "i_ld2");
+    body->pushBack(iLoad2);
+    body->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "i_next", iLoad2, ConstantInt::get(IntegerType::I32, 1)));
+    body->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(body->getInstructions().back().get()), iVar));
+    body->pushBack(Instruction::createBr(cond));
+
+    exitBB->pushBack(Instruction::createRet(ConstantInt::get(IntegerType::I32, 0)));
+
+    std::string before = mod.dump();
+    Opt::loopInterchange(&mod);
+    std::string after = mod.dump();
+
+    CHECK(before == after);
+    PASS();
+}
+
+// ================================================================
+// 测试 9: 循环交换 — 计算体中的变量引用不被篡改
+// ================================================================
+void test_loop_interchange_computation_body() {
+    TEST("LoopInterchange 计算体变量引用正确性");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+
+    auto* entry   = func->createBlock("entry");
+    auto* outerH  = func->createBlock("while_cond_i");
+    auto* outerB  = func->createBlock("while_body_i");
+    auto* innerH  = func->createBlock("while_cond_j");
+    auto* innerB  = func->createBlock("while_body_j");
+    auto* outerL  = func->createBlock("while_latch_i");
+    auto* exitBB  = func->createBlock("while_exit");
+
+    auto* iVar = Instruction::createAlloca(IntegerType::I32, "i");
+    auto* jVar = Instruction::createAlloca(IntegerType::I32, "j");
+    auto* sumVar = Instruction::createAlloca(IntegerType::I32, "sum");
+
+    entry->pushBack(iVar);
+    entry->pushBack(jVar);
+    entry->pushBack(sumVar);
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), iVar));
+    entry->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), sumVar));
+    entry->pushBack(Instruction::createBr(outerH));
+
+    auto* iLoad1 = createLoadInstruction(iVar, "i_ld1");
+    outerH->pushBack(iLoad1);
+    outerH->pushBack(Instruction::createCmp(Instruction::Opcode::ICMP,
+        iLoad1, ConstantInt::get(IntegerType::I32, 10), "cmp_i"));
+    outerH->pushBack(Instruction::createCondBr(
+        outerH->getInstructions().back().get(), outerB, exitBB));
+
+    outerB->pushBack(Instruction::createStore(ConstantInt::get(IntegerType::I32, 0), jVar));
+    outerB->pushBack(Instruction::createBr(innerH));
+
+    auto* jLoad1 = createLoadInstruction(jVar, "j_ld1");
+    innerH->pushBack(jLoad1);
+    innerH->pushBack(Instruction::createCmp(Instruction::Opcode::ICMP,
+        jLoad1, ConstantInt::get(IntegerType::I32, 10), "cmp_j"));
+    innerH->pushBack(Instruction::createCondBr(
+        innerH->getInstructions().back().get(), innerB, outerL));
+
+    // inner_body: sum = sum + i * j;  j = j + 1;  br inner_header
+    auto* sumLoad = createLoadInstruction(sumVar, "sum_ld");
+    innerB->pushBack(sumLoad);
+    auto* iBodyLoad = createLoadInstruction(iVar, "i_body");
+    innerB->pushBack(iBodyLoad);
+    auto* jBodyLoad = createLoadInstruction(jVar, "j_body");
+    innerB->pushBack(jBodyLoad);
+    auto* mul = Instruction::createBinOp(Instruction::Opcode::MUL,
+        IntegerType::I32, "mul_ij", iBodyLoad, jBodyLoad);
+    innerB->pushBack(mul);
+    auto* addSum = Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "sum_next", sumLoad, mul);
+    innerB->pushBack(addSum);
+    innerB->pushBack(Instruction::createStore(addSum, sumVar));
+    auto* jLoad2 = createLoadInstruction(jVar, "j_ld2");
+    innerB->pushBack(jLoad2);
+    innerB->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "j_next", jLoad2, ConstantInt::get(IntegerType::I32, 1)));
+    innerB->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(innerB->getInstructions().back().get()), jVar));
+    innerB->pushBack(Instruction::createBr(innerH));
+
+    auto* iLoad2 = createLoadInstruction(iVar, "i_ld2");
+    outerL->pushBack(iLoad2);
+    outerL->pushBack(Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "i_next", iLoad2, ConstantInt::get(IntegerType::I32, 1)));
+    outerL->pushBack(Instruction::createStore(
+        dynamic_cast<Instruction*>(outerL->getInstructions().back().get()), iVar));
+    outerL->pushBack(Instruction::createBr(outerH));
+
+    exitBB->pushBack(Instruction::createRet(ConstantInt::get(IntegerType::I32, 0)));
+
+    Opt::loopInterchange(&mod);
+    std::string after = mod.dump();
+
+    // After interchange, entry stores 0 to j (new outer), outer_body stores 0 to i (new inner)
+    CHECK(after.find("store i32 0, i32* %j") != std::string::npos);
+    CHECK(after.find("store i32 0, i32* %i") != std::string::npos);
+
+    // Computation body should still reference %i and %j correctly
+    CHECK(after.find("%mul_ij") != std::string::npos);
+
+    // The increment in inner_body should now increment i (new inner)
+    auto innerBodyPos = after.find("while_body_j:");
+    CHECK(innerBodyPos != std::string::npos);
+    auto jNextPos = after.find("%j_next", innerBodyPos);
+    CHECK(jNextPos != std::string::npos);
+
+    PASS();
+}
+
+// ================================================================
 // main
 // ================================================================
 int main() {
@@ -252,6 +516,11 @@ int main() {
 
     std::cout << "\n[IRBuilder - End to End]\n";
     test_builder_simple_main();
+
+    std::cout << "\n[Loop Interchange]\n";
+    test_loop_interchange_basic();
+    test_loop_interchange_noop_single();
+    test_loop_interchange_computation_body();
 
     std::cout << "\n=== 结果: " << passed << " passed, "
               << failed << " failed ===\n";

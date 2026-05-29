@@ -4,14 +4,15 @@
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: sysyc <input.sy> [-S] [-o <output>]\n";
-        std::cerr << "       sysyc -S <input.sy> [-o <output>]\n";
+        std::cerr << "Usage: sysyc <input.sy> [-S] [-o <output>] [-O0|-O1|-O2|-O3|-Oall]\n";
+        std::cerr << "       sysyc -S <input.sy> [-o <output>] [-O0|-O1|-O2|-O3|-Oall]\n";
         return 1;
     }
 
     std::string inputPath;
     std::string outputPath;
     bool emitAssembly = false;
+    IR::OptLevel optLevel = IR::OptLevel::O0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -19,7 +20,17 @@ int main(int argc, char* argv[]) {
             outputPath = argv[++i];
         } else if (arg == "-S") {
             emitAssembly = true;
-        } else if (inputPath.empty()) {
+        } else if (arg == "-O0") {
+            optLevel = IR::OptLevel::O0;
+        } else if (arg == "-O1") {
+            optLevel = IR::OptLevel::O1;
+        } else if (arg == "-O2") {
+            optLevel = IR::OptLevel::O2;
+        } else if (arg == "-O3") {
+            optLevel = IR::OptLevel::O3;
+        } else if (arg == "-Oall") {
+            optLevel = IR::OptLevel::OALL;
+        } else if (arg[0] != '-' && inputPath.empty()) {
             inputPath = arg;
         }
     }
@@ -34,16 +45,16 @@ int main(int argc, char* argv[]) {
 
         if (emitAssembly) {
             if (outputPath.empty()) {
-                compiler.emitAsm(inputPath, std::cout);
+                compiler.emitAsm(inputPath, std::cout, optLevel);
             } else {
-                compiler.emitAsmToFile(inputPath, outputPath);
+                compiler.emitAsmToFile(inputPath, outputPath, optLevel);
                 std::cout << "Assembly written to " << outputPath << "\n";
             }
         } else {
             if (outputPath.empty()) {
-                compiler.emitIR(inputPath, std::cout);
+                compiler.emitIR(inputPath, std::cout, optLevel);
             } else {
-                compiler.emitIRToFile(inputPath, outputPath);
+                compiler.emitIRToFile(inputPath, outputPath, optLevel);
                 std::cout << "IR written to " << outputPath << "\n";
             }
         }

@@ -46,8 +46,10 @@ temp/
 /tmp
 /temp
 
-# Final_Test cases (not to be committed)
-test/Final_Test/
+# Final test cases (not to be committed)
+test/functional/
+test/h_functional/
+test/performance/
 
 # Backup files
 *.bak

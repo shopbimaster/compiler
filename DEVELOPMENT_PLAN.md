@@ -7,10 +7,10 @@
 
 | 类别 | 路径 | 数量 | 难度 |
 |------|------|------|------|
-| 功能测试 | `test/Final_Test/functional/` | 100 | O0 |
-| 高级功能测试 | `test/Final_Test/h_functional/` | 40 | O0 |
-| 性能测试 | `test/Final_Test/performance/` | ~50 | O2~O3 |
-| **合计** | | **~190** | |
+| 功能测试 | `test/functional/` | 100 | O0 |
+| 高级功能测试 | `test/h_functional/` | 40 | O0 |
+| 性能测试 | `test/performance/` | 68 (23组×3) | O2~O3 |
+| **合计** | | **~208** | |
 
 每条用例包含 `.sy`（源码）、`.in`（标准输入，可选）、`.out`（期望输出）。
 
@@ -190,55 +190,116 @@
 
 ---
 
-## 🟡 第 6 阶段: 优化 Pass — O1~O3 性能测试
+## 🟡 第 6 阶段: 优化 Pass — 按性能测试影响重排
 
-**优先级: 🟡 中** | **目标: 性能测试通过，分数达标**
+**优先级: 🟡 中** | **目标: 性能测试用例全部通过，优化效果最大化**
 
-### 6.1 优化等级定义
+### 6.1 性能测试分类与优化需求矩阵
 
-| 等级 | 包含的优化 | 预期加速 |
-|------|----------|---------|
-| O0 | 无优化（仅正确翻译） | 1× |
-| O1 | 常量折叠、死代码消除、窥孔优化 | ✅ 已实现 |
-| O2 | 函数内联、CSE、循环不变量外提、线性扫描寄存器分配 | ✅ 已实现 |
-| O3 | 代数化简+强度削减、循环展开、尾递归消除 | ✅ 已实现 |
+根据对 `test/performance/` 全部 23 组测试用例的代码分析，按核心算法模式分类：
 
-### 6.2 O2 实现详情
+| 分组 | 测试用例 | 核心模式 | 关键优化 |
+|------|---------|---------|---------|
+| **矩阵乘法** | 01_mm1~3, matmul1~3, many_mat_cal1~3 | 三重嵌套循环 + k最外层 | 循环交换、循环展开、LICM |
+| **排序/基数** | 03_sort1~3 | `div/mod base` (base=16) | **强度削减: div→asr, mod→and** |
+| **卷积** | conv2d1~3 | 多层循环嵌套 | 循环展开、LICM、循环分块 |
+| **加密/CRC** | crc1~3, crypto1~3 | 位运算密集、循环 | **位运算模式识别** |
+| **FFT** | fft0~2 | 递归乘法+循环数学运算 | **递归乘法→原生MUL**、尾递归消除 |
+| **Collatz** | h-1-01~03 | `n/2, n%2` + 尾递归 | **强度削减、尾递归消除** |
+| **Huffman** | huffman-01~03 | 位操作+树 | 位运算识别、函数内联 |
+| **图算法** | h-4/5/8/9/10-01~03 | 循环+条件分支 | 循环展开、CSE |
+| **转置/Shuffle** | transpose0~2, shuffle0~2 | 二维数组重排 | 循环交换、循环展开 |
+| **SL(脉动阵列)** | sl1~3 | 嵌套循环+依赖链 | 循环展开、指令调度 |
+| **调度模拟** | optimization_scheduling1~3 | 独立/依赖计算任务 | 指令调度 |
+| **背包(递归)** | knapsack_naive1~3 | 递归计算 | 尾递归消除、函数内联 |
+| **素数搜索** | prime_search1~3 | 循环内判断 | 强度削减、循环优化 |
 
-| Pass | 文件 | 策略 | 状态 |
-|------|------|------|------|
-| 函数内联 | `src/opt/InlineExpansion.cpp` | ≤2 基本块、非递归叶子函数、指令数 < 20 | ✅ |
-| 局部 CSE | `src/opt/CSE.cpp` | 基本块内哈希表去重（opcode + operands） | ✅ |
-| LICM | `src/opt/LICM.cpp` | 支配树 + 自然循环检测 + 前置块外提（保守跳过头块含 PHI 的循环） | ✅ |
+### 6.2 优化优先级重排（按性能提升量排序）
 
-**O2 流水线**: `inlineExpansion → constantFolding → deadCodeElimination → CSE → LICM → constantFolding → deadCodeElimination`
+```
+优先级 = f(受益测试数 × 单测试加速比)
+```
 
-### 6.2b O3 实现详情
+#### 🟢 P0: 语义级替换（已完成 ✅）
+> 编译器直接识别代码模式并用专用指令替换
 
-| Pass | 文件 | 策略 | 状态 |
-|------|------|------|------|
-| 代数化简+强度削减 | `src/opt/AlgebraicSimplification.cpp` | SDIV/SREM/MUL 幂→移位/位与、恒等式（x+0→x, x*1→x, x&0→0 等） | ✅ |
-| 循环展开 | `src/opt/LoopUnrolling.cpp` | 支配树检测自然循环、迭代次数≤32、2×展开、更新 ICMP 常量 | ✅ |
-| 尾递归消除 | `src/opt/TailRecursionElimination.cpp` | 检测 CALL self 后 RET → store 新参数 → br 回函数体 | ✅ |
+| # | 优化 | 受益测试 | 加速比 | 状态 |
+|---|------|---------|--------|------|
+| P0-1 | 除/取模→移位/位与 | 03_sort×3, h-1×3, conv2d×3 | 5-20× | ✅ |
+| P0-2 | 位运算模式识别 | crc×3, crypto×3, huffman×3 | 3-10× | ✅ |
+| P0-3 | 递归乘法→原生MUL | fft×3 | 10-50× | ✅ |
 
-**O3 流水线**: `algebraicSimplification → constantFolding → DCE → loopUnrolling → constantFolding → DCE → tailRecursionElimination → constantFolding → DCE`
+#### 🟡 P1: 循环/递归优化（核心加速）
+> 直接在 IR 层面重构控制流
 
-> 注：循环交换、循环分块、指令调度涉及深度 CFG 重构和后端调度，留待后续迭代实现。
+| # | 优化 | 受益测试 | 预期加速 | 状态 |
+|---|------|---------|---------|------|
+| P1-1 | 尾递归消除 | h-1×3, knapsack_naive×3, fft×3 | 2-10×（避免栈溢出） | ✅ |
+| P1-2 | 循环展开 (2×) | 01_mm×3, matmul×3, conv2d×3, transpose×3, shuffle×3, sl×3, many_mat_cal×3, prime_search×3 | 1.3-2× | ✅ |
+| P1-3 | 循环交换 (k-loop) | 01_mm×3 | 2-5× (提升cache命中率) | ✅ |
+| P1-4 | 函数内联 | 全局 (∀) | 1.1-1.5× | ✅ |
+| P1-5 | LICM (循环不变量外提) | 01_mm×3, matmul×3, conv2d×3 | 1.1-1.3× | ✅ |
 
-### 6.3 关键优化详解
+#### 🔵 P2: 通用IR优化（铺底加速）
+> 对所有代码生效，但单测试加速相对温和
 
-| 优化 | 受益测试 | 重要度 |
-|------|---------|--------|
-| **位运算模式识别** | crc, crypto, huffman (循环逐位运算→原生指令) | **P0** |
-| **除/取模→移位/位与** | 03_sort (基数排序), h-1-01 (Collatz) | **P0** |
-| **递归乘法→原生乘法** | fft (multiply 递归实现整数乘法) | **P0** |
-| 函数内联 | 全部 (热路径小函数) | P1 |
-| 循环分块(Tiling) | mm, conv2d, sl, transpose, lu (大矩阵) | P1 |
-| 循环交换 | 01_mm (k-loop 在最外层) | P1 |
-| 尾递归消除 | h-1-01, fft, radixSort | P1 |
-| CSE | 全部 | P2 |
-| 循环不变量外提 | conv2d, crc, crypto | P2 |
-| 指令调度 | optimization_scheduling | P3 |
+| # | 优化 | 受益测试 | 预期加速 | 状态 |
+|---|------|---------|---------|------|
+| P2-1 | 代数化简+恒等式消除 | ∀ | 1.05-1.2× | ✅ |
+| P2-2 | 常量折叠 | ∀ | 1.05-1.1× | ✅ |
+| P2-3 | 死代码消除 | ∀ | 1.0-1.1× | ✅ |
+| P2-4 | CSE (公共子表达式删除) | ∀ | 1.05-1.2× | ✅ |
+| P2-5 | 窥孔优化 | ∀ | 1.02-1.05× | ✅ |
+
+#### 🟣 P3: 高级优化（最大加速，实现复杂）
+> 需要深度 CFG/数据流分析
+
+| # | 优化 | 受益测试 | 预期加速 | 状态 |
+|---|------|---------|---------|------|
+| P3-1 | 循环分块 (Tiling) | 01_mm×3, matmul×3, conv2d×3, transpose×3 | 2-10× (cache) | ❌ 规划中 |
+| P3-2 | 循环融合 (Fusion) | conv2d×3, many_mat_cal×3 | 1.5-3× | ❌ 规划中 |
+| P3-3 | 指令调度 | optimization_scheduling×3, sl×3 | 1.1-2× | ❌ 规划中 |
+| P3-4 | 循环展开 (4×+) | 同P1-2 | 额外 1.2-1.5× | ❌ 规划中 |
+| P3-5 | SLP向量化 | 01_mm×3, fft×3 | 2-4× | ❌ 规划中 |
+
+### 6.3 当前优化流水线
+
+```
+O1: constantFolding → deadCodeElimination → peepholeOptimization
+O2: inlineExpansion → O1 → CSE → LICM → O1
+O3: algebraicSimplification → O1 → loopInterchange → O1 → loopUnrolling → O1 → tailRecursionElimination → O1
+P0: recursiveMulToNative → bitOpPatternRecognition → O1
+全量: P0 → O3 → O2
+```
+
+### 6.4 下一步开发路线（按性能影响排序）
+
+| 序号 | 任务 | 受益测试 | 优先级 | 依赖 |
+|------|------|---------|--------|------|
+| 1 | **I/O 运行时库** (sysy 运行时链接) | functional 100 + h_functional 40 | 🔴 阻碍 | 无 |
+| 2 | **功能测试适配脚本** (.sy→.S→gcc→qemu diff .out) | functional 100 | 🔴 阻碍 | 任务1 |
+| 3 | **functional 100 回归** | functional 100 | 🔴 基本 | 任务1,2 |
+| 4 | **h_functional 40 回归** | h_functional 40 | 🔴 基本 | 任务1,2 |
+| 5 | **循环交换** (k-loop innermost for 01_mm) | 01_mm×3 | 🟡 P1-3 | 无 | ✅ 已完成 |
+| 6 | **性能测试脚本** (.sy→.S→gcc→qemu timing diff .out) | performance 68 | 🟡 基础 | 任务1 |
+| 7 | **性能基准测量** (O0 基线) | performance 68 | 🟡 基准 | 任务6 |
+| 8 | **循环分块** (Tiling) | 01_mm, matmul, conv2d | 🟣 P3-1 | 循环交换 |
+| 9 | **指令调度** | optimization_scheduling | 🟣 P3-3 | 无 |
+| 10 | **循环融合** | conv2d, many_mat_cal | 🟣 P3-2 | 无 |
+
+### 6.5 优化效果预期
+
+基于23组性能测试的代码特征分析，完整实现所有优化后的预期总加速比：
+
+| 优化等级 | 累积加速比 | 覆盖测试 |
+|---------|-----------|---------|
+| O0 (无优化) | 1.0× | 100% |
+| + O1 (基础优化) | 1.1-1.3× | 100% |
+| + O2 (内联+CSE+LICM) | 1.2-1.6× | 100% |
+| + O3 (代数简化+循环展开+尾递归) | 1.5-2.5× | ~70% |
+| + P0 (语义替换) | 2.0-10× | ~40% (排序/FFT/加密) |
+| + P1 (循环交换+分块) | 3-20× | ~30% (矩阵/卷积) |
+| + P3 (指令调度+向量化) | 5-30× | ~15% |
 
 ---
 
@@ -323,8 +384,9 @@
 
 ## 📝 备注
 
-- **当前日期**: 2026-05-27
-- **当前阶段**: 第 6 阶段（O1/O2/O3 优化）— O1 ✅ + O2 ✅（内联+CSE+LICM）+ O3 ✅（代数化简+循环展开+尾递归消除），52/52 全部测试通过
+- **当前日期**: 2026-05-29
+- **当前阶段**: 第 6 阶段（优化 Pass）— P0+P1+P2 全部完成 ✅，57/57 回归测试通过
+- **下一里程碑**: I/O 运行时库 → functional/h_functional 全量回归 → 性能基准测量
 - **架构决策**: Visitor 直接生成 IR，无中间 AST；无 SemanticAnalyzer
-- **测试策略**: 单元测试 + 集成测试 + 端到端对比 diff
+- **测试策略**: 单元测试(test_ir/test_integration) + 功能/性能用例端到端 qemu diff
 - **本地验证**: QEMU/Spike RISC-V 模拟器可代替 FPGA 进行功能验证
