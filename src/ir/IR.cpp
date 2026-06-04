@@ -186,11 +186,15 @@ namespace IR {
     }
 
     ConstantFloat* ConstantFloat::get(FloatType* ty, double val) {
+        // SysY only has 32-bit floats; truncate to float32 precision
+        // so that constant folding produces results matching runtime semantics.
+        float fval = static_cast<float>(val);
+        double dval = static_cast<double>(fval);
         static std::vector<std::unique_ptr<ConstantFloat>> cache;
         for (auto& c : cache) {
-            if (c->getValue() == val) return c.get();
+            if (c->getValue() == dval) return c.get();
         }
-        cache.push_back(std::make_unique<ConstantFloat>(ty, val));
+        cache.push_back(std::make_unique<ConstantFloat>(ty, dval));
         return cache.back().get();
     }
 
@@ -472,10 +476,21 @@ namespace IR {
                         case Instruction::Opcode::MUL:  oss << "mul ";  break;
                         case Instruction::Opcode::SDIV: oss << "sdiv "; break;
                         case Instruction::Opcode::SREM: oss << "srem "; break;
+                        case Instruction::Opcode::FADD: oss << "fadd "; break;
+                        case Instruction::Opcode::FSUB: oss << "fsub "; break;
+                        case Instruction::Opcode::FMUL: oss << "fmul "; break;
+                        case Instruction::Opcode::FDIV: oss << "fdiv "; break;
                         case Instruction::Opcode::AND:  oss << "and ";  break;
                         case Instruction::Opcode::OR:   oss << "or ";   break;
                         case Instruction::Opcode::XOR:  oss << "xor ";  break;
+                        case Instruction::Opcode::SHL:  oss << "shl ";  break;
+                        case Instruction::Opcode::ASHR: oss << "ashr "; break;
                         case Instruction::Opcode::ICMP: oss << "icmp "; break;
+                        case Instruction::Opcode::FCMP: oss << "fcmp "; break;
+                        case Instruction::Opcode::SITOFP: oss << "sitofp "; break;
+                        case Instruction::Opcode::FPTOSI: oss << "fptosi "; break;
+                        case Instruction::Opcode::ZEXT: oss << "zext "; break;
+                        case Instruction::Opcode::SEXT: oss << "sext "; break;
                         case Instruction::Opcode::GETELEMENTPTR: oss << "getelementptr "; break;
                         default: oss << "unknown "; break;
                         }

@@ -86,7 +86,16 @@ void TargetCodeGen::emitGlobal(IR::GlobalVariable* gv) {
             emitter.emitData("  .align  2");
             emitter.emitData("  .size   " + gv->getName() + ", " + std::to_string(totalSize));
             emitter.emitData(gv->getName() + ":");
-            emitGlobalInitData(gv->getInitializer(), pointee, "  ");
+
+            // Check for flat init data (aggregate initializer)
+            const auto& initData = gv->getInitData();
+            if (!initData.empty()) {
+                for (uint32_t word : initData) {
+                    emitter.emitData("  .word   " + std::to_string(static_cast<int32_t>(word)));
+                }
+            } else {
+                emitGlobalInitData(gv->getInitializer(), pointee, "  ");
+            }
         } else {
             emitter.emitData("  .align  2");
             emitter.emitData("  .size   " + gv->getName() + ", " + std::to_string(totalSize));
@@ -99,14 +108,24 @@ void TargetCodeGen::emitGlobal(IR::GlobalVariable* gv) {
         emitter.emitData(gv->getName() + ":");
 
         if (gv->getInitializer()) {
-            if (auto* ci = dynamic_cast<IR::ConstantInt*>(gv->getInitializer())) {
-                emitter.emitData("  .word   " + std::to_string(ci->getValue()));
-            } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(gv->getInitializer())) {
+            if (pointee->isFloat()) {
                 union { float f; uint32_t i; } u;
-                u.f = static_cast<float>(cf->getValue());
+                if (auto* ci = dynamic_cast<IR::ConstantInt*>(gv->getInitializer())) {
+                    u.f = static_cast<float>(ci->getValue());
+                } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(gv->getInitializer())) {
+                    u.f = static_cast<float>(cf->getValue());
+                } else {
+                    u.f = 0.0f;
+                }
                 emitter.emitData("  .word   " + std::to_string(u.i));
             } else {
-                emitter.emitData("  .word   0");
+                if (auto* ci = dynamic_cast<IR::ConstantInt*>(gv->getInitializer())) {
+                    emitter.emitData("  .word   " + std::to_string(ci->getValue()));
+                } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(gv->getInitializer())) {
+                    emitter.emitData("  .word   " + std::to_string(static_cast<int>(cf->getValue())));
+                } else {
+                    emitter.emitData("  .word   0");
+                }
             }
         } else {
             emitter.emitData("  .word   0");
@@ -162,7 +181,31 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
 }
 
 void TargetCodeGen::computeStackLayout(IR::Function& func) {
-    stackSize = 0;
+    // Reserve space for outgoing stack arguments (beyond register limits).
+    // RISC-V convention: up to 8 integer params (a0-a7) and 8 float params (fa0-fa7).
+    int maxStackArgs = 0;
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
+                int numArgs = static_cast<int>(inst->getNumOperands()) - 1;
+                int intRegCount = 0, floatRegCount = 0;
+                for (int j = 0; j < numArgs; ++j) {
+                    auto* argTy = inst->getOperand(j + 1)->getType();
+                    if (argTy && argTy->isFloat()) {
+                        if (floatRegCount < 8) floatRegCount++;
+                    } else {
+                        if (intRegCount < 8) intRegCount++;
+                    }
+                }
+                int regParams = intRegCount + floatRegCount;
+                int stackArgs = numArgs - regParams;
+                if (stackArgs > maxStackArgs) {
+                    maxStackArgs = stackArgs;
+                }
+            }
+        }
+    }
+    stackSize = maxStackArgs * 8;
 
     for (auto& bb : func.getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
@@ -242,36 +285,94 @@ int TargetCodeGen::getTypeSize(IR::Type* t) {
     return 8;
 }
 
+// Helper: adjust sp by delta (handles large immediates)
+std::string TargetCodeGen::emitSPAddImm(int delta) {
+    std::string result;
+    if (delta == 0) return result;
+    if (fitsImm12(delta)) {
+        result += "  addi    sp, sp, " + std::to_string(delta) + "\n";
+    } else {
+        int absDelta = (delta < 0) ? -delta : delta;
+        result += "  li      t0, " + std::to_string(absDelta) + "\n";
+        result += (delta < 0) ? "  sub     sp, sp, t0\n" : "  add     sp, sp, t0\n";
+    }
+    return result;
+}
+
+// Helper: load from sp+offset to reg, handling large offsets
+std::string TargetCodeGen::emitStackLoad(const std::string& reg, int offset, const std::string& insn) {
+    std::string result;
+    if (fitsImm12(offset)) {
+        result += "  " + insn + "      " + reg + ", " + std::to_string(offset) + "(sp)\n";
+    } else {
+        result += "  li      t2, " + std::to_string(offset) + "\n";
+        result += "  add     t2, sp, t2\n";
+        result += "  " + insn + "      " + reg + ", 0(t2)\n";
+    }
+    return result;
+}
+
+// Helper: store reg to sp+offset, handling large offsets
+std::string TargetCodeGen::emitStackStore(const std::string& reg, int offset, const std::string& insn) {
+    std::string result;
+    if (fitsImm12(offset)) {
+        result += "  " + insn + "      " + reg + ", " + std::to_string(offset) + "(sp)\n";
+    } else {
+        result += "  li      t2, " + std::to_string(offset) + "\n";
+        result += "  add     t2, sp, t2\n";
+        result += "  " + insn + "      " + reg + ", 0(t2)\n";
+    }
+    return result;
+}
+
 void TargetCodeGen::emitPrologue(IR::Function& func) {
-    emitter.emitText("  addi    sp, sp, -" + std::to_string(stackSize));
+    // Adjust stack pointer, handling large stack frames
+    emitter.emitText(emitSPAddImm(-stackSize));
 
     if (stackSize > 0) {
-        emitter.emitText("  sd      ra, " + std::to_string(stackSize - 8) + "(sp)");
+        emitter.emitText(emitStackStore("ra", stackSize - 8, "sd"));
     }
 
     int csrOffset = stackSize - 8;
     for (auto& reg : regAlloc.getUsedCalleeSaved()) {
         csrOffset -= 8;
         if (reg[0] == 'f') {
-            emitter.emitText("  fsd     " + reg + ", " + std::to_string(csrOffset) + "(sp)");
+            emitter.emitText(emitStackStore(reg, csrOffset, "fsd"));
         } else {
-            emitter.emitText("  sd      " + reg + ", " + std::to_string(csrOffset) + "(sp)");
+            emitter.emitText(emitStackStore(reg, csrOffset, "sd"));
         }
     }
 
     auto* ft = func.getFunctionType();
+    unsigned iReg = 0;  // Next integer argument register
+    unsigned fReg = 0;  // Next float argument register
+    unsigned stackParamIdx = 0;  // Stack parameter counter
     for (unsigned i = 0; i < func.getNumArgs(); ++i) {
         auto* arg = func.getArg(i);
         int offset = getStackOffset(arg);
-        std::string argReg = (i < 8)
-            ? std::string("a") + std::to_string(i)
-            : "t0";
-        if (ft->getParamTypes()[i]->isInteger()) {
-            emitter.emitText("  sw      " + argReg + ", " + std::to_string(offset) + "(sp)");
-        } else if (ft->getParamTypes()[i]->isFloat()) {
-            emitter.emitText("  fsw     " + std::string("fa") + std::to_string(i) + ", " + std::to_string(offset) + "(sp)");
+        bool pIsFloat = ft->getParamTypes()[i]->isFloat();
+        bool pIsPtr = ft->getParamTypes()[i]->isPointer();
+
+        if (pIsFloat && fReg < 8) {
+            std::string reg = std::string("fa") + std::to_string(fReg++);
+            emitter.emitText(emitStackStore(reg, offset, "fsw"));
+        } else if (!pIsFloat && iReg < 8) {
+            std::string reg = std::string("a") + std::to_string(iReg++);
+            emitter.emitText(emitStackStore(reg, offset, pIsPtr ? "sd" : "sw"));
         } else {
-            emitter.emitText("  sd      " + argReg + ", " + std::to_string(offset) + "(sp)");
+            // Arguments beyond registers: load from the caller's stack frame
+            int callerOffset = stackSize + stackParamIdx * 8;
+            stackParamIdx++;
+            if (pIsFloat) {
+                emitter.emitText(emitStackLoad("ft0", callerOffset, "flw"));
+                emitter.emitText(emitStackStore("ft0", offset, "fsw"));
+            } else if (pIsPtr) {
+                emitter.emitText(emitStackLoad("t1", callerOffset, "ld"));
+                emitter.emitText(emitStackStore("t1", offset, "sd"));
+            } else {
+                emitter.emitText(emitStackLoad("t1", callerOffset, "lw"));
+                emitter.emitText(emitStackStore("t1", offset, "sw"));
+            }
         }
     }
 
@@ -281,12 +382,21 @@ void TargetCodeGen::emitPrologue(IR::Function& func) {
             int offset = getStackOffset(arg);
             std::string r = regAlloc.getReg(arg);
             auto* pt = ft->getParamTypes()[i];
-            if (pt->isFloat()) {
-                emitter.emitText("  flw     " + r + ", " + std::to_string(offset) + "(sp)");
-            } else if (pt->isPointer()) {
-                emitter.emitText("  ld      " + r + ", " + std::to_string(offset) + "(sp)");
+            bool paramFloat = pt->isFloat();
+            bool regFloat = !r.empty() && r[0] == 'f';
+
+            if (paramFloat && regFloat) {
+                emitter.emitText(emitStackLoad(r, offset, "flw"));
+            } else if (paramFloat && !regFloat) {
+                emitter.emitText(emitStackLoad("ft0", offset, "flw"));
+                emitter.emitText("  fmv.x.w " + r + ", ft0\n");
+            } else if (!paramFloat && regFloat) {
+                emitter.emitText(emitStackLoad("t2", offset,
+                    pt->isPointer() ? "ld" : "lw"));
+                emitter.emitText("  " + std::string(pt->isPointer() ? "fmv.d.x" : "fmv.w.x") + " " + r + ", t2\n");
             } else {
-                emitter.emitText("  lw      " + r + ", " + std::to_string(offset) + "(sp)");
+                emitter.emitText(emitStackLoad(r, offset,
+                    pt->isPointer() ? "ld" : "lw"));
             }
         }
     }
@@ -298,19 +408,20 @@ void TargetCodeGen::emitEpilogue(IR::Function& func) {
         for (auto& reg : regAlloc.getUsedCalleeSaved()) {
             csrOffset -= 8;
             if (reg[0] == 'f') {
-                emitter.emitText("  fld     " + reg + ", " + std::to_string(csrOffset) + "(sp)");
+                emitter.emitText(emitStackLoad(reg, csrOffset, "fld"));
             } else {
-                emitter.emitText("  ld      " + reg + ", " + std::to_string(csrOffset) + "(sp)");
+                emitter.emitText(emitStackLoad(reg, csrOffset, "ld"));
             }
         }
-        emitter.emitText("  ld      ra, " + std::to_string(stackSize - 8) + "(sp)");
-        emitter.emitText("  addi    sp, sp, " + std::to_string(stackSize));
+        emitter.emitText(emitStackLoad("ra", stackSize - 8, "ld"));
+        emitter.emitText(emitSPAddImm(stackSize));
     }
     emitter.emitText("  ret");
 }
 
 void TargetCodeGen::emitBasicBlock(IR::BasicBlock& bb) {
-    emitter.emitText("." + bb.getName() + ":");
+    // Use .L prefix for local labels to avoid symbol conflicts across functions
+    emitter.emitText(".L" + currentFunc->getName() + "_" + bb.getName() + ":");
     for (auto& inst : bb.getInstructions()) {
         emitInstruction(*inst);
     }
@@ -391,11 +502,11 @@ std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg)
     bool destIsFloat = isFloatReg(destReg);
 
     if (auto* ci = dynamic_cast<IR::ConstantInt*>(val)) {
-        result += "  li      t2, " + std::to_string(ci->getValue()) + "\n";
         if (!destIsFloat) {
-            result += "  mv      " + destReg + ", t2\n";
+            result += "  li      " + destReg + ", " + std::to_string(ci->getValue()) + "\n";
         } else {
-            result += "  fmv.w.x " + destReg + ", t2\n";
+            result += "  li      t2, " + std::to_string(ci->getValue()) + "\n";
+            result += "  fcvt.s.w " + destReg + ", t2\n";
         }
         return result;
     }
@@ -421,7 +532,12 @@ std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg)
 
     if (allocaOffset.find(val) != allocaOffset.end()) {
         if (offset != 0) {
-            result += "  addi    " + destReg + ", sp, " + std::to_string(offset) + "\n";
+            if (fitsImm12(offset)) {
+                result += "  addi    " + destReg + ", sp, " + std::to_string(offset) + "\n";
+            } else {
+                result += "  li      t1, " + std::to_string(offset) + "\n";
+                result += "  add     " + destReg + ", sp, t1\n";
+            }
         } else {
             result += "  mv      " + destReg + ", sp\n";
         }
@@ -433,12 +549,14 @@ std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg)
         if (r != destReg) {
             bool srcFloat = isFloatReg(r);
             bool dstFloat = isFloatReg(destReg);
+            auto* valTy = val->getType();
+            bool isPtr = valTy && valTy->isPointer();
             if (srcFloat && dstFloat) {
                 result += "  fmv.s   " + destReg + ", " + r + "\n";
             } else if (srcFloat && !dstFloat) {
-                result += "  fmv.x.w " + destReg + ", " + r + "\n";
+                result += "  " + std::string(isPtr ? "fmv.x.d" : "fmv.x.w") + " " + destReg + ", " + r + "\n";
             } else if (!srcFloat && dstFloat) {
-                result += "  fmv.w.x " + destReg + ", " + r + "\n";
+                result += "  " + std::string(isPtr ? "fmv.d.x" : "fmv.w.x") + " " + destReg + ", " + r + "\n";
             } else {
                 result += "  mv      " + destReg + ", " + r + "\n";
             }
@@ -447,12 +565,21 @@ std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg)
     }
 
     auto* ty = val->getType();
-    if (ty->isFloat()) {
-        result += "  flw     " + destReg + ", " + std::to_string(offset) + "(sp)\n";
-    } else if (ty->isPointer()) {
-        result += "  ld      " + destReg + ", " + std::to_string(offset) + "(sp)\n";
+    bool valIsFloat = ty && ty->isFloat();
+    bool valIsPtr = ty && ty->isPointer();
+
+    if (valIsFloat && destIsFloat) {
+        result += emitStackLoad(destReg, offset, "flw");
+    } else if (valIsFloat && !destIsFloat) {
+        // Float value loaded into int register: use float temp then convert
+        result += emitStackLoad("ft0", offset, "flw");
+        result += "  fmv.x.w " + destReg + ", ft0\n";
+    } else if (!valIsFloat && destIsFloat) {
+        // Int/pointer value loaded into float register: use int temp then convert
+        result += emitStackLoad("t2", offset, valIsPtr ? "ld" : "lw");
+        result += "  " + std::string(valIsPtr ? "fmv.d.x" : "fmv.w.x") + " " + destReg + ", t2\n";
     } else {
-        result += "  lw      " + destReg + ", " + std::to_string(offset) + "(sp)\n";
+        result += emitStackLoad(destReg, offset, valIsPtr ? "ld" : "lw");
     }
     return result;
 }
@@ -466,36 +593,56 @@ std::string TargetCodeGen::storeFromReg(IR::Value* val, const std::string& srcRe
         if (r != srcReg) {
             bool srcFloat = isFloatReg(srcReg);
             bool dstFloat = isFloatReg(r);
+            auto* valTy = val->getType();
+            bool isPtr = valTy && valTy->isPointer();
             if (srcFloat && dstFloat) {
                 result += "  fmv.s   " + r + ", " + srcReg + "\n";
             } else if (srcFloat && !dstFloat) {
-                result += "  fmv.x.w " + r + ", " + srcReg + "\n";
+                result += "  " + std::string(isPtr ? "fmv.x.d" : "fmv.x.w") + " " + r + ", " + srcReg + "\n";
             } else if (!srcFloat && dstFloat) {
-                result += "  fmv.w.x " + r + ", " + srcReg + "\n";
+                result += "  " + std::string(isPtr ? "fmv.d.x" : "fmv.w.x") + " " + r + ", " + srcReg + "\n";
             } else {
                 result += "  mv      " + r + ", " + srcReg + "\n";
             }
         }
         int offset = getStackOffset(val);
         auto* ty = val->getType();
-        if (ty && ty->isFloat()) {
-            result += "  fsw     " + r + ", " + std::to_string(offset) + "(sp)\n";
-        } else if (ty && ty->isPointer()) {
-            result += "  sd      " + r + ", " + std::to_string(offset) + "(sp)\n";
+        bool valIsFloat = ty && ty->isFloat();
+        bool regIsFloat = !r.empty() && r[0] == 'f';
+
+        if (valIsFloat && regIsFloat) {
+            result += emitStackStore(r, offset, "fsw");
+        } else if (valIsFloat && !regIsFloat) {
+            result += "  fmv.w.x ft0, " + r + "\n";
+            result += emitStackStore("ft0", offset, "fsw");
+        } else if (!valIsFloat && regIsFloat) {
+            result += "  " + std::string((ty && ty->isPointer()) ? "fmv.x.d" : "fmv.x.w") + " t2, " + r + "\n";
+            result += emitStackStore("t2", offset,
+                (ty && ty->isPointer()) ? "sd" : "sw");
         } else {
-            result += "  sw      " + r + ", " + std::to_string(offset) + "(sp)\n";
+            result += emitStackStore(r, offset,
+                (ty && ty->isPointer()) ? "sd" : "sw");
         }
         return result;
     }
 
     int offset = getStackOffset(val);
     auto* ty = val->getType();
-    if (ty && ty->isFloat()) {
-        result += "  fsw     " + srcReg + ", " + std::to_string(offset) + "(sp)\n";
-    } else if (ty && ty->isPointer()) {
-        result += "  sd      " + srcReg + ", " + std::to_string(offset) + "(sp)\n";
+    bool valIsFloat = ty && ty->isFloat();
+    bool srcIsFloat = !srcReg.empty() && srcReg[0] == 'f';
+
+    if (valIsFloat && srcIsFloat) {
+        result += emitStackStore(srcReg, offset, "fsw");
+    } else if (valIsFloat && !srcIsFloat) {
+        result += "  fmv.w.x ft0, " + srcReg + "\n";
+        result += emitStackStore("ft0", offset, "fsw");
+    } else if (!valIsFloat && srcIsFloat) {
+        result += "  " + std::string((ty && ty->isPointer()) ? "fmv.x.d" : "fmv.x.w") + " t2, " + srcReg + "\n";
+        result += emitStackStore("t2", offset,
+            (ty && ty->isPointer()) ? "sd" : "sw");
     } else {
-        result += "  sw      " + srcReg + ", " + std::to_string(offset) + "(sp)\n";
+        result += emitStackStore(srcReg, offset,
+            (ty && ty->isPointer()) ? "sd" : "sw");
     }
     return result;
 }
@@ -541,7 +688,7 @@ std::string TargetCodeGen::emitValueToReg(IR::Value* val, const std::string& des
         std::string result;
         result += "  li      t2, " + std::to_string(ci->getValue()) + "\n";
         if (destIsFloat) {
-            result += "  fmv.w.x " + destReg + ", t2\n";
+            result += "  fcvt.s.w " + destReg + ", t2\n";
         } else {
             result += "  mv      " + destReg + ", t2\n";
         }
@@ -566,21 +713,17 @@ void TargetCodeGen::emitRet(IR::Instruction& inst) {
 
 void TargetCodeGen::emitBr(IR::Instruction& inst) {
     auto* target = dynamic_cast<IR::BasicBlock*>(inst.getOperand(0));
-    emitter.emitText("  j       ." + target->getName());
+    emitter.emitText("  j       .L" + currentFunc->getName() + "_" + target->getName());
 }
 
 void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
     std::string code;
-    if (regAlloc.hasReg(inst.getOperand(0))) {
-        code += "  mv      t0, " + regAlloc.getReg(inst.getOperand(0)) + "\n";
-    } else {
-        int offset = getStackOffset(inst.getOperand(0));
-        code += "  lw      t0, " + std::to_string(offset) + "(sp)\n";
-    }
+    // Use loadToReg to handle constants (li) and variables (mv/stack load)
+    code += loadToReg(inst.getOperand(0), "t0");
     auto* thenBB = dynamic_cast<IR::BasicBlock*>(inst.getOperand(1));
     auto* elseBB = dynamic_cast<IR::BasicBlock*>(inst.getOperand(2));
-    code += "  bnez    t0, ." + thenBB->getName() + "\n";
-    code += "  j       ." + elseBB->getName() + "\n";
+    code += "  bnez    t0, .L" + currentFunc->getName() + "_" + thenBB->getName() + "\n";
+    code += "  j       .L" + currentFunc->getName() + "_" + elseBB->getName() + "\n";
     emitter.emitText(code);
 }
 
@@ -691,6 +834,9 @@ void TargetCodeGen::emitLoad(IR::Instruction& inst) {
     if (loadTy && loadTy->isFloat()) {
         code += "  flw     ft0, 0(t0)\n";
         code += storeFromReg(&inst, "ft0");
+    } else if (loadTy && loadTy->isPointer()) {
+        code += "  ld      t0, 0(t0)\n";
+        code += storeFromReg(&inst, "t0");
     } else {
         code += "  lw      t0, 0(t0)\n";
         code += storeFromReg(&inst, "t0");
@@ -705,6 +851,10 @@ void TargetCodeGen::emitStore(IR::Instruction& inst) {
         code += loadToReg(inst.getOperand(0), "ft0");
         code += loadToReg(inst.getOperand(1), "t0");
         code += "  fsw     ft0, 0(t0)\n";
+    } else if (valTy && valTy->isPointer()) {
+        code += loadToReg(inst.getOperand(0), "t0");
+        code += loadToReg(inst.getOperand(1), "t1");
+        code += "  sd      t0, 0(t1)\n";
     } else {
         code += loadToReg(inst.getOperand(0), "t0");
         code += loadToReg(inst.getOperand(1), "t1");
@@ -717,15 +867,54 @@ void TargetCodeGen::emitCall(IR::Instruction& inst) {
     std::string code;
 
     unsigned numArgs = inst.getNumOperands() - 1;
+    unsigned iReg = 0;   // Next available integer argument register (a0-a7)
+    unsigned fReg = 0;   // Next available float argument register (fa0-fa7)
+    unsigned stackIdx = 0; // Stack parameter offset counter
+
     for (unsigned i = 0; i < numArgs; ++i) {
         auto* argVal = inst.getOperand(i + 1);
         auto* argTy = argVal->getType();
-        if (argTy && argTy->isFloat() && i < 8) {
-            std::string fReg = std::string("fa") + std::to_string(i);
-            code += loadToReg(argVal, fReg);
+        bool isFloat = argTy && argTy->isFloat();
+        bool isPtr = argTy && argTy->isPointer();
+
+        if (isFloat && fReg < 8) {
+            std::string reg = std::string("fa") + std::to_string(fReg++);
+            code += loadToReg(argVal, reg);
+        } else if (!isFloat && iReg < 8) {
+            std::string reg = std::string("a") + std::to_string(iReg++);
+            code += loadToReg(argVal, reg);
         } else {
-            std::string argReg = (i < 8) ? std::string("a") + std::to_string(i) : "t1";
-            code += loadToReg(argVal, argReg);
+            // Arguments beyond registers: pass on the stack
+            int stackOffset = stackIdx * 8;
+            stackIdx++;
+            if (isFloat) {
+                code += loadToReg(argVal, "ft0");
+                if (fitsImm12(stackOffset)) {
+                    code += "  fsw     ft0, " + std::to_string(stackOffset) + "(sp)\n";
+                } else {
+                    code += "  li      t1, " + std::to_string(stackOffset) + "\n";
+                    code += "  add     t1, sp, t1\n";
+                    code += "  fsw     ft0, 0(t1)\n";
+                }
+            } else if (isPtr) {
+                code += loadToReg(argVal, "t0");
+                if (fitsImm12(stackOffset)) {
+                    code += "  sd      t0, " + std::to_string(stackOffset) + "(sp)\n";
+                } else {
+                    code += "  li      t1, " + std::to_string(stackOffset) + "\n";
+                    code += "  add     t1, sp, t1\n";
+                    code += "  sd      t0, 0(t1)\n";
+                }
+            } else {
+                code += loadToReg(argVal, "t0");
+                if (fitsImm12(stackOffset)) {
+                    code += "  sw      t0, " + std::to_string(stackOffset) + "(sp)\n";
+                } else {
+                    code += "  li      t1, " + std::to_string(stackOffset) + "\n";
+                    code += "  add     t1, sp, t1\n";
+                    code += "  sw      t0, 0(t1)\n";
+                }
+            }
         }
     }
 
@@ -750,16 +939,30 @@ void TargetCodeGen::emitGetElementPtr(IR::Instruction& inst) {
     code += loadToReg(inst.getOperand(0), "t0");
 
     unsigned numOps = inst.getNumOperands();
-    if (numOps >= 3) {
+    if (numOps >= 2) {
         auto* ptrTy = dynamic_cast<IR::PointerType*>(inst.getOperand(0)->getType());
         IR::Type* curPointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
 
-        unsigned i = 1;
-        if (numOps >= 4) {
-            i = 2;
+        // First index (operand 1) is the pointer offset:
+        // advance by sizeof(pointee). Do NOT update curPointee here.
+        int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
+        code += loadToReg(inst.getOperand(1), "t1");
+        if (ptrStride == 1) {
+        } else if (ptrStride == 2) {
+            code += "  slli    t1, t1, 1\n";
+        } else if (ptrStride == 4) {
+            code += "  slli    t1, t1, 2\n";
+        } else if (ptrStride == 8) {
+            code += "  slli    t1, t1, 3\n";
+        } else {
+            code += "  li      t2, " + std::to_string(ptrStride) + "\n";
+            code += "  mul     t1, t1, t2\n";
         }
+        code += "  add     t0, t0, t1\n";
 
-        for (; i < numOps; ++i) {
+        // Remaining indices (operand 2+) are array indices:
+        // advance by sizeof(element of current array type), then descend.
+        for (unsigned i = 2; i < numOps; ++i) {
             int stride = 4;
             if (curPointee && curPointee->isArray()) {
                 auto* arrTy = dynamic_cast<IR::ArrayType*>(curPointee);

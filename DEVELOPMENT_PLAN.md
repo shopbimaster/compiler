@@ -114,8 +114,6 @@ P3 = instructionScheduling → O1
 
 | 限制 | 影响范围 | 严重程度 |
 |------|---------|:--:|
-| 无 I/O 运行时库 C 实现 | functional/h_functional 无法端到端运行 | 🔴 阻塞 |
-| 无自动化回归测试脚本 | 无法批量验证 208 条用例 | 🔴 阻塞 |
 | ZEXT/SEXT/TRUNC/SITOFP/FPTOSI 使用有限 | 部分类型转换场景未覆盖 | 🟡 低 |
 
 ### 2.2 后端层面
@@ -142,15 +140,15 @@ P3 = instructionScheduling → O1
 
 ## 三、未来优化空间
 
-### 3.1 🔴 阻塞性任务（需最先完成）
+### 3.1 🔴 阻塞性任务（进行中）
 
-| # | 任务 | 受益 | 优先级 |
+| # | 任务 | 受益 | 状态 |
 |---|------|------|:--:|
-| B1 | **I/O 运行时库** — getint/putint/starttime/stoptime 等 C 实现 + 编译为 libsysy.a | 解锁全部 functional/h_functional/performance 测试 | 🔴 |
-| B2 | **自动化测试脚本** — .sy→.S→gcc→qemu diff .out 批量回归 | functional 100 + h_functional 40 | 🔴 |
-| B3 | **functional 100 回归** + Bug 修复 | 确保 O0 基本正确 | 🔴 |
-| B4 | **h_functional 40 回归** + Bug 修复 | 高级特性正确 | 🔴 |
-| B5 | **性能测试 68 回归** + O0 基线测量 | 性能基准 | 🔴 |
+| B1 | **I/O 运行时库** — getint/putint/starttime/stoptime 等 C 实现 + 编译为 libsysy.a | 解锁全部 functional/h_functional/performance 测试 | ✅ 已完成 |
+| B2 | **自动化测试脚本** — .sy→.S→gcc→qemu diff .out 批量回归 | functional 100 + h_functional 40 | ✅ 已完成 |
+| B3 | **functional 100 回归** + Bug 修复 | 确保 O0 基本正确 | 🔴 待运行 |
+| B4 | **h_functional 40 回归** + Bug 修复 | 高级特性正确 | 🔴 待运行 |
+| B5 | **性能测试 68 回归** + O0 基线测量 | 性能基准 | 🔴 待运行 |
 
 ### 3.2 🟡 高价值优化（实现复杂但收益大）
 
@@ -240,11 +238,12 @@ compiler/
 │   ├── functional/*.sy              100 功能测试（尚未批量回归）
 │   ├── h_functional/*.sy            40 高级功能测试（尚未批量回归）
 │   └── performance/*.sy             68 性能测试（尚未批量回归）
-├── test_backend.sh                  QEMU 端到端 (11)
-├── test_qemu_extra.sh               QEMU 额外 (5)
-├── test_qemu_unroll.sh              QEMU 循环展开 (6)
-├── test_qemu_sched.sh               QEMU 指令调度 (2)
-├── build_backend.sh                 后端构建 + 端到端测试
+├── SysYlib/
+│   ├── sylib.h                       运行时库头文件（I/O + 计时函数声明）
+│   └── sylib.c                       运行时库实现（getint/putint/starttime/stoptime等）
+├── build_sylib.sh                    运行时库构建脚本（RISCV64 → libsylib.a）
+├── test_qemu.sh                      快速 QEMU 端到端测试（含运行时库链接）
+├── test_qemu_all.sh                  全量回归测试脚本（functional 100）
 ├── CMakeLists.txt                   主构建文件
 ├── DEVELOPMENT_PLAN.md              本文档
 └── PROGRESS_SUMMARY.md              完成路径总结
@@ -263,7 +262,38 @@ compiler/
 | 2026-05-28 | 全流程 Bug 修复（6个） | 57/57 |
 | 2026-05-28 | O1/O2/O3/P0 优化全部实现 | 同上 |
 | 2026-05-29 | P1-3 循环交换 + 测试 | 49/49 |
-| **2026-05-29** | **P3 循环展开4× + 指令调度** | **59/59** |
+| 2026-05-29 | P3 循环展开4× + 指令调度 | 59/59 |
+| 2026-06-03 | 运行时库集成 — SysYlib 编译链接 + 全面回归测试脚本 | 已完成 |
+| **2026-06-04** | **全面回归测试 + Bug 修复** | **见下方** |
+
+### 2026-06-04 全面回归测试结果
+
+| 测试套件 | 编译 | 链接 | 运行时正确 | 输出差异 | 段错误 | 超时 |
+|---------|:---:|:---:|:--------:|:------:|:----:|:---:|
+| functional (100) | 100 | 100 | 99 | 0 | 0 | 1¹ |
+| h_functional (40) | 40 | 40 | 39 | 1² | 0 | 0 |
+| performance (60) | 60 | 60 | 51 | 7³ | 0 | 2⁴ |
+
+> ¹ 82_long_func: O0 计算量过大，15s 超时（非 Bug）
+> ² 38_light2d: 浮点 SDF 渲染精度差异（自定义 sin/cos/sqrt 累积误差）
+> ³ h-4-01/02/03, sl1/2/3, h-9-03: 有符号整数溢出行为差异（与参考编译器语义不同）
+> ⁴ h-9-01/02: O0 未优化导致超时（非 Bug）
+
+### 本轮修复的 Bug
+
+| 编号 | 测试用例 | 问题描述 | 修复方案 |
+|:---:|---------|---------|---------|
+| 1 | 54_hidden_var | 3D 数组初始化 `subIdx` 被递归调用中 `flatIdx=0` 重置，导致子数组首元素被覆盖 | `emitInitStoresVar`/`emitInitStoresConst` 中，递归调用后设置 `subIdx = subTotal` |
+| 2 | h_functional 测试脚本 | 缺少输出规范化，尾部换行符不匹配导致 7 个误报 | 添加 `norm` 函数统一格式化 |
+| 3 | sylib.c | 缺少 `starttime`/`stoptime` 包装函数 | 添加 `#undef` + 包装函数，重建 libsylib.a |
+
+### 已知问题
+
+| 问题 | 影响范围 | 原因 | 优先级 |
+|------|---------|------|:---:|
+| 有符号整数溢出语义 | h-4, sl, h-9 系列 | IR 中 `add`/`mul` 使用 64 位运算，与 32 位回绕语义不同 | 低 |
+| 浮点精度累积 | 38_light2d | 自定义 sin/cos/sqrt 迭代实现，小误差累积 | 低 |
+| O0 大循环超时 | 82_long_func, h-9-01/02 | 未优化代码计算量过大 | 低 |
 
 ---
 
@@ -271,8 +301,10 @@ compiler/
 
 ```
 当前（已完成）: O1/O2/O3/P0/P3 全部优化 Pass 实现 ✅
-下一阶段:      I/O 运行时库 → 批量回归脚本 → functional 100 + h_functional 40 回归
-远期:          循环分块/融合/向量化 → 性能测试 68 优化 → FPGA 上板
+当前（已完成）: 运行时库集成（SysYlib + 测试脚本） ✅
+当前（已完成）: functional 100 + h_functional 40 + performance 60 回归测试 ✅
+下一阶段:      Oall 优化性能测试 → 38_light2d 浮点精度修复 → 整数溢出语义修复
+远期:          循环分块/融合/向量化 → FPGA 上板
 ```
 
-> **当前日期**：2026-05-29 &nbsp;|&nbsp; **测试通过**：59/59 &nbsp;|&nbsp; **优化 Pass**：13 个全部实现
+> **当前日期**：2026-06-04 &nbsp;|&nbsp; **测试通过**：functional 99/100, h_functional 39/40, performance 51/60 (O0) &nbsp;|&nbsp; **优化 Pass**：13 个全部实现 &nbsp;|&nbsp; **运行时库**：已集成

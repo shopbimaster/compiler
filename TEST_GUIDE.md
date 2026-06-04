@@ -1,4 +1,79 @@
-# SysY2022 编译器 — WSL 测试操作手册
+# SysY2022 编译器 — 测试指导文档
+
+## 项目目录结构
+
+```
+compiler/
+├── grammar/            # G4 语法定义文件
+│   ├── SysY2022Lexer.g4
+│   └── SysY2022Parser.g4
+├── include/            # 头文件（IR、后端、优化、工具）
+│   ├── backend/        # 后端头文件（代码生成、寄存器分配、窥孔优化）
+│   ├── ir/             # IR 数据结构头文件
+│   ├── opt/            # 优化器头文件
+│   └── utils/          # 工具头文件（错误处理、日志）
+├── src/                # 源代码
+│   ├── backend/        # 后端实现（TargetCodeGen、RegisterAllocator）
+│   ├── ir/             # IR 实现（IR、IRBuilder）
+│   ├── opt/            # 优化器实现（14个优化Pass）
+│   ├── utils/          # 工具实现
+│   ├── Compiler.cpp    # 编译器封装
+│   ├── main.cpp        # 主入口 sysyc
+│   └── test-grammar.cpp # 语法测试程序
+├── test/               # 测试用例与测试代码
+│   ├── functional/     # 功能测试用例（100个，.gitignore 排除）
+│   ├── h_functional/   # 高阶功能测试用例（40个，.gitignore 排除）
+│   ├── performance/    # 性能测试用例（60个，.gitignore 排除）
+│   ├── test_ir.cpp     # IR 单元测试代码
+│   ├── test_integration.cpp # 集成测试代码
+│   └── *.sy            # 项目级测试用例（instr_sched、loop_unroll 等）
+├── scripts/            # 测试与构建脚本
+│   ├── run_tests.sh    # [主入口] 统一测试框架
+│   ├── test_qemu.sh    # QEMU 端到端快速测试
+│   ├── test_qemu_all.sh# QEMU 全量回归测试
+│   ├── test_qemu_sched.sh # 指令调度 QEMU 测试
+│   ├── test_qemu_unroll.sh # 循环展开 QEMU 测试
+│   ├── test_all_functional.sh # 全量功能测试（仅编译+运行）
+│   ├── test_runtime.sh # 运行时库 I/O 测试
+│   ├── build/          # 构建脚本
+│   │   ├── build_sylib.sh  # 运行时库构建
+│   │   └── build_backend.sh # 后端快速构建
+│   ├── debug/          # 调试脚本（临时/问题定位用）
+│   │   ├── _run_func_tests.sh  # 原功能测试（被 run_tests.sh 替代）
+│   │   ├── _run_hfunc_tests.sh # 原高阶功能测试（被替代）
+│   │   ├── _run_perf_tests.sh  # 原性能测试（被替代）
+│   │   ├── _quick_test.sh      # 原快速测试
+│   │   ├── _test_one.sh        # 单用例调试
+│   │   ├── _test80.sh          # 80号用例调试
+│   │   ├── _debug_test.sh      # 调试测试
+│   │   ├── _debug_diffs.sh     # 输出差异对比
+│   │   ├── _run87.sh           # 87号用例调试
+│   │   ├── _test_failing.sh    # 失败用例调试
+│   │   ├── _trace.sh           # 汇编跟踪
+│   │   ├── _test_stack.sh      # 栈帧测试
+│   │   ├── _test_float_min.sh  # 浮点最小测试
+│   │   ├── debug-float-segfault.md # 浮点段错误调试记录
+│   │   └── _test_*.sy          # 调试用临时测试文件
+│   ├── grammar/        # 语法测试脚本
+│   │   ├── test-grammar.sh     # G4 语法验证
+│   │   └── QUICK_GRAMMAR_TEST.sh # 快速语法验证
+│   └── setup/          # 环境配置脚本
+│       ├── setup-ubuntu.sh     # Ubuntu 一键部署
+│       ├── install_riscv.sh    # RISC-V 工具链安装
+│       └── check-references.sh # 引用检查
+├── SysYlib/            # SysY 运行时库
+│   ├── sylib.c
+│   └── sylib.h
+├── lib/                # 第三方库
+│   └── antlr-4.10.1.jar
+├── grammar/            # G4 语法文件
+├── CMakeLists.txt      # 主构建配置
+├── CMakeLists-test.txt # 语法测试构建配置
+├── .gitignore
+└── TEST_GUIDE.md       # 本文件
+```
+
+---
 
 ## 前置条件
 
@@ -6,188 +81,285 @@
 - 项目位于 Windows 文件系统：`D:\VSCodeProjects\compiler`
 - WSL 内对应的路径为：`/mnt/d/VSCodeProjects/compiler`
 
-> **如果 WSL 中尚需安装依赖，执行以下命令（仅首次）：**
-> ```bash
-> sudo apt-get update
-> sudo apt-get install -y build-essential cmake openjdk-17-jdk-headless libantlr4-runtime-dev uuid-dev
-> ```
->
-> **后端验证额外依赖（RISC-V 工具链 + QEMU 用户模式模拟器）：**
-> ```bash
-> # 以 root 运行（非交互模式）
-> wsl -d Ubuntu -u root -- bash -c "apt-get update -qq && apt-get install -y gcc-riscv64-linux-gnu qemu-user"
-> ```
->
-> 验证安装：
-> ```bash
-> wsl -d Ubuntu -- bash -c "riscv64-linux-gnu-gcc --version && qemu-riscv64 --version"
-> ```
->
-> > **注**：`riscv64-linux-gnu-gcc` 提供 C 标准库和启动文件，配合 `qemu-riscv64` 用户模式模拟器可直接运行生成的静态链接 RISC-V 可执行文件
+### 首次环境安装
+
+```bash
+# 基础依赖
+sudo apt-get update
+sudo apt-get install -y build-essential cmake openjdk-17-jdk-headless libantlr4-runtime-dev uuid-dev
+
+# RISC-V 工具链 + QEMU（后端验证必需）
+wsl -d Ubuntu -u root -- bash -c "apt-get update -qq && apt-get install -y gcc-riscv64-linux-gnu qemu-user"
+```
+
+验证安装：
+```bash
+wsl -d Ubuntu -- bash -c "riscv64-linux-gnu-gcc --version && qemu-riscv64 --version"
+```
 
 ---
 
 ## 一、构建项目
 
 ```bash
-# 在 PowerShell 中进入 WSL
-wsl -d Ubuntu
-```
-
-```bash
-# 定位到项目目录并构建
 cd /mnt/d/VSCodeProjects/compiler
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
+构建运行时库：
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/build/build_sylib.sh
+```
+
 ---
 
-## 二、IR 单元测试（18 项）
+## 二、统一测试框架（推荐）
+
+统一测试脚本 `scripts/run_tests.sh` 整合了所有测试套件，支持多优化级别。
+
+### 2.1 基本用法
+
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+
+# 快速冒烟测试（5个关键用例）
+bash scripts/run_tests.sh quick
+
+# 功能测试（100个用例，O0 优化）
+bash scripts/run_tests.sh func O0
+
+# 高阶功能测试（40个用例，O3 优化）
+bash scripts/run_tests.sh hfunc O3
+
+# 性能测试（60个用例）
+bash scripts/run_tests.sh perf O0
+
+# 全量测试（所有套件，O0 优化）
+bash scripts/run_tests.sh all O0
+
+# 全量测试（所有优化级别）
+bash scripts/run_tests.sh all Oall
+```
+
+### 2.2 测试套件说明
+
+| 套件 | 命令 | 用例数 | 说明 |
+|------|------|--------|------|
+| `quick` | `run_tests.sh quick` | 5 | 快速冒烟测试，验证基本功能 |
+| `func` | `run_tests.sh func [opt]` | 100 | 功能测试（Final_Test functional） |
+| `hfunc` | `run_tests.sh hfunc [opt]` | 40 | 高阶功能测试（Final_Test h_functional） |
+| `perf` | `run_tests.sh perf [opt]` | 60 | 性能测试（Final_Test performance） |
+| `all` | `run_tests.sh all [opt]` | 200 | 全量测试（三个套件） |
+
+### 2.3 优化级别
+
+| 参数 | 说明 |
+|------|------|
+| `O0` | 无优化（默认） |
+| `O1` | 基础优化 |
+| `O2` | 中级优化 |
+| `O3` | 高级优化 |
+| `Oall` | 全部优化级别 |
+
+### 2.4 测试流程
+
+每个测试用例经过以下流程：
+
+```
+.sy 源文件 → [sysyc 编译] → .S 汇编 → [GCC 链接] → ELF → [QEMU 运行] → 结果比对
+```
+
+**错误分类统计：**
+- **COMPILE FAIL**：sysyc 编译失败
+- **LINK FAIL**：GCC 汇编/链接失败
+- **OUTPUT DIFF**：运行输出与预期不符
+- **SEGFAULT**：运行时段错误
+- **TIMEOUT**：运行超时
+
+### 2.5 快速冒烟测试用例
+
+| 用例 | 预期返回值 | 说明 |
+|------|-----------|------|
+| `00_main` | 3 | 最小程序 |
+| `01_var_defn2` | 10 | 变量定义 |
+| `11_add2` | 9 | 加法运算 |
+| `26_while_test1` | 3 | while 循环 |
+| `29_break` | 201 | break 跳出 |
+
+---
+
+## 三、IR 单元测试（18 项）
 
 ```bash
 cd /mnt/d/VSCodeProjects/compiler/build
 ./test_ir
 ```
 
-> **期望输出**：
-> ```
-> === IR 框架单元测试 ===
-> [Type System]       9/9  PASSED
-> [Def-Use Chain]     2/2  PASSED
-> [Constants]         1/1  PASSED
-> [Instructions]      3/3  PASSED
-> [Module/BB/Func]    1/1  PASSED
-> [IRBuilder E2E]     2/2  PASSED
-> === 结果: 18 passed, 0 failed ===
-> ```
+期望输出：
+```
+=== IR 框架单元测试 ===
+[Type System]       9/9  PASSED
+[Def-Use Chain]     2/2  PASSED
+[Constants]         1/1  PASSED
+[Instructions]      3/3  PASSED
+[Module/BB/Func]    1/1  PASSED
+[IRBuilder E2E]     2/2  PASSED
+=== 结果: 18 passed, 0 failed ===
+```
 
 ---
 
-## 三、.sy → IR 集成测试（23 项）
+## 四、集成测试（23 项）
 
 ```bash
 cd /mnt/d/VSCodeProjects/compiler/build
 ./test_integration
 ```
 
-> **期望输出**：
-> ```
-> === 集成测试: .sy → IR ===
->   TEST: int main() { return 0; } ... PASSED
->   TEST: int main() { return 1+2*3; } ... PASSED
->   TEST: int main() { int a; a = 42; return a; } ... PASSED
->   TEST: if-else 分支 ... PASSED
->   TEST: while 循环 ... PASSED
->   TEST: 函数调用 ... PASSED
->   TEST: 语法错误检测（缺少分号） ... PASSED
->   TEST: break 跳出循环 ... PASSED
->   TEST: continue 跳过迭代 ... PASSED
->   TEST: 全局变量 ... PASSED
->   TEST: 一维数组存取 ... PASSED
->   TEST: 二维数组存取 ... PASSED
->   TEST: void 函数 ... PASSED
->   TEST: 数组参数传递 ... PASSED
->   TEST: const一维数组初始化 ... PASSED
->   TEST: const二维数组初始化 ... PASSED
->   TEST: constExpr作为数组维度 ... PASSED
->   TEST: 全局const作为数组维度 ... PASSED
->   TEST: 一维数组聚合初始化 ... PASSED
->   TEST: 二维数组聚合初始化 ... PASSED
->   TEST: I/O运行时函数声明与调用 ... PASSED
->   TEST: 全局常量数组 ... PASSED
->   TEST: 数组部分初始化（缺失元素补零） ... PASSED
-> === 结果: 23 passed, 0 failed ===
-> ```
+期望：23 passed, 0 failed
 
 ---
 
-## 四、sysyc 命令行工具测试
+## 五、其他测试脚本
+
+### 5.1 QEMU 端到端快速测试
 
 ```bash
-cd /mnt/d/VSCodeProjects/compiler/build
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/test_qemu.sh
+```
 
-# 1. 最小程序
-./sysyc ../test/hello.sy
-# 期望: define i32 @main() { ret i32 0 }
+涵盖 O0/O3 两个优化级别，13个关键用例。
 
-# 2. 算术表达式
-./sysyc ../test/arithmetic.sy
-# 期望: mul + add + ret
+### 5.2 QEMU 全量回归测试
 
-# 3. 变量声明与赋值
-./sysyc ../test/variable.sy
-# 期望: alloca + store + load + ret
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/test_qemu_all.sh [O0|O1|O2|O3|Oall]
+```
 
-# 4. 条件分支 if-else
-./sysyc ../test/ifelse.sy
-# 期望: icmp + br + then/else + ret
+遍历 functional 全部用例，比对 stdout 和退出码。
 
-# 5. while 循环
-./sysyc ../test/while_test.sy
-# 期望: while_cond/while_body/while_end + br
+### 5.3 全量功能测试（仅编译+运行）
 
-# 6. 函数调用
-./sysyc ../test/func_call.sy
-# 期望: define add + define main + call
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/test_all_functional.sh
+```
 
-# 7. 输出到文件
-./sysyc ../test/hello.sy -o output.ir
-cat output.ir
+统计编译/链接/运行结果，不比对输出内容。
 
-# 8. break 循环跳出
-./sysyc ../test/break_test.sy
+### 5.4 指令调度测试
 
-# 9. continue 循环跳过
-./sysyc ../test/continue_test.sy
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/test_qemu_sched.sh
+```
 
-# 10. 全局变量
-./sysyc ../test/global_var.sy
+### 5.5 循环展开测试
 
-# 11. 一维数组
-./sysyc ../test/array_1d.sy
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/test_qemu_unroll.sh
+```
 
-# 12. 二维数组
-./sysyc ../test/array_2d.sy
+### 5.6 运行时库测试
 
-# 13. void 无返回值函数
-./sysyc ../test/void_func.sy
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/test_runtime.sh
+```
 
-# 14. 数组作为参数传递
-./sysyc ../test/array_param.sy
+### 5.7 语法测试
 
-# 15. 一维数组初始化
-./sysyc ../test/array_init.sy
-
-# 16. 二维数组初始化
-./sysyc ../test/array_init2d.sy
-
-# 17. const 一维数组
-./sysyc ../test/const_1d.sy
-
-# 18. const 二维数组
-./sysyc ../test/const_2d.sy
-
-# 19. constExpr 作为数组维度
-./sysyc ../test/const_arr_dim.sy
-
-# 20. 全局 const 作为数组维度
-./sysyc ../test/global_const_dim.sy
-
-# 21. I/O 运行时函数
-./sysyc ../test/io_test.sy
-
-# 22. 全局常量数组
-./sysyc ../test/global_const_arr.sy
-
-# 23. 数组部分初始化
-./sysyc ../test/arr_partial.sy
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/grammar/test-grammar.sh
+bash scripts/grammar/QUICK_GRAMMAR_TEST.sh
 ```
 
 ---
 
-## 五、前端 G4 语法文件独立验证
+## 六、一键全量测试
+
+```bash
+cd /mnt/d/VSCodeProjects/compiler/build
+cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
+
+# IR 层测试
+./test_ir && ./test_integration && echo "IR 层: 41/41 通过"
+
+# 后端全量测试
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/run_tests.sh all O0
+```
+
+---
+
+## 七、清理方案
+
+### 7.1 清理脚本
+
+```bash
+cd /mnt/d/VSCodeProjects/compiler
+bash scripts/clean.sh
+```
+
+清理内容：
+- `/tmp/sysy_test_*` 临时测试目录
+- `~/tmp/` 下的测试中间文件（.S、_bin、_out.txt）
+- `build/` 目录（CMake 构建产物）
+- 根目录下的 `CMakeCache.txt`、`CMakeFiles/` 等 CMake 残留
+
+### 7.2 手动清理命令
+
+```bash
+# 清理临时测试文件
+rm -rf /tmp/sysy_test_* /tmp/func_test_* /tmp/qemu_test_* /tmp/quick_*
+rm -rf ~/tmp/    # 调试脚本产生的临时文件
+rm -rf ~/tmp2/   # 调试脚本产生的临时文件
+rm -rf ~/tmp3/   # 调试脚本产生的临时文件
+
+# 清理构建产物
+cd /mnt/d/VSCodeProjects/compiler
+rm -rf build/
+
+# 清理 CMake 残留
+rm -f CMakeCache.txt
+rm -rf CMakeFiles/
+rm -f cmake_install.cmake
+rm -f Makefile
+
+# 清理 ANTLR 生成文件
+rm -rf src/antlr/
+```
+
+### 7.3 .gitignore 已排除项
+
+- `build/` — 构建产物
+- `src/antlr/` — ANTLR 生成文件
+- `test/functional/`、`test/h_functional/`、`test/performance/` — 官方测试用例（不提交）
+- `*.o`、`*.obj`、`*.s`、`*.elf` — 编译中间文件
+- `tmp/`、`temp/` — 临时目录
+- `.vscode/`、`.idea/` — IDE 配置
+
+### 7.4 可安全删除的目录/文件
+
+| 路径 | 说明 | 删除影响 |
+|------|------|---------|
+| `build/` | CMake 构建产物 | 需重新 cmake + make |
+| `src/antlr/` | ANTLR 自动生成 | 需重新生成 |
+| `scripts/debug/_test_*.sy` | 调试用临时测试文件 | 无影响 |
+| `scripts/debug/_input_fa40.txt` | 调试用输入文件 | 无影响 |
+| `/tmp/sysy_test_*` | 测试运行临时文件 | 无影响 |
+| `~/tmp/`、`~/tmp2/`、`~/tmp3/` | 调试脚本临时目录 | 无影响 |
+
+---
+
+## 八、G4 语法文件验证
 
 > 仅在修改 G4 文件后需要执行
 
@@ -195,7 +367,7 @@ cat output.ir
 cd /mnt/d/VSCodeProjects/compiler
 mkdir -p /tmp/sysy-test
 
-# 生成 Java 版本（Lexer + Parser 必须同一命令）
+# 生成 Java 版本
 java -jar lib/antlr-4.10.1.jar -Dlanguage=Java -o /tmp/sysy-test \
   grammar/SysY2022Lexer.g4 grammar/SysY2022Parser.g4
 
@@ -205,211 +377,37 @@ javac -cp ".:lib/antlr-4.10.1.jar" /tmp/sysy-test/*.java
 # 测试
 export CLASSPATH="/tmp/sysy-test:lib/antlr-4.10.1.jar"
 java org.antlr.v4.gui.TestRig SysY2022 compilationUnit test/hello.sy
-# 期望: 无报错（静默返回）
 ```
 
 ---
 
-## 六、ANTLR C++ 文件重新生成
-
-> 修改 G4 文件后需要重新生成 C++ 代码
+## 九、ANTLR C++ 文件重新生成
 
 ```bash
 cd /mnt/d/VSCodeProjects/compiler
 java -jar lib/antlr-4.10.1.jar -Dlanguage=Cpp -no-listener -visitor \
   -o src/antlr grammar/SysY2022Lexer.g4 grammar/SysY2022Parser.g4
 
-# 然后重新构建
 cd build && cmake .. && make -j$(nproc)
 ```
 
 ---
 
-## 七、一键全量测试
-
-```bash
-cd /mnt/d/VSCodeProjects/compiler/build
-cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) && \
-./test_ir && \
-./test_integration && \
-echo "🎉 全量测试全部通过！（18 单元 + 23 集成 = 41/41）"
-```
-
----
-
-## 八、Final_Test 批量编译验证
-
-> 验证所有官方测试用例从 .sy → IR 编译通过
-
-```bash
-cd /mnt/d/VSCodeProjects/compiler
-
-# functional（100 项）
-pass=0 fail=0
-for f in test/Final_Test/functional/*.sy; do
-    if build/sysyc "$f" > /dev/null 2>&1; then
-        pass=$((pass+1))
-    else
-        echo "[FAIL] $(basename "$f")"
-        fail=$((fail+1))
-    fi
-done
-echo "functional: $pass passed, $fail failed"
-
-# h_functional（40 项）
-pass=0 fail=0
-for f in test/Final_Test/h_functional/*.sy; do
-    if build/sysyc "$f" > /dev/null 2>&1; then
-        pass=$((pass+1))
-    else
-        echo "[FAIL] $(basename "$f")"
-        fail=$((fail+1))
-    fi
-done
-echo "h_functional: $pass passed, $fail failed"
-
-# performance（60 项）
-pass=0 fail=0
-for f in test/Final_Test/performance/*.sy; do
-    if build/sysyc "$f" > /dev/null 2>&1; then
-        pass=$((pass+1))
-    else
-        echo "[FAIL] $(basename "$f")"
-        fail=$((fail+1))
-    fi
-done
-echo "performance: $pass passed, $fail failed"
-```
-
-> **当前期望**：functional 100/100，h_functional 40/40，performance 60/60，**总计 200/200 全部通过**
-
----
-
-## 九、后端 O0 代码生成验证（IR → RISC-V → 可执行 → 运行结果校验）
-
-### 9.1 汇编输出（-S 参数）
-
-```bash
-cd /mnt/d/VSCodeProjects/compiler
-
-# 输出到 stdout
-build/sysyc -S test/hello.sy
-
-# 输出到文件
-build/sysyc -S test/hello.sy -o hello.S
-```
-
-### 9.2 端到端验证流程（.sy → .S → ELF → QEMU）
-
-> 单文件一步式验证脚本：
-> ```bash
-> cd /mnt/d/VSCodeProjects/compiler
-> 
-> GCC=riscv64-linux-gnu-gcc
-> QEMU=qemu-riscv64
-> 
-> for test in hello arithmetic variable ifelse while_test func_call global_var float_cmp; do
->     build/sysyc -S test/${test}.sy -o /tmp/${test}.S
->     $GCC -march=rv64gc -mabi=lp64d -static -o /tmp/${test}_bin /tmp/${test}.S
->     echo -n "${test}: "
->     $QEMU /tmp/${test}_bin
->     echo "exit=$?"
-> done
-> ```
->
-> **期望输出**：
-> ```
-> hello: exit=0
-> arithmetic: exit=7
-> variable: exit=42
-> ifelse: exit=0
-> while_test: exit=5
-> func_call: exit=7
-> global_var: exit=42
-> float_cmp: exit=1
-> ```
-
-### 9.3 单步调试汇编
-
-```bash
-# 查看生成的汇编代码
-build/sysyc -S test/func_call.sy
-
-# 查看 IR + 汇编 对比
-echo "=== IR ===" && build/sysyc test/func_call.sy
-echo ""
-echo "=== ASM ===" && build/sysyc -S test/func_call.sy
-```
-
----
-
-## 十、一键全量验证（含后端）
-
-```bash
-# 在 WSL 内执行
-cd /mnt/d/VSCodeProjects/compiler/build
-cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
-
-# IR 层测试
-./test_ir && ./test_integration && echo "IR 层: 41/41 通过"
-
-# 后端端到端测试
-cd /mnt/d/VSCodeProjects/compiler
-GCC=riscv64-linux-gnu-gcc QEMU=qemu-riscv64
-pass=0 fail=0
-for test in hello arithmetic variable ifelse while_test func_call global_var float_cmp; do
-    build/sysyc -S test/${test}.sy -o /tmp/${test}.S
-    $GCC -march=rv64gc -mabi=lp64d -static -o /tmp/${test}_bin /tmp/${test}.S 2>/dev/null || continue
-    $QEMU /tmp/${test}_bin > /dev/null 2>&1
-    [ $? -eq 0 ] && pass=$((pass+1)) || fail=$((fail+1))
-done
-echo "后端: ${pass}/$((pass+fail)) 通过"
-```
-
----
-
-## 测试结果速查
+## 十、测试结果速查
 
 | 模块 | 测试项 | 通过标志 |
 |-----|--------|---------|
-| 前端 G4 | `hello.sy` 解析 | 终端无报错 |
+| 统一框架 | quick 冒烟测试 | 5/5 PASS |
+| 统一框架 | func O0 功能测试 | Compile 100 OK, Runtime 100 OK |
+| 统一框架 | hfunc O0 高阶测试 | Compile 40 OK |
+| 统一框架 | perf O0 性能测试 | Compile 60 OK |
 | IR Type System | 唯一性、toString | 9/9 PASSED |
 | IR Def-Use | 引用链维护 | 2/2 PASSED |
 | IR Constants | 缓存验证 | 1/1 PASSED |
 | IR Instructions | 创建方法 | 3/3 PASSED |
 | IR Module | dump() 输出 | 1/1 PASSED |
 | IRBuilder E2E | main→ret | 2/2 PASSED |
-| 集成: hello.sy | 最小 main | IR 输出正确 |
-| 集成: arithmetic.sy | 表达式 | mul+add+ret |
-| 集成: variable.sy | 变量 | alloca+store+load |
-| 集成: ifelse.sy | 分支 | icmp+br+then/else |
-| 集成: while_test.sy | 循环 | while_cond/body/end |
-| 集成: func_call.sy | 函数调用 | define+call |
-| 集成: bad.sy | 错误检测 | 抛出异常 |
-| 集成: break_test.sy | break | br to while_end |
-| 集成: continue_test.sy | continue | br to while_cond |
-| 集成: global_var.sy | 全局变量 | global 声明 |
-| 集成: array_1d.sy | 一维数组 | alloca+getelementptr |
-| 集成: array_2d.sy | 二维数组 | alloca+getelementptr |
-| 集成: void_func.sy | void 函数 | define void |
-| 集成: array_param.sy | 数组参数 | pointer type param |
-| 集成: const_1d.sy | const 1D 数组 | alloca+store |
-| 集成: const_2d.sy | const 2D 数组 | alloca+store |
-| 集成: const_arr_dim.sy | constExpr 维度 | const 表达式求值 |
-| 集成: global_const_dim.sy | 全局const引用 | global+constant |
-| 集成: array_init.sy | 数组聚合初始化 | getelementptr+store |
-| 集成: array_init2d.sy | 2D 聚合初始化 | getelementptr+store |
-| 集成: io_test.sy | I/O 内置函数 | declare+call |
-| 集成: global_const_arr.sy | 全局const数组 | global array |
-| 集成: arr_partial.sy | 部分初始化 | 缺失元素补零 |
-| Final_Test | functional 批量 | 100/100 ✅ |
-| Final_Test | h_functional 批量 | 40/40 ✅ |
-| Final_Test | performance 批量 | 60/60 ✅ |
-| 后端: hello.sy | hello 端到端 | qemu exit=0 ✅ |
-| 后端: arithmetic.sy | 算术端到端 | qemu exit=7 ✅ |
-| 后端: variable.sy | 变量端到端 | qemu exit=42 ✅ |
-| 后端: ifelse.sy | 分支端到端 | qemu exit=0 ✅ |
-| 后端: while_test.sy | 循环端到端 | qemu exit=5 ✅ |
-| 后端: func_call.sy | 函数调用端到端 | qemu exit=7 ✅ |
-| 后端: global_var.sy | 全局变量端到端 | qemu exit=42 ✅ |
-| 后端: float_cmp.sy | 浮点比较端到端 | qemu exit=1 ✅ |
+| 集成测试 | .sy → IR | 23/23 PASSED |
+| Final_Test | functional 批量 | 100/100 |
+| Final_Test | h_functional 批量 | 40/40 |
+| Final_Test | performance 批量 | 60/60 |

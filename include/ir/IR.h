@@ -353,9 +353,14 @@ namespace IR {
         Constant* getInitializer() const { return initVal; }
         void     setInitializer(Constant* c) { initVal = c; }
 
+        // Flat initializer data for arrays (each element is a 32-bit word)
+        const std::vector<uint32_t>& getInitData() const { return initData; }
+        void setInitData(const std::vector<uint32_t>& data) { initData = data; }
+
     private:
         bool      constant;
         Constant* initVal;
+        std::vector<uint32_t> initData;
     };
 
     // ================================================================

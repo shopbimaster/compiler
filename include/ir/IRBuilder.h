@@ -66,7 +66,9 @@ private:
     // ===== 工具 =====
     std::string     newTempName();
     Type*           toIRType(const std::string& sysyType);
-    Instruction*    emitBinOp(Instruction::Opcode op, Value* lhs, Value* rhs);
+    Value*          implConvert(Value* val, Type* targetTy);
+    Constant*       constantToType(Constant* val, Type* targetTy);
+    Value*          conditionToBool(Value* val);
     void            registerBuiltinFunctions();
     void            emitInitStoresVar(Type* targetType, Value* basePtr,
                                   std::vector<Value*>& indices,
@@ -76,6 +78,9 @@ private:
                                   std::vector<Value*>& indices,
                                   const std::vector<SysY2022Parser::ConstInitValContext*>& children,
                                   int& flatIdx);
+    void            collectInitData(Type* targetType,
+                                  const std::vector<SysY2022Parser::InitValContext*>& children,
+                                  std::vector<uint32_t>& outData);
     Value*          zeroForType(Type* ty);
 
     // ===== 常数表达式编译期求值 =====

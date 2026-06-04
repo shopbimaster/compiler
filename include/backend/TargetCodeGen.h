@@ -79,6 +79,12 @@ private:
     std::string storeFromReg(IR::Value* val, const std::string& srcReg, bool addNew = false);
     std::string emitGlobalAddr(IR::GlobalVariable* gv, const std::string& destReg);
     std::string emitValueToReg(IR::Value* val, const std::string& destReg);
+
+    // Helpers for large stack frames exceeding RISC-V 12-bit immediate
+    static bool fitsImm12(int val) { return val >= -2048 && val <= 2047; }
+    std::string emitStackLoad(const std::string& reg, int offset, const std::string& insn);
+    std::string emitStackStore(const std::string& reg, int offset, const std::string& insn);
+    std::string emitSPAddImm(int delta);
 };
 
 }
