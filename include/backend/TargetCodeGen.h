@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ir/IR.h"
+#include "backend/RegisterAllocator.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -15,39 +16,75 @@ enum class Register {
     s8, s9, s10, s11, t3, t4, t5, t6
 };
 
-class CodeEmitter {
-private:
-    std::ostringstream text;
-    std::ostringstream data;
+std::string regToString(Register reg);
 
+class CodeEmitter {
 public:
     void emitText(const std::string& asmLine) { text << asmLine << std::endl; }
     void emitData(const std::string& asmLine) { data << asmLine << std::endl; }
     std::string getTextSection() const { return text.str(); }
     std::string getDataSection() const { return data.str(); }
+
+private:
+    std::ostringstream text;
+    std::ostringstream data;
 };
 
 class TargetCodeGen {
-private:
-    CodeEmitter emitter;
-    std::unordered_map<IR::Value*, Register> regMap;
-    int stackOffset;
-
 public:
     TargetCodeGen();
-
     std::string generate(IR::Module& module);
 
 private:
+    CodeEmitter emitter;
+    IR::Function* currentFunc = nullptr;
+    int stackSize;
+    int labelCounter;
+
+    std::unordered_map<IR::Value*, int> vregStackOffset;
+    std::unordered_map<IR::Value*, int> allocaOffset;
+    std::unordered_map<IR::Argument*, int> paramOffsets;
+    RegisterAllocator regAlloc;
+
+    void emitGlobal(IR::GlobalVariable* gv);
+    void emitGlobalInitData(IR::Constant* init, IR::Type* type, const std::string& indent);
+
     void emitFunction(IR::Function& func);
     void emitBasicBlock(IR::BasicBlock& bb);
     void emitInstruction(IR::Instruction& inst);
+
+    void computeStackLayout(IR::Function& func);
+    int getTypeSize(IR::Type* t);
+    int getStackOffset(IR::Value* val);
+    int allocSlot(IR::Value* val);
+
     void emitPrologue(IR::Function& func);
     void emitEpilogue(IR::Function& func);
-    Register getReg(IR::Value* val);
-    Register allocReg();
-    void freeReg(Register reg);
-    std::string regToString(Register reg);
+
+    void emitRet(IR::Instruction& inst);
+    void emitBr(IR::Instruction& inst);
+    void emitCondBr(IR::Instruction& inst);
+    void emitBinOp(IR::Instruction& inst);
+    void emitFBinOp(IR::Instruction& inst);
+    void emitIcmp(IR::Instruction& inst);
+    void emitFcmp(IR::Instruction& inst);
+    void emitLoad(IR::Instruction& inst);
+    void emitStore(IR::Instruction& inst);
+    void emitCall(IR::Instruction& inst);
+    void emitGetElementPtr(IR::Instruction& inst);
+    void emitSitofp(IR::Instruction& inst);
+    void emitFptosi(IR::Instruction& inst);
+
+    std::string loadToReg(IR::Value* val, const std::string& destReg);
+    std::string storeFromReg(IR::Value* val, const std::string& srcReg, bool addNew = false);
+    std::string emitGlobalAddr(IR::GlobalVariable* gv, const std::string& destReg);
+    std::string emitValueToReg(IR::Value* val, const std::string& destReg);
+
+    // Helpers for large stack frames exceeding RISC-V 12-bit immediate
+    static bool fitsImm12(int val) { return val >= -2048 && val <= 2047; }
+    std::string emitStackLoad(const std::string& reg, int offset, const std::string& insn);
+    std::string emitStackStore(const std::string& reg, int offset, const std::string& insn);
+    std::string emitSPAddImm(int delta);
 };
 
 }

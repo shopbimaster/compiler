@@ -22,8 +22,7 @@ sysyc
 *.out
 *.app
 
-# Generated ANTLR files
-src/antlr/
+# ANTLR intermediate files (regenerated each run)
 *.interp
 *.tokens
 *.class
@@ -46,9 +45,6 @@ temp/
 /tmp
 /temp
 
-# Final_Test cases (not to be committed)
-test/Final_Test/
-
 # Backup files
 *.bak
 *.backup
@@ -58,3 +54,10 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+
+# Debug test files (ad-hoc debug scripts and data)
+scripts/debug/_test_*.sy
+scripts/debug/_input_*.txt
+
+# Grammar test build directory
+build-grammar-test/

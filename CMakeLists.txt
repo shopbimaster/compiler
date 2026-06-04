@@ -53,6 +53,38 @@ target_include_directories(sysy_compiler PUBLIC include)
 target_link_libraries(sysy_compiler PUBLIC sysy_ir_builder)
 
 # ================================================================
+# 后端代码生成库
+# ================================================================
+add_library(sysy_backend STATIC
+    src/backend/TargetCodeGen.cpp
+    src/backend/RegisterAllocator.cpp
+)
+target_include_directories(sysy_backend PUBLIC include)
+target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
+
+# ================================================================
+# O1 + O2 + O3 优化库
+# ================================================================
+add_library(sysy_opt STATIC
+    src/opt/Optimizer.cpp
+    src/opt/ConstantFolding.cpp
+    src/opt/DeadCodeElimination.cpp
+    src/opt/PeepholeOptimizer.cpp
+    src/opt/InlineExpansion.cpp
+    src/opt/CSE.cpp
+    src/opt/LICM.cpp
+    src/opt/AlgebraicSimplification.cpp
+    src/opt/LoopUnrolling.cpp
+    src/opt/LoopInterchange.cpp
+    src/opt/TailRecursionElimination.cpp
+    src/opt/InstructionScheduling.cpp
+    src/opt/RecursiveMulToNative.cpp
+    src/opt/BitOpPatternRecognition.cpp
+)
+target_include_directories(sysy_opt PUBLIC include)
+target_link_libraries(sysy_opt PUBLIC sysy_ir_core)
+
+# ================================================================
 # IR 核心单元测试（不依赖 ANTLR 输入，但需 ANTLR 运行时符号）
 # ================================================================
 add_executable(test_ir
@@ -60,7 +92,7 @@ add_executable(test_ir
     ${ANTLR_SOURCES}
 )
 target_include_directories(test_ir PRIVATE ${ANTLR_INCLUDES})
-target_link_libraries(test_ir sysy_ir_builder antlr4_static)
+target_link_libraries(test_ir sysy_ir_builder sysy_opt antlr4_static)
 
 # ================================================================
 # 编译器主入口 sysyc
@@ -70,7 +102,7 @@ add_executable(sysyc
     ${ANTLR_SOURCES}
 )
 target_include_directories(sysyc PRIVATE include ${ANTLR_INCLUDES})
-target_link_libraries(sysyc sysy_compiler antlr4_static)
+target_link_libraries(sysyc sysy_compiler sysy_backend sysy_opt antlr4_static)
 
 # ================================================================
 # 集成测试
@@ -80,4 +112,4 @@ add_executable(test_integration
     ${ANTLR_SOURCES}
 )
 target_include_directories(test_integration PRIVATE include ${ANTLR_INCLUDES})
-target_link_libraries(test_integration sysy_compiler antlr4_static)
+target_link_libraries(test_integration sysy_compiler sysy_opt antlr4_static)

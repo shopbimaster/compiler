@@ -118,8 +118,8 @@ namespace IR {
     };
 
     // ================================================================
-    // Value —— 所有 IR 实体的基类，持有 uses 列表
-    // ================================================================
+// Value —— 所有 IR 实体的基类，持有 uses 列表
+// ================================================================
 
     class Value {
     public:
@@ -134,6 +134,7 @@ namespace IR {
         const std::vector<Use>& getUses() const { return uses; }
         unsigned getNumUses() const             { return static_cast<unsigned>(uses.size()); }
         bool     hasOneUse() const              { return uses.size() == 1; }
+        void     replaceAllUsesWith(Value* newVal);
 
     protected:
         explicit Value(Type* t, const std::string& n = "") : type(t), name(n) {}
@@ -297,6 +298,10 @@ namespace IR {
         using iterator = std::vector<std::unique_ptr<Instruction>>::iterator;
         iterator begin() { return insts.begin(); }
         iterator end()   { return insts.end(); }
+        iterator erase(iterator it) { return insts.erase(it); }
+        iterator insert(iterator pos, Instruction* inst) {
+            return insts.insert(pos, std::unique_ptr<Instruction>(inst));
+        }
 
     private:
         Function*                                  parent;
@@ -348,9 +353,14 @@ namespace IR {
         Constant* getInitializer() const { return initVal; }
         void     setInitializer(Constant* c) { initVal = c; }
 
+        // Flat initializer data for arrays (each element is a 32-bit word)
+        const std::vector<uint32_t>& getInitData() const { return initData; }
+        void setInitData(const std::vector<uint32_t>& data) { initData = data; }
+
     private:
         bool      constant;
         Constant* initVal;
+        std::vector<uint32_t> initData;
     };
 
     // ================================================================

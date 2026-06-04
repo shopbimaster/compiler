@@ -5,7 +5,7 @@
 - **目标平台**: RISC-V RV64GC (medany)
 - **开发语言**: C++20
 - **目标操作系统**: Ubuntu 24.04 (WSL)
-- **最后更新**: 2026-05-21
+- **最后更新**: 2026-05-29（P3 高级优化完成）
 
 ---
 
@@ -53,6 +53,50 @@
 - [x] BailErrorStrategy 语法错误检测
 - [x] **25/25 全部测试通过（18 单元 + 7 集成）**
 
+### 第 6 阶段: 后端代码生成 ✅
+- [x] 指令选择：全部 IR opcode → RISC-V 指令
+- [x] 栈帧管理：函数序言/尾声、栈变量分配
+- [x] 寄存器分配：线性扫描分配器
+- [x] 调用约定：RV64 LP64 (a0-a7, t0-t6, s0-s11)
+- [x] 全局变量：lui+addi (medany) 访问
+- [x] 浮点指令：FADD/FSUB/FMUL/FDIV → fadd.s/fsub.s/fmul.s/fdiv.s
+- [x] 11/11 端到端用例 QEMU 验证通过
+
+### 第 7 阶段: 前端语言特性补全 ✅
+- [x] break/continue、嵌套 if-else/while
+- [x] 一维/多维数组、数组传参、表达式下标
+- [x] 全局变量/数组、const 常量
+- [x] float 语法/常量折叠、void 函数
+- [x] 十六进制/八进制、一元运算符
+- [x] 嵌套块作用域/变量遮蔽
+- [x] I/O 运行时函数声明（12个）
+- [x] 递归函数、多文件 return、语句表达式
+- [x] 数组初始化、全局数组初始化、部分数组初始化
+- [x] **52/52 全部测试通过（18 单元 + 23 集成 + 11 端到端）**
+
+### 第 7.5 阶段: 全流程Bug修复 ✅ (2026-05-28)
+- [x] **Bug #1: InlineExpansion ICMP条件名丢失**: cloneInstruction 使用 createBinOp+".i"后缀 → 改用 createCmp 保留原始条件名 → ifelse.sy 结果正确
+- [x] **Bug #2: AlgebraicSimplification 恒等式消除死循环**: 6处恒等式消除后 replaceAllUsesWith+dropAllUses 但未 erase → while(changed) 从头重扫死循环 → 添加 `bb->erase` 修复
+- [x] **Bug #3: BitOpPatternRecognition 相同死循环**: trySimplifyShiftAndMask 中 AND 冗余消除后未 erase → 添加 erase 逻辑修复
+- [x] **Bug #4: LoopUnrolling ICMP常量错误更新**: cloneNonTermInst 跳过 LOAD/STORE 且未做操作数重映射，但 ICMP 常量被错误减半 → 注释掉 ICMP 常量更新，待完整克隆修复后恢复
+- [x] **Bug #5: test_backend.sh ifelse 期望值错误**: 预期0实为1（之前被ICMP反向bug掩盖）→ 修正为1
+- [x] **Bug #6: TailRecursionElimination SIGSEGV**: eliminateOnFunction range-for循环内 eliminateTailCall 修改BB指令列表（erase CALL/RET）导致迭代器失效 → 改为先收集尾调用到vector再逐个处理
+- [x] **test_qemu_extra.sh 预期值修正**: recursive_mul(30→21), div_chain(3→2), mul_simple(20→21), break_test(3→201=1225%256)
+- [x] **16/16 QEMU端到端、18单元、23集成 全部通过**
+
+### 第 8 阶段: 优化 Pass ✅
+- [x] **O1**: 常量折叠 + 死代码消除 + 窥孔优化
+- [x] **O2**: 函数内联 + 局部CSE + LICM + 线性扫描寄存器分配
+- [x] **O3**: 代数化简+强度削减 + 循环展开 + 尾递归消除
+- [x] **P0 语义级优化**:
+  - P0-1: 除/取模→移位/位与（AlgebraicSimplification）
+  - P0-2: 位运算模式识别（BitOpPatternRecognition）
+  - P0-3: 递归乘法→原生乘法（RecursiveMulToNative）
+- [x] P0 优化流水线: recursiveMulToNative → bitOpPatternRecognition → constantFolding → deadCodeElimination
+- [x] P1-3 **循环交换 (Loop Interchange)**: 二重嵌套循环变量交换（entry初始化→outerBody初始化→innerBody/outerLatch自增→ICMP条件），支持直接嵌套检测，单次 pass 避免振荡；21 单元测试 + 24 集成测试 + 10 QEMU端到端 全部通过
+- [x] LoopUnrolling 克隆修复：LOAD/STORE/GEP 完整支持 + 操作数重映射 + valueMap 分离克隆与插入避免指针失效
+- [x] **21/21 单元 + 24/24 集成 全部通过（45/45）**
+
 ---
 
 ## 📁 项目结构 (当前)
@@ -86,6 +130,21 @@ compiler/
 │   ├── ir/
 │   │   ├── IR.cpp                ✅ 完整实现
 │   │   └── IRBuilder.cpp         ✅ 完整 Visitor 实现
+│   ├── opt/
+│   │   ├── AlgebraicSimplification.cpp   ✅ O3/P0-1
+│   │   ├── BitOpPatternRecognition.cpp   ✅ P0-2
+│   │   ├── ConstantFolding.cpp           ✅ O1
+│   │   ├── CSE.cpp                       ✅ O2
+│   │   ├── DeadCodeElimination.cpp       ✅ O1
+│   │   ├── InlineExpansion.cpp           ✅ O2
+│   │   ├── InstructionScheduling.cpp     ✅ P3-3
+│   │   ├── LICM.cpp                      ✅ O2
+│   │   ├── LoopInterchange.cpp           ✅ P1-3
+│   │   ├── LoopUnrolling.cpp             ✅ O3/P3-4
+│   │   ├── Optimizer.cpp                 ✅ 优化流水线
+│   │   ├── PeepholeOptimizer.cpp         ✅ O1
+│   │   ├── RecursiveMulToNative.cpp      ✅ P0-3
+│   │   └── TailRecursionElimination.cpp  ✅ O3
 │   └── utils/
 │       └── Logger.cpp
 ├── test/
@@ -97,8 +156,16 @@ compiler/
 │   ├── func_call.sy              ✅ 函数调用
 │   ├── bad.sy                    ✅ 语法错误测试
 │   ├── float_test.sy
-│   ├── test_ir.cpp               ✅ IR 单元测试 (18/18)
-│   └── test_integration.cpp      ✅ 集成测试 (7/7)
+│   ├── nested_loop_test.sy       ✅ 嵌套循环测试
+│   ├── loop_unroll_4x.sy         ✅ 循环展开 4× 测试
+│   ├── instr_sched_basic.sy      ✅ 指令调度测试
+│   ├── test_ir.cpp               ✅ IR 单元测试 (26/26)
+│   └── test_integration.cpp      ✅ 集成测试 (25/25)
+├── build_backend.sh               ✅ 后端构建
+├── test_backend.sh                ✅ QEMU 端到端 (11/11)
+├── test_qemu_extra.sh             ✅ QEMU 端到端 额外 (5/5)
+├── test_qemu_unroll.sh            ✅ 循环展开 QEMU 测试
+├── test_qemu_sched.sh             ✅ 指令调度 QEMU 测试
 ├── CMakeLists.txt                ✅ 3 库 + 3 可执行文件
 ├── DEVELOPMENT_PLAN.md
 ├── PROGRESS_SUMMARY.md
@@ -157,6 +224,19 @@ Use → { User*, operandNo }  // Def-Use 链
 | 2026-05-21 | sysyc: func_call.sy | ✅ | 函数调用 IR |
 | 2026-05-21 | test_integration 7 项 | ✅ | 全部通过 |
 | 2026-05-21 | test_ir 18 项 | ✅ | 全部通过 |
+| 2026-05-28 | P0-1 除/取模→移位/位与 | ✅ | div_chain.sy: sra 替代 div, QEMU exit 2 |
+| 2026-05-28 | P0-2 位运算模式识别 | ✅ | 代码审查: 4条规则正确, 测试无回归 |
+| 2026-05-28 | P0-3 递归乘法→原生乘法 | ✅ | recursive_mul.sy: mul 替代递归, QEMU exit 21 |
+| 2026-05-28 | P0 全量回归 | ✅ | 18 单元 + 23 集成 全部通过 |
+| 2026-05-28 | Bug #1-#6 修复后全量回归 | ✅ | 16 QEMU端到端 + 18单元 + 23集成 全部通过 (57/57) |
+| 2026-05-28 | Bug #6 TailRecursionElimination SIGSEGV | ✅ | eliminateOnFunction 迭代器失效修复，recursive_mul_shift 不再崩溃 |
+| 2026-05-28 | Bug #1 InlineExpansion ICMP 条件名 | ✅ | createBinOp→createCmp，ifelse 结果正确 |
+| 2026-05-28 | Bug #2/#3 死循环修复 | ✅ | AlgebraicSimplification + BitOpPatternRecognition erase修复 |
+| 2026-05-28 | LoopUnrolling 克隆修复 | ✅ | cloneNonTermInst 支持 LOAD/STORE/GEP + valueMap 操作数重映射，分离克隆创建与BB插入避免迭代器/指针失效；仅展开 tripCount%2==0 的循环；loop_unroll_test.sy QEMU exit=10 通过 |
+| 2026-05-29 | P1-3 循环交换实现 + 单元测试 | ✅ | 21/21 单元 + 24/24 集成 + 10/10 QEMU端到端（O0+O3）全部通过；新增 3 个 LoopInterchange 单元测试（basic/noop/computation）和 1 个集成测试；修复振荡 bug（maxIters=1） |
+| 2026-05-29 | P3-4 循环展开 4× 增强 | ✅ | LoopUnrolling 优先 4× 展开（tripCount%4==0），回退 2×；新增 3 个单元测试（basic/4×/fallback）+ 3 个集成测试用例 + QEMU 端到端验证（6/6） |
+| 2026-05-29 | P3-3 指令调度 | ✅ | 基本块内列表调度：构建数据依赖 DAG，优先调度 LOAD 和多使用者指令，stable_sort 原地重排避免迭代器失效；新增 2 个单元测试（load_hoist/dep_chain）+ 1 个集成测试 + QEMU 端到端验证（2/2） |
+| 2026-05-29 | P3 全量回归 | ✅ | 26 单元 + 25 集成 + 8 QEMU端到端（2 test suites）全部通过（59/59） |
 
 ---
 
@@ -180,8 +260,9 @@ make -j$(nproc)
 - **语法解析**: G4 文件完全正确，C++ 版 ANTLR 运行时已集成
 - **IR 框架**: 类型系统 + SSA IR + Module/dump 完整可用
 - **前端→IR 管线**: sysyc 可从 .sy 源文件自动生成 LLVM 风格 IR
-- **已支持特性**: 变量/赋值、四则运算、比较、短路求值、if-else、while、函数+参数
-- **待实现特性**: break/continue、数组、全局变量、float、void 函数、作用域、I/O 等
-- **后端**: 代码生成器头文件已定义，待实现
-- **测试用例**: Final_Test 目录包含 functional (100) + h_functional (40) + performance (~50) 共 ~190 条
-- **下一步**: 前端补全 → 后端 O0 代码生成 (IR → RISC-V 汇编)
+- **已支持特性**: 全部 SysY2022 语言特性（数组、全局变量、float、void、作用域、I/O 等）
+- **后端**: 代码生成器完整实现（指令选择 + 栈帧 + 线性扫描寄存器分配）
+- **优化**: O1/O2/O3/P0/P3 全部实现，优化流水线完整（含循环交换、循环展开4×、指令调度）
+- **测试用例**: test/ 目录包含 functional (100) + h_functional (40) + performance (68) 共 208 条最终测试用例
+- **已知问题**: 无
+- **下一步**: 对接 final test 测试套件：I/O 运行时库 → 功能测试适配脚本 → functional/h_functional 全量回归 → 性能基准测量

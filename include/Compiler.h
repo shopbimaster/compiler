@@ -6,18 +6,27 @@
 
 namespace IR {
 
+enum class OptLevel {
+    O0,
+    O1,
+    O2,
+    O3,
+    OALL
+};
+
 class Compiler {
 public:
     Compiler() = default;
 
-    // 编译 .sy 源文件，返回 IR Module
     std::unique_ptr<Module> compile(const std::string& sourcePath);
 
-    // 输出 IR 到 ostream
-    void emitIR(const std::string& sourcePath, std::ostream& out);
+    void emitIR(const std::string& sourcePath, std::ostream& out, OptLevel opt = OptLevel::O0);
 
-    // 输出 IR 到文件
-    void emitIRToFile(const std::string& sourcePath, const std::string& outputPath);
+    void emitIRToFile(const std::string& sourcePath, const std::string& outputPath, OptLevel opt = OptLevel::O0);
+
+    void emitAsm(const std::string& sourcePath, std::ostream& out, OptLevel opt = OptLevel::OALL);
+
+    void emitAsmToFile(const std::string& sourcePath, const std::string& outputPath, OptLevel opt = OptLevel::OALL);
 };
 
 } // namespace IR
