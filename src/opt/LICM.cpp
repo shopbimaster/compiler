@@ -117,10 +117,11 @@ struct Loop {
 
 std::vector<Loop> findLoops(IR::Function* func, const DomMap& dom) {
     auto preds = buildPredecessors(func);
+    auto succs = buildSuccessors(func);
     std::vector<Loop> loops;
 
     for (auto& bb : func->getBlocks()) {
-        for (auto* succ : buildSuccessors(func)[bb.get()]) {
+        for (auto* succ : succs[bb.get()]) {
             if (strictlyDominates(succ, bb.get(), dom)) {
                 Loop loop;
                 loop.header = succ;
