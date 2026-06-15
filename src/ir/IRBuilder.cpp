@@ -690,6 +690,21 @@ std::any IRBuilder::visitUnaryExp(SysY2022Parser::UnaryExpContext* ctx) {
     if (ctx->IDENTIFIER() && !ctx->unaryOp()) {
         std::string calleeName = ctx->IDENTIFIER()->getText();
 
+        // starttime() / stoptime() → _sysy_starttime(0) / _sysy_stoptime(0)
+        // SysY runtime library provides _sysy_starttime(int)/_sysy_stoptime(int);
+        // starttime/stoptime are only macros in sylib.h.
+        if (calleeName == "starttime" || calleeName == "stoptime") {
+            std::string actualName = (calleeName == "starttime")
+                ? "_sysy_starttime" : "_sysy_stoptime";
+            auto* ftSys = FunctionType::get(VoidType::get(), {IntegerType::I32});
+            Function* callee = module->createFunction(ftSys, actualName, true);
+            Value* lineNum = ConstantInt::get(IntegerType::I32, 0);
+            std::vector<Value*> callArgs = { lineNum };
+            auto* call = Instruction::createCall(ftSys, callee, callArgs, "");
+            currentBB->pushBack(call);
+            return std::any(static_cast<Value*>(nullptr));
+        }
+
         std::vector<Value*> args;
         std::vector<Type*> paramTypes;
         if (ctx->funcRParams()) {
@@ -1217,13 +1232,18 @@ void IRBuilder::registerBuiltinFunctions() {
     funcTypeTable["putfarray"] = FunctionType::get(vd, {i32, PointerType::get(flt)});
     module->createFunction(FunctionType::get(vd, {i32, PointerType::get(flt)}), "putfarray", true);
 
-    // void starttime()
+    // void starttime() — mapped to _sysy_starttime(int) at call site
     funcTypeTable["starttime"] = FunctionType::get(vd, {});
-    module->createFunction(FunctionType::get(vd, {}), "starttime", true);
 
-    // void stoptime()
+    // void stoptime() — mapped to _sysy_stoptime(int) at call site
     funcTypeTable["stoptime"] = FunctionType::get(vd, {});
-    module->createFunction(FunctionType::get(vd, {}), "stoptime", true);
+
+    // Actual runtime library symbols: void _sysy_starttime(int), void _sysy_stoptime(int)
+    funcTypeTable["_sysy_starttime"] = FunctionType::get(vd, {i32});
+    module->createFunction(FunctionType::get(vd, {i32}), "_sysy_starttime", true);
+
+    funcTypeTable["_sysy_stoptime"] = FunctionType::get(vd, {i32});
+    module->createFunction(FunctionType::get(vd, {i32}), "_sysy_stoptime", true);
 }
 
 // ================================================================
