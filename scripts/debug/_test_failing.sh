@@ -10,7 +10,7 @@ tests="87_many_params 88_many_params2 95_float"
 for t in $tests; do
     echo ""
     echo "--- ${t} ---"
-    ${BUILD_DIR}/sysyc -S ${SRC}/${t}.sy -o ${TMPDIR}/${t}.S -O0 2>&1
+    ${BUILD_DIR}/compiler -S ${SRC}/${t}.sy -o ${TMPDIR}/${t}.S -O0 2>&1
     riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d -static -o ${TMPDIR}/${t}_bin ${TMPDIR}/${t}.S ${BUILD_DIR}/libsylib.a 2>&1
     if [ -f "${SRC}/${t}.in" ]; then
         qemu-riscv64 -d in_asm ${TMPDIR}/${t}_bin < ${SRC}/${t}.in > ${TMPDIR}/${t}_out 2>${TMPDIR}/${t}_trace.log

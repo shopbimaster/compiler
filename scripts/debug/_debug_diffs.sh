@@ -15,7 +15,7 @@ for name in 53_scope2 78_side_effect 80_chaos_token 95_float; do
     bin="${TMP}/func_test_${name}_bin"
     infile="${FUNC_DIR}/${name}.in"
     
-    ${BUILD_DIR}/sysyc -S "$src" -o "$asm" -O0 2>&1
+    ${BUILD_DIR}/compiler -S "$src" -o "$asm" -O0 2>&1
     
     $GCC -march=rv64gc -mabi=lp64d -static -o "$bin" "$asm" "$SYLIB_A" 2>&1
     

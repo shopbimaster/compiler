@@ -68,7 +68,7 @@ run_suite() {
         local outfile="${test_dir}/${name}.out"
 
         # Compile
-        if ! ${BUILD_DIR}/sysyc -S "$src" -o "$asm" -${OPT} 2>/dev/null; then
+        if ! ${BUILD_DIR}/compiler -S "$src" -o "$asm" -${OPT} 2>/dev/null; then
             echo -e "  ${RED}COMPILE FAIL${NC}: ${name}"
             compile_fail=$((compile_fail + 1))
             continue
@@ -152,7 +152,7 @@ run_quick() {
         local asm="${TMPDIR}/quick_${name}.S"
         local bin="${TMPDIR}/quick_${name}_bin"
 
-        if ! ${BUILD_DIR}/sysyc -S "$src" -o "$asm" -O0 2>/dev/null; then
+        if ! ${BUILD_DIR}/compiler -S "$src" -o "$asm" -O0 2>/dev/null; then
             echo -e "  ${RED}FAIL${NC}: ${name} - compile error"
             fail=$((fail + 1))
             continue
@@ -189,9 +189,9 @@ if [ ! -f "$SYLIB_A" ]; then
 fi
 
 # Ensure compiler exists
-if [ ! -f "${BUILD_DIR}/sysyc" ]; then
-    echo -e "${RED}Error: sysyc not found at ${BUILD_DIR}/sysyc${NC}"
-    echo "Run: cmake --build build --target sysyc"
+if [ ! -f "${BUILD_DIR}/compiler" ]; then
+    echo -e "${RED}Error: compiler not found at ${BUILD_DIR}/compiler${NC}"
+    echo "Run: cmake --build build --target compiler"
     exit 1
 fi
 

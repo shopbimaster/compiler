@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 FUNC_DIR="${SCRIPT_DIR}/test/functional"
 SYLIB_A="${BUILD_DIR}/libsylib.a"
-SYSC="${BUILD_DIR}/sysyc"
+SYSC="${BUILD_DIR}/compiler"
 
 OPT_LEVEL="${1:-Oall}"
 TMP_DIR="/tmp/sysy_test_$$"
@@ -50,7 +50,7 @@ check_prereqs() {
         missing=1
     fi
     if [ ! -f "$SYSC" ]; then
-        echo -e "${RED}Error: sysyc not found at $SYSC${NC}"
+        echo -e "${RED}Error: compiler not found at $SYSC${NC}"
         missing=1
     fi
     return $missing

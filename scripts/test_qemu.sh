@@ -26,7 +26,7 @@ run_test() {
     local bin="/tmp/qemu_test_${name}_bin"
     local label="${name} (${opt})"
 
-    if ! ${BUILD_DIR}/sysyc -S "$src" -o "$asm" -${opt} 2>/dev/null; then
+    if ! ${BUILD_DIR}/compiler -S "$src" -o "$asm" -${opt} 2>/dev/null; then
         echo "  FAIL: $label - compile error"
         return 1
     fi
@@ -56,7 +56,7 @@ run_test_with_input() {
     local bin="/tmp/qemu_test_${name}_bin"
     local label="${name} (${opt})"
 
-    if ! ${BUILD_DIR}/sysyc -S "$src" -o "$asm" -${opt} 2>/dev/null; then
+    if ! ${BUILD_DIR}/compiler -S "$src" -o "$asm" -${opt} 2>/dev/null; then
         echo "  FAIL: $label - compile error"
         return 1
     fi

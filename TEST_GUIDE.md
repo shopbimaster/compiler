@@ -18,15 +18,15 @@ compiler/
 │   ├── opt/            # 优化器实现（14个优化Pass）
 │   ├── utils/          # 工具实现
 │   ├── Compiler.cpp    # 编译器封装
-│   ├── main.cpp        # 主入口 sysyc
-│   └── test-grammar.cpp # 语法测试程序
-├── test/               # 测试用例与测试代码
-│   ├── functional/     # 功能测试用例（100个，.gitignore 排除）
-│   ├── h_functional/   # 高阶功能测试用例（40个，.gitignore 排除）
-│   ├── performance/    # 性能测试用例（60个，.gitignore 排除）
-│   ├── test_ir.cpp     # IR 单元测试代码
-│   ├── test_integration.cpp # 集成测试代码
+│   └── main.cpp        # 主入口 compiler
+├── test/               # 测试用例
+│   ├── functional/     # 功能测试用例（100个）
+│   ├── h_functional/   # 高阶功能测试用例（40个）
+│   ├── performance/    # 性能测试用例（60个）
 │   └── *.sy            # 项目级测试用例（instr_sched、loop_unroll 等）
+├── tests/              # 测试代码（独立于源码，测评平台不扫描）
+│   ├── test_ir.cppx    # IR 单元测试代码
+│   └── test_integration.cppx # 集成测试代码
 ├── scripts/            # 测试与构建脚本
 │   ├── run_tests.sh    # [主入口] 统一测试框架
 │   ├── test_qemu.sh    # QEMU 端到端快速测试
@@ -68,7 +68,6 @@ compiler/
 │   └── antlr-4.10.1.jar
 ├── grammar/            # G4 语法文件
 ├── CMakeLists.txt      # 主构建配置
-├── CMakeLists-test.txt # 语法测试构建配置
 ├── .gitignore
 └── TEST_GUIDE.md       # 本文件
 ```
@@ -105,7 +104,8 @@ wsl -d Ubuntu -- bash -c "riscv64-linux-gnu-gcc --version && qemu-riscv64 --vers
 cd /mnt/d/VSCodeProjects/compiler
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+make -j$(nproc)           # 构建 compiler 及所有测试程序
+# 或仅构建编译器: make compiler
 ```
 
 构建运行时库：
@@ -169,11 +169,11 @@ bash scripts/run_tests.sh all Oall
 每个测试用例经过以下流程：
 
 ```
-.sy 源文件 → [sysyc 编译] → .S 汇编 → [GCC 链接] → ELF → [QEMU 运行] → 结果比对
+.sy 源文件 → [compiler 编译] → .S 汇编 → [GCC 链接] → ELF → [QEMU 运行] → 结果比对
 ```
 
 **错误分类统计：**
-- **COMPILE FAIL**：sysyc 编译失败
+- **COMPILE FAIL**：compiler 编译失败
 - **LINK FAIL**：GCC 汇编/链接失败
 - **OUTPUT DIFF**：运行输出与预期不符
 - **SEGFAULT**：运行时段错误

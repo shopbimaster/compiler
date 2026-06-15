@@ -4,8 +4,7 @@
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: sysyc <input.sy> [-S] [-o <output>] [-O0|-O1|-O2|-O3|-Oall]\n";
-        std::cerr << "       sysyc -S <input.sy> [-o <output>] [-O0|-O1|-O2|-O3|-Oall]\n";
+        std::cerr << "Usage: compiler -S -o <output> <input.sy> [-O1]\n";
         return 1;
     }
 

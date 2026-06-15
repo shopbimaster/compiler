@@ -17,7 +17,7 @@ test_one() {
     local bin="${TMPDIR}/_t_${name}_bin"
     
     echo "=== Testing ${name} (expected=$expected) ==="
-    if ! ${BUILD_DIR}/sysyc -S "$src" -o "$asm" -O0 2>&1; then
+    if ! ${BUILD_DIR}/compiler -S "$src" -o "$asm" -O0 2>&1; then
         echo "  COMPILE ERROR"
         return 1
     fi

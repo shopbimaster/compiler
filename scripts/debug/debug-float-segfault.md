@@ -5,7 +5,7 @@
 - **Log File**: .dbg/trae-debug-log-float-segfault.ndjson
 
 ## Reproduction Steps
-1. Compile: `./build/sysyc -S test/functional/95_float.sy -o ~/tmp/95_float.S -O0`
+1. Compile: `./build/compiler -S test/functional/95_float.sy -o ~/tmp/95_float.S -O0`
 2. Link: `riscv64-linux-gnu-gcc -static -o ~/tmp/95_bin ~/tmp/95_float.S build/libsylib.a`
 3. Run: `echo 0 | qemu-riscv64 ~/tmp/95_bin`
 

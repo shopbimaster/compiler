@@ -14,7 +14,7 @@ test_one() {
     local infile="${FUNC_DIR}/${name}.in"
     
     echo "=== Testing ${name} (${opt}) ==="
-    ${BUILD_DIR}/sysyc -S "$src" -o "$asm" -${opt} 2>&1
+    ${BUILD_DIR}/compiler -S "$src" -o "$asm" -${opt} 2>&1
     $GCC -march=rv64gc -mabi=lp64d -static -o "$bin" "$asm" "$SYLIB_A" 2>&1
     
     local ret=0

@@ -35,7 +35,7 @@ for src in "${FUNC_DIR}"/*.sy; do
     infile="${FUNC_DIR}/${name}.in"
     
     # Compile
-    if ! ${BUILD_DIR}/sysyc -S "$src" -o "$asm" -O0 2>/dev/null; then
+    if ! ${BUILD_DIR}/compiler -S "$src" -o "$asm" -O0 2>/dev/null; then
         echo "  COMPILE FAIL: ${name}"
         COMPILE_FAIL=$((COMPILE_FAIL + 1))
         continue

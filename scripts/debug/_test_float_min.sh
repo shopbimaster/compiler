@@ -31,7 +31,7 @@ int main() {
 }
 EOF
 
-${BUILD_DIR}/sysyc -S ${TMP}/_test_float.sy -o ${TMP}/_tf.S -O0 2>&1
+${BUILD_DIR}/compiler -S ${TMP}/_test_float.sy -o ${TMP}/_tf.S -O0 2>&1
 $GCC -march=rv64gc -mabi=lp64d -static -o ${TMP}/_tf_bin ${TMP}/_tf.S "$SYLIB_A" 2>&1
 timeout 5 $QEMU ${TMP}/_tf_bin 2>&1
 echo "Exit: $?"

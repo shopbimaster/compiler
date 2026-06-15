@@ -6,7 +6,7 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-SYSYC="${PROJECT_DIR}/build/sysyc"
+SYSYC="${PROJECT_DIR}/build/compiler"
 GCC=riscv64-linux-gnu-gcc
 QEMU=qemu-riscv64
 PASS=0

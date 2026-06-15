@@ -3,7 +3,7 @@
 ## 项目信息
 - **开始时间**: 2026-05
 - **目标平台**: RISC-V RV64GC (medany)
-- **开发语言**: C++20
+- **开发语言**: C++17（测评平台标准）
 - **目标操作系统**: Ubuntu 24.04 (WSL)
 - **最后更新**: 2026-05-29（P3 高级优化完成）
 
@@ -48,7 +48,7 @@
 - [x] 实现 visitStmt（赋值/if-else/while/return）
 - [x] 实现 visitExp → Value*（全部左递归表达式处理）
 - [x] 实现 && / || 短路求值（branch + phi）
-- [x] 编译器主入口 sysyc (.sy → IR)
+- [x] 编译器主入口 compiler (.sy → IR)
 - [x] Compiler 类封装
 - [x] BailErrorStrategy 语法错误检测
 - [x] **25/25 全部测试通过（18 单元 + 7 集成）**
@@ -216,12 +216,12 @@ Use → { User*, operandNo }  // Def-Use 链
 | 2026-05-20 | Instructions 3 项 | ✅ | createRet/BinOp/Void |
 | 2026-05-20 | Module → Function → BB 1 项 | ✅ | dump() 输出 |
 | 2026-05-20 | IRBuilder end-to-end 2 项 | ✅ | main 返回 0 / 42 |
-| 2026-05-21 | sysyc: hello.sy | ✅ | IR 输出正确 |
-| 2026-05-21 | sysyc: arithmetic.sy | ✅ | 表达式 IR 正确 |
-| 2026-05-21 | sysyc: variable.sy | ✅ | alloca/store/load |
-| 2026-05-21 | sysyc: ifelse.sy | ✅ | 条件分支 IR |
-| 2026-05-21 | sysyc: while_test.sy | ✅ | 循环 IR |
-| 2026-05-21 | sysyc: func_call.sy | ✅ | 函数调用 IR |
+| 2026-05-21 | compiler: hello.sy | ✅ | IR 输出正确 |
+| 2026-05-21 | compiler: arithmetic.sy | ✅ | 表达式 IR 正确 |
+| 2026-05-21 | compiler: variable.sy | ✅ | alloca/store/load |
+| 2026-05-21 | compiler: ifelse.sy | ✅ | 条件分支 IR |
+| 2026-05-21 | compiler: while_test.sy | ✅ | 循环 IR |
+| 2026-05-21 | compiler: func_call.sy | ✅ | 函数调用 IR |
 | 2026-05-21 | test_integration 7 项 | ✅ | 全部通过 |
 | 2026-05-21 | test_ir 18 项 | ✅ | 全部通过 |
 | 2026-05-28 | P0-1 除/取模→移位/位与 | ✅ | div_chain.sy: sra 替代 div, QEMU exit 2 |
@@ -249,8 +249,8 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ./test_ir             # IR 单元测试
 ./test_integration    # 集成测试
-./sysyc ../test/hello.sy   # 编译 .sy → IR
-./sysyc ../test/hello.sy -o output.ir   # 输出到文件
+./compiler ../test/hello.sy   # 编译 .sy → IR
+./compiler ../test/hello.sy -o output.ir   # 输出到文件
 ```
 
 ---
@@ -259,7 +259,7 @@ make -j$(nproc)
 
 - **语法解析**: G4 文件完全正确，C++ 版 ANTLR 运行时已集成
 - **IR 框架**: 类型系统 + SSA IR + Module/dump 完整可用
-- **前端→IR 管线**: sysyc 可从 .sy 源文件自动生成 LLVM 风格 IR
+- **前端→IR 管线**: compiler 可从 .sy 源文件自动生成 LLVM 风格 IR
 - **已支持特性**: 全部 SysY2022 语言特性（数组、全局变量、float、void、作用域、I/O 等）
 - **后端**: 代码生成器完整实现（指令选择 + 栈帧 + 线性扫描寄存器分配）
 - **优化**: O1/O2/O3/P0/P3 全部实现，优化流水线完整（含循环交换、循环展开4×、指令调度）

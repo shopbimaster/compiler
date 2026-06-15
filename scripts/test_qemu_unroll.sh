@@ -8,7 +8,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-SYSYC="${PROJECT_DIR}/build/sysyc"
+SYSYC="${PROJECT_DIR}/build/compiler"
 PASS=0
 FAIL=0
 

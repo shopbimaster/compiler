@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(SysY2022Compiler VERSION 1.0.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -88,27 +88,27 @@ target_link_libraries(sysy_opt PUBLIC sysy_ir_core)
 # IR 核心单元测试（不依赖 ANTLR 输入，但需 ANTLR 运行时符号）
 # ================================================================
 add_executable(test_ir
-    test/test_ir.cpp
+    tests/test_ir.cppx
     ${ANTLR_SOURCES}
 )
 target_include_directories(test_ir PRIVATE ${ANTLR_INCLUDES})
 target_link_libraries(test_ir sysy_ir_builder sysy_opt antlr4_static)
 
 # ================================================================
-# 编译器主入口 sysyc
+# 编译器主入口 compiler
 # ================================================================
-add_executable(sysyc
+add_executable(compiler
     src/main.cpp
     ${ANTLR_SOURCES}
 )
-target_include_directories(sysyc PRIVATE include ${ANTLR_INCLUDES})
-target_link_libraries(sysyc sysy_compiler sysy_backend sysy_opt antlr4_static)
+target_include_directories(compiler PRIVATE include ${ANTLR_INCLUDES})
+target_link_libraries(compiler sysy_compiler sysy_backend sysy_opt antlr4_static)
 
 # ================================================================
 # 集成测试
 # ================================================================
 add_executable(test_integration
-    test/test_integration.cpp
+    tests/test_integration.cppx
     ${ANTLR_SOURCES}
 )
 target_include_directories(test_integration PRIVATE include ${ANTLR_INCLUDES})
