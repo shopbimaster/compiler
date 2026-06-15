@@ -102,13 +102,24 @@ std::any IRBuilder::visitConstDecl(SysY2022Parser::ConstDeclContext* ctx) {
         if (currentFunc == nullptr) {
             // ===== 全局常量 =====
             Constant* init = nullptr;
+            std::vector<uint32_t> initData;
             if (defCtx->constInitVal()->constExp()) {
                 Value* iv = valFrom(visitConstExp(defCtx->constInitVal()->constExp()));
                 init = dynamic_cast<Constant*>(iv);
                 init = constantToType(init, baseType);
+            } else if (varType->isArray()) {
+                // Aggregate init for global const arrays
+                auto children = defCtx->constInitVal()->constInitVal();
+                std::vector<SysY2022Parser::ConstInitValContext*> childVec(
+                    children.begin(), children.end());
+                collectInitDataConst(varType, childVec, initData);
+                init = ConstantInt::get(IntegerType::I32, 1);
             }
             auto* gv = module->createGlobalVariable(
                 PointerType::get(varType), name, true, init);
+            if (!initData.empty()) {
+                gv->setInitData(initData);
+            }
             declare(name, gv);
         } else {
             // ===== 局部常量 =====
@@ -1240,9 +1251,12 @@ void IRBuilder::emitInitStoresVar(Type* targetType, Value* basePtr,
             if (child->exp()) {
                 if (elemType->isArray()) {
                     // Brace elision: scalar exprs initialize the sub-array in flat order.
-                    // Collect consecutive scalars and recurse into elemType.
+                    // Collect at most subTotal consecutive scalars for this sub-array.
+                    auto* subArrTy = static_cast<ArrayType*>(elemType);
+                    unsigned subTotal = subArrTy->getNumElements();
                     std::vector<SysY2022Parser::InitValContext*> flatVec;
-                    while (i < children.size() && children[i]->exp()) {
+                    while (i < children.size() && children[i]->exp()
+                           && flatVec.size() < subTotal) {
                         flatVec.push_back(children[i]);
                         i++;
                     }
@@ -1253,8 +1267,6 @@ void IRBuilder::emitInitStoresVar(Type* targetType, Value* basePtr,
                         emitInitStoresVar(elemType, basePtr, subIndices, flatVec, subIdx);
                     }
                     // Zero-fill remaining sub-array elements
-                    auto* subArrTy = static_cast<ArrayType*>(elemType);
-                    unsigned subTotal = subArrTy->getNumElements();
                     while (subIdx < static_cast<int>(subTotal)) {
                         Value* zv = zeroForType(subArrTy->getElementType());
                         std::vector<Value*> zpIndices = subIndices;
@@ -1378,8 +1390,12 @@ void IRBuilder::emitInitStoresConst(Type* targetType, Value* basePtr,
             if (child->constExp()) {
                 if (elemType->isArray()) {
                     // Brace elision: scalar const-exprs initialize the sub-array in flat order.
+                    // Collect at most subTotal consecutive scalars for this sub-array.
+                    auto* subArrTy = static_cast<ArrayType*>(elemType);
+                    unsigned subTotal = subArrTy->getNumElements();
                     std::vector<SysY2022Parser::ConstInitValContext*> flatVec;
-                    while (i < children.size() && children[i]->constExp()) {
+                    while (i < children.size() && children[i]->constExp()
+                           && flatVec.size() < subTotal) {
                         flatVec.push_back(children[i]);
                         i++;
                     }
@@ -1389,8 +1405,7 @@ void IRBuilder::emitInitStoresConst(Type* targetType, Value* basePtr,
                     if (!flatVec.empty()) {
                         emitInitStoresConst(elemType, basePtr, subIndices, flatVec, subIdx);
                     }
-                    auto* subArrTy = static_cast<ArrayType*>(elemType);
-                    unsigned subTotal = subArrTy->getNumElements();
+                    // Zero-fill remaining sub-array elements
                     while (subIdx < static_cast<int>(subTotal)) {
                         Value* zv = zeroForType(subArrTy->getElementType());
                         std::vector<Value*> zpIndices = subIndices;
@@ -1509,18 +1524,20 @@ void IRBuilder::collectInitData(Type* targetType,
             if (child->exp()) {
                 if (elemType->isArray()) {
                     // Brace elision: scalar exprs initialize the sub-array in flat order.
+                    // Collect at most subTotal consecutive scalars for this sub-array.
+                    auto* subArrTy = static_cast<ArrayType*>(elemType);
+                    unsigned subTotal = subArrTy->getNumElements();
                     std::vector<SysY2022Parser::InitValContext*> flatVec;
-                    while (i < children.size() && children[i]->exp()) {
+                    while (i < children.size() && children[i]->exp()
+                           && flatVec.size() < subTotal) {
                         flatVec.push_back(children[i]);
                         i++;
                     }
-                    auto* subArrTy = static_cast<ArrayType*>(elemType);
                     size_t before = outData.size();
                     if (!flatVec.empty()) {
                         collectInitData(elemType, flatVec, outData);
                     }
                     // Zero-fill remaining sub-array elements
-                    unsigned subTotal = subArrTy->getNumElements();
                     while (outData.size() - before < subTotal) {
                         outData.push_back(0);
                     }
@@ -1591,6 +1608,100 @@ void IRBuilder::collectInitData(Type* targetType,
     }
 }
 
+// ================================================================
+// collectInitDataConst: collect flat constant data for global const array initializers
+// ================================================================
+void IRBuilder::collectInitDataConst(Type* targetType,
+                                     const std::vector<SysY2022Parser::ConstInitValContext*>& children,
+                                     std::vector<uint32_t>& outData) {
+    if (auto* arrTy = dynamic_cast<ArrayType*>(targetType)) {
+        Type* elemType = arrTy->getElementType();
+        unsigned total = arrTy->getNumElements();
+        unsigned pos = 0;
+
+        for (size_t i = 0; i < children.size(); ) {
+            if (pos >= total) break;
+            auto* child = children[i];
+
+            if (child->constExp()) {
+                if (elemType->isArray()) {
+                    // Brace elision: collect at most subTotal consecutive scalars
+                    auto* subArrTy = static_cast<ArrayType*>(elemType);
+                    unsigned subTotal = subArrTy->getNumElements();
+                    std::vector<SysY2022Parser::ConstInitValContext*> flatVec;
+                    while (i < children.size() && children[i]->constExp()
+                           && flatVec.size() < subTotal) {
+                        flatVec.push_back(children[i]);
+                        i++;
+                    }
+                    size_t before = outData.size();
+                    if (!flatVec.empty()) {
+                        collectInitDataConst(elemType, flatVec, outData);
+                    }
+                    while (outData.size() - before < subTotal) {
+                        outData.push_back(0);
+                    }
+                    pos++;
+                } else {
+                    Value* val = valFrom(visitConstExp(child->constExp()));
+                    if (auto* ci = dynamic_cast<ConstantInt*>(val)) {
+                        outData.push_back(static_cast<uint32_t>(ci->getValue()));
+                    } else if (auto* cf = dynamic_cast<ConstantFloat*>(val)) {
+                        union { float f; uint32_t u; } u;
+                        u.f = static_cast<float>(cf->getValue());
+                        outData.push_back(u.u);
+                    } else {
+                        outData.push_back(0);
+                    }
+                    pos++;
+                    i++;
+                }
+            } else {
+                auto subChildren = child->constInitVal();
+                if (elemType->isArray()) {
+                    auto* subArrTy = static_cast<ArrayType*>(elemType);
+                    std::vector<SysY2022Parser::ConstInitValContext*> subVec(
+                        subChildren.begin(), subChildren.end());
+                    size_t before = outData.size();
+                    collectInitDataConst(elemType, subVec, outData);
+                    unsigned subTotal = subArrTy->getNumElements();
+                    while (outData.size() - before < subTotal) {
+                        outData.push_back(0);
+                    }
+                } else {
+                    if (!subChildren.empty() && subChildren[0]->constExp()) {
+                        Value* val = valFrom(visitConstExp(subChildren[0]->constExp()));
+                        if (auto* ci = dynamic_cast<ConstantInt*>(val)) {
+                            outData.push_back(static_cast<uint32_t>(ci->getValue()));
+                        } else if (auto* cf = dynamic_cast<ConstantFloat*>(val)) {
+                            union { float f; uint32_t u; } u;
+                            u.f = static_cast<float>(cf->getValue());
+                            outData.push_back(u.u);
+                        } else {
+                            outData.push_back(0);
+                        }
+                    } else {
+                        outData.push_back(0);
+                    }
+                }
+                pos++;
+                i++;
+            }
+        }
+        while (pos < total) {
+            if (elemType->isArray()) {
+                auto* subArrTy = static_cast<ArrayType*>(elemType);
+                unsigned subTotal = subArrTy->getNumElements();
+                for (unsigned i = 0; i < subTotal; ++i)
+                    outData.push_back(0);
+            } else {
+                outData.push_back(0);
+            }
+            pos++;
+        }
+    }
+}
+
 Value* IRBuilder::zeroForType(Type* ty) {
     if (ty->isInteger()) return ConstantInt::get(static_cast<IntegerType*>(ty), 0);
     if (ty->isFloat())   return ConstantFloat::get(static_cast<FloatType*>(ty), 0.0);
@@ -1621,38 +1732,38 @@ Value* IRBuilder::constFoldBinOp(Instruction::Opcode op, Value* left, Value* rig
     auto* lcf = dynamic_cast<ConstantFloat*>(left);
     auto* rcf = dynamic_cast<ConstantFloat*>(right);
     if (lcf && rcf) {
-        double lv = lcf->getValue(), rv = rcf->getValue();
+        float lv = static_cast<float>(lcf->getValue()), rv = static_cast<float>(rcf->getValue());
         switch (op) {
-        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), lv + rv);
-        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), lv - rv);
-        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), lv * rv);
+        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv + rv));
+        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv - rv));
+        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv * rv));
         case Instruction::Opcode::SDIV:
-            return ConstantFloat::get(FloatType::get(), rv != 0.0 ? lv / rv : 0.0);
+            return ConstantFloat::get(FloatType::get(), static_cast<double>(rv != 0.0f ? lv / rv : 0.0f));
         case Instruction::Opcode::SREM: return nullptr;
         default: return nullptr;
         }
     }
 
     if (lcf && rci) {
-        double lv = lcf->getValue(), rv = static_cast<double>(rci->getValue());
+        float lv = static_cast<float>(lcf->getValue()), rv = static_cast<float>(rci->getValue());
         switch (op) {
-        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), lv + rv);
-        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), lv - rv);
-        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), lv * rv);
+        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv + rv));
+        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv - rv));
+        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv * rv));
         case Instruction::Opcode::SDIV:
-            return ConstantFloat::get(FloatType::get(), rv != 0.0 ? lv / rv : 0.0);
+            return ConstantFloat::get(FloatType::get(), static_cast<double>(rv != 0.0f ? lv / rv : 0.0f));
         default: return nullptr;
         }
     }
 
     if (lci && rcf) {
-        double lv = static_cast<double>(lci->getValue()), rv = rcf->getValue();
+        float lv = static_cast<float>(lci->getValue()), rv = static_cast<float>(rcf->getValue());
         switch (op) {
-        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), lv + rv);
-        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), lv - rv);
-        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), lv * rv);
+        case Instruction::Opcode::ADD:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv + rv));
+        case Instruction::Opcode::SUB:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv - rv));
+        case Instruction::Opcode::MUL:  return ConstantFloat::get(FloatType::get(), static_cast<double>(lv * rv));
         case Instruction::Opcode::SDIV:
-            return ConstantFloat::get(FloatType::get(), rv != 0.0 ? lv / rv : 0.0);
+            return ConstantFloat::get(FloatType::get(), static_cast<double>(rv != 0.0f ? lv / rv : 0.0f));
         default: return nullptr;
         }
     }

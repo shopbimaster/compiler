@@ -81,6 +81,9 @@ private:
     void            collectInitData(Type* targetType,
                                   const std::vector<SysY2022Parser::InitValContext*>& children,
                                   std::vector<uint32_t>& outData);
+    void            collectInitDataConst(Type* targetType,
+                                  const std::vector<SysY2022Parser::ConstInitValContext*>& children,
+                                  std::vector<uint32_t>& outData);
     Value*          zeroForType(Type* ty);
 
     // ===== 常数表达式编译期求值 =====

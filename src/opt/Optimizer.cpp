@@ -14,6 +14,10 @@ namespace Opt {
 void runO1(IR::Module* mod) {
     constantFolding(mod);
     deadCodeElimination(mod);
+    commonSubexpressionElimination(mod);
+    loopInvariantCodeMotion(mod);
+    constantFolding(mod);
+    deadCodeElimination(mod);
 }
 
 void runO2(IR::Module* mod) {

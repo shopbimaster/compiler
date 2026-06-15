@@ -68,18 +68,18 @@ bool tryFold(IR::Instruction* inst) {
         auto* l = inst->getOperand(0);
         auto* r = inst->getOperand(1);
         if (!isConstant(l) || !isConstant(r)) return false;
-        double lv = getFloatVal(l), rv = getFloatVal(r);
-        double result = 0.0;
+        float lv = static_cast<float>(getFloatVal(l)), rv = static_cast<float>(getFloatVal(r));
+        float result = 0.0f;
         bool valid = true;
         switch (op) {
             case Opc::FADD: result = lv + rv; break;
             case Opc::FSUB: result = lv - rv; break;
             case Opc::FMUL: result = lv * rv; break;
-            case Opc::FDIV: if (rv == 0.0) valid = false; else result = lv / rv; break;
+            case Opc::FDIV: if (rv == 0.0f) valid = false; else result = lv / rv; break;
             default: valid = false;
         }
         if (!valid) return false;
-        auto* folded = IR::ConstantFloat::get(IR::FloatType::get(), result);
+        auto* folded = IR::ConstantFloat::get(IR::FloatType::get(), static_cast<double>(result));
         inst->replaceAllUsesWith(folded);
         inst->dropAllUses();
         return true;
@@ -94,7 +94,7 @@ bool tryFold(IR::Instruction* inst) {
         if (isConstant(l) && isConstant(r)) {
             auto* lt = l->getType();
             if (lt && lt->isFloat()) {
-                double lv = getFloatVal(l), rv = getFloatVal(r);
+                float lv = static_cast<float>(getFloatVal(l)), rv = static_cast<float>(getFloatVal(r));
                 if (cond == "eq")       result = (lv == rv);
                 else if (cond == "ne")  result = (lv != rv);
                 else if (cond == "slt") result = (lv < rv);
