@@ -3,10 +3,10 @@
 # SysY Compiler - Unified Test Runner
 # ================================================================
 # Usage:
-#   ./scripts/run_tests.sh func [O0|O1|O2|O3|Oall]  # functional tests
-#   ./scripts/run_tests.sh hfunc [O0|O1|O2|O3|Oall]  # h_functional tests
-#   ./scripts/run_tests.sh perf [O0|O1|O2|O3|Oall]   # performance tests
-#   ./scripts/run_tests.sh all [O0|O1|O2|O3|Oall]     # all three suites
+#   ./scripts/run_tests.sh func [O1|o0|o1|o2|o3]  # functional tests
+#   ./scripts/run_tests.sh hfunc [O1|o0|o1|o2|o3]  # h_functional tests
+#   ./scripts/run_tests.sh perf [O1|o0|o1|o2|o3]   # performance tests
+#   ./scripts/run_tests.sh all [O1|o0|o1|o2|o3]     # all three suites
 #   ./scripts/run_tests.sh quick                        # quick smoke test
 # ================================================================
 set -e

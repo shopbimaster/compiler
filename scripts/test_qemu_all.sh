@@ -1,8 +1,8 @@
 #!/bin/bash
 # ================================================================
 # SysY 编译器全量回归测试脚本
-# 用法: ./test_qemu_all.sh [O0|O1|O2|O3|Oall]
-# 默认: Oall (全量优化)
+# 用法: ./test_qemu_all.sh [O1|o0|o1|o2|o3]
+# 默认: O1 (对应编译器 -O1，即最高优化)
 # ================================================================
 set -e
 
@@ -14,7 +14,7 @@ FUNC_DIR="${SCRIPT_DIR}/test/functional"
 SYLIB_A="${BUILD_DIR}/libsylib.a"
 SYSC="${BUILD_DIR}/compiler"
 
-OPT_LEVEL="${1:-Oall}"
+OPT_LEVEL="${1:-O1}"
 TMP_DIR="/tmp/sysy_test_$$"
 
 # 颜色输出

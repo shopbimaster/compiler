@@ -734,16 +734,16 @@ void TargetCodeGen::emitBinOp(IR::Instruction& inst) {
 
     using Opc = IR::Instruction::Opcode;
     switch (inst.getOpcode()) {
-    case Opc::ADD:  code += "  add     t0, t0, t1\n"; break;
-    case Opc::SUB:  code += "  sub     t0, t0, t1\n"; break;
-    case Opc::MUL:  code += "  mul     t0, t0, t1\n"; break;
-    case Opc::SDIV: code += "  div     t0, t0, t1\n"; break;
-    case Opc::SREM: code += "  rem     t0, t0, t1\n"; break;
+    case Opc::ADD:  code += "  addw    t0, t0, t1\n"; break;
+    case Opc::SUB:  code += "  subw    t0, t0, t1\n"; break;
+    case Opc::MUL:  code += "  mulw    t0, t0, t1\n"; break;
+    case Opc::SDIV: code += "  divw    t0, t0, t1\n"; break;
+    case Opc::SREM: code += "  remw    t0, t0, t1\n"; break;
     case Opc::AND:  code += "  and     t0, t0, t1\n"; break;
     case Opc::OR:   code += "  or      t0, t0, t1\n"; break;
     case Opc::XOR:  code += "  xor     t0, t0, t1\n"; break;
-    case Opc::SHL:  code += "  sll     t0, t0, t1\n"; break;
-    case Opc::ASHR: code += "  sra     t0, t0, t1\n"; break;
+    case Opc::SHL:  code += "  sllw    t0, t0, t1\n"; break;
+    case Opc::ASHR: code += "  sraw    t0, t0, t1\n"; break;
     default: break;
     }
 

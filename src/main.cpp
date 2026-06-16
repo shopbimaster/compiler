@@ -4,7 +4,7 @@
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: compiler -S -o <output> <input.sy> [-O1]\n";
+        std::cerr << "Usage: compiler -S -o <output> <input.sy> [-O1] [-o0|-o1|-o2|-o3]\n";
         return 1;
     }
 
@@ -22,13 +22,15 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-O0") {
             optLevel = IR::OptLevel::O0;
         } else if (arg == "-O1") {
-            optLevel = IR::OptLevel::O1;
-        } else if (arg == "-O2") {
-            optLevel = IR::OptLevel::O2;
-        } else if (arg == "-O3") {
-            optLevel = IR::OptLevel::O3;
-        } else if (arg == "-Oall") {
             optLevel = IR::OptLevel::OALL;
+        } else if (arg == "-o0") {
+            optLevel = IR::OptLevel::O0;
+        } else if (arg == "-o1") {
+            optLevel = IR::OptLevel::O1;
+        } else if (arg == "-o2") {
+            optLevel = IR::OptLevel::O2;
+        } else if (arg == "-o3") {
+            optLevel = IR::OptLevel::O3;
         } else if (arg[0] != '-' && inputPath.empty()) {
             inputPath = arg;
         }
