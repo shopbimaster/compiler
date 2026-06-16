@@ -613,10 +613,10 @@ void test_loop_unrolling_4x() {
 }
 
 // ================================================================
-// 测试 11: 循环展开 — tc=6 回退 2×
+// 测试 11: 循环展开 — tc=6 直接 6×
 // ================================================================
 void test_loop_unrolling_fallback_2x() {
-    TEST("LoopUnrolling tc=6 回退 2× 展开");
+    TEST("LoopUnrolling tc=6 6× 展开");
     Module mod;
 
     auto* func = mod.createFunction(
@@ -662,9 +662,9 @@ void test_loop_unrolling_fallback_2x() {
     Opt::loopUnrolling(&mod);
     std::string after = mod.dump();
 
-    // tc=6 → 回退 2×，只有 1 份克隆体
+    // tc=6 → 6× 展开，有 5 份克隆体
     CHECK(after.find("a_next.u1") != std::string::npos);
-    CHECK(after.find("a_next.u2") == std::string::npos);
+    CHECK(after.find("a_next.u5") != std::string::npos);
 
     PASS();
 }

@@ -160,8 +160,9 @@ void RegisterAllocator::spillAtInterval(LiveInterval& current, std::vector<LiveI
     LiveInterval* toSpill = nullptr;
     int farthestEnd = -1;
 
+    // Only spill intervals of the same type (float/int) to keep register types correct
     for (auto* a : active) {
-        if (a->spillSlot < 0 && a->end > farthestEnd) {
+        if (a->spillSlot < 0 && a->isFloat == current.isFloat && a->end > farthestEnd) {
             farthestEnd = a->end;
             toSpill = a;
         }

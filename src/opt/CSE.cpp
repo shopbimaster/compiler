@@ -102,7 +102,7 @@ bool cseOnBlock(IR::BasicBlock* bb) {
 
 } // namespace
 
-void commonSubexpressionElimination(IR::Module* mod) {
+bool commonSubexpressionElimination(IR::Module* mod) {
     bool changed = true;
     while (changed) {
         changed = false;
@@ -113,6 +113,7 @@ void commonSubexpressionElimination(IR::Module* mod) {
             }
         }
     }
+    return changed;
 }
 
 } // namespace Opt

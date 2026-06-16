@@ -12,103 +12,9 @@
 namespace Opt {
 namespace {
 
-using BBSet = std::unordered_set<IR::BasicBlock*>;
-using DomMap = std::unordered_map<IR::BasicBlock*, BBSet>;
-using PredMap = std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>>;
-
-// ================================================================
-// 构建前驱映射：pred[b] = 直接前驱列表
-// ================================================================
-PredMap buildPredecessors(IR::Function* func) {
-    PredMap pred;
-    for (auto& bb : func->getBlocks()) {
-        pred[bb.get()]; // ensure entry in map
-        auto* term = bb->getTerminator();
-        if (!term) continue;
-
-        if (term->getOpcode() == IR::Instruction::Opcode::BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(0)))
-                pred[t].push_back(bb.get());
-        } else if (term->getOpcode() == IR::Instruction::Opcode::COND_BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(1)))
-                pred[t].push_back(bb.get());
-            if (auto* e = dynamic_cast<IR::BasicBlock*>(term->getOperand(2)))
-                pred[e].push_back(bb.get());
-        }
-    }
-    return pred;
-}
-
-// ================================================================
-// 后构建后继映射
-// ================================================================
-std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>>
-buildSuccessors(IR::Function* func) {
-    std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>> succ;
-    for (auto& bb : func->getBlocks()) {
-        succ[bb.get()];
-        auto* term = bb->getTerminator();
-        if (!term) continue;
-        if (term->getOpcode() == IR::Instruction::Opcode::BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(0)))
-                succ[bb.get()].push_back(t);
-        } else if (term->getOpcode() == IR::Instruction::Opcode::COND_BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(1)))
-                succ[bb.get()].push_back(t);
-            if (auto* e = dynamic_cast<IR::BasicBlock*>(term->getOperand(2)))
-                succ[bb.get()].push_back(e);
-        }
-    }
-    return succ;
-}
-
-// ================================================================
-// 支配者计算 — 迭代不动点
-// dom[n] = {n} ∪ ∩{dom[p] : p ∈ pred[n]}
-// ================================================================
-DomMap computeDominators(IR::Function* func) {
-    auto preds = buildPredecessors(func);
-    auto* entry = func->getEntryBlock();
-    if (!entry) return {};
-
-    std::vector<IR::BasicBlock*> allBBs;
-    for (auto& bb : func->getBlocks()) allBBs.push_back(bb.get());
-    BBSet allSet(allBBs.begin(), allBBs.end());
-
-    DomMap dom;
-    for (auto* bb : allBBs) dom[bb] = allSet;
-    dom[entry] = {entry};
-
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (auto* bb : allBBs) {
-            if (bb == entry) continue;
-            BBSet inter = allSet;
-            for (auto* p : preds[bb]) {
-                BBSet temp;
-                for (auto* d : inter)
-                    if (dom[p].count(d)) temp.insert(d);
-                inter = std::move(temp);
-            }
-            inter.insert(bb);
-            if (inter != dom[bb]) {
-                dom[bb] = std::move(inter);
-                changed = true;
-            }
-        }
-    }
-    return dom;
-}
-
-bool strictlyDominates(IR::BasicBlock* a, IR::BasicBlock* b, const DomMap& dom) {
-    auto it = dom.find(b);
-    if (it == dom.end()) return false;
-    return it->second.count(a) && a != b;
-}
-
 // ================================================================
 // 检测自然循环：回边 B→H 且 H strictly dominates B
+// （使用共享的 computeDominators / buildPredecessors / buildSuccessors）
 // ================================================================
 struct Loop {
     IR::BasicBlock* header;
@@ -287,14 +193,16 @@ bool licmOnFunction(IR::Function* func) {
 
 } // namespace
 
-void loopInvariantCodeMotion(IR::Module* mod) {
+bool loopInvariantCodeMotion(IR::Module* mod) {
     bool changed = true;
+    bool anyChanged = false;
     while (changed) {
         changed = false;
         for (auto& func : mod->getFunctions()) {
-            if (licmOnFunction(func.get())) changed = true;
+            if (licmOnFunction(func.get())) { changed = true; anyChanged = true; }
         }
     }
+    return anyChanged;
 }
 
 } // namespace Opt

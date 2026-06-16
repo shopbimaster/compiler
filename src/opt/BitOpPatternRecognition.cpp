@@ -245,8 +245,9 @@ bool tryOptimize(IR::Instruction* inst) {
 // ================================================================
 // bitOpPatternRecognition 入口 — 反复扫描直到收敛
 // ================================================================
-void bitOpPatternRecognition(IR::Module* mod) {
+bool bitOpPatternRecognition(IR::Module* mod) {
     bool changed = true;
+    bool anyChanged = false;
     while (changed) {
         changed = false;
         for (auto& func : mod->getFunctions()) {
@@ -255,6 +256,7 @@ void bitOpPatternRecognition(IR::Module* mod) {
                 for (auto it = bb->begin(); it != bb->end(); ) {
                     if (tryOptimize(it->get())) {
                         changed = true;
+                        anyChanged = true;
                         it = bb->begin(); // 重扫
                     } else {
                         ++it;
@@ -263,6 +265,7 @@ void bitOpPatternRecognition(IR::Module* mod) {
             }
         }
     }
+    return anyChanged;
 }
 
 } // namespace Opt

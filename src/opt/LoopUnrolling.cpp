@@ -1,7 +1,7 @@
 // ================================================================
 // O3: 循环展开（Loop Unrolling）
 // 策略：
-//   对迭代次数 ≤ 32 的简单 while 循环做 2 倍展开
+//   对迭代次数 ≤ 64 的简单 while 循环做展开（最大 8×）
 //   将循环体的非控制指令拷贝一份到同一个 BB 中，减少分支开销
 //   对新产生的常量表达式由后续 constantFolding 进行折叠
 // ================================================================
@@ -14,88 +14,7 @@
 namespace Opt {
 namespace {
 
-using BBSet = std::unordered_set<IR::BasicBlock*>;
-
-// ---- 构建后继 ----
-std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>>
-buildSuccs(IR::Function* func) {
-    std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>> succ;
-    for (auto& bb : func->getBlocks()) {
-        succ[bb.get()];
-        auto* term = bb->getTerminator();
-        if (!term) continue;
-        if (term->getOpcode() == IR::Instruction::Opcode::BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(0)))
-                succ[bb.get()].push_back(t);
-        } else if (term->getOpcode() == IR::Instruction::Opcode::COND_BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(1)))
-                succ[bb.get()].push_back(t);
-            if (auto* e = dynamic_cast<IR::BasicBlock*>(term->getOperand(2)))
-                succ[bb.get()].push_back(e);
-        }
-    }
-    return succ;
-}
-
-// ---- 构建前驱 ----
-std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>>
-buildPreds(IR::Function* func) {
-    std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>> pred;
-    for (auto& bb : func->getBlocks()) {
-        pred[bb.get()];
-        auto* term = bb->getTerminator();
-        if (!term) continue;
-        if (term->getOpcode() == IR::Instruction::Opcode::BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(0)))
-                pred[t].push_back(bb.get());
-        } else if (term->getOpcode() == IR::Instruction::Opcode::COND_BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(1)))
-                pred[t].push_back(bb.get());
-            if (auto* e = dynamic_cast<IR::BasicBlock*>(term->getOperand(2)))
-                pred[e].push_back(bb.get());
-        }
-    }
-    return pred;
-}
-
-// ---- 支配者计算 ----
-std::unordered_map<IR::BasicBlock*, BBSet>
-computeDom(IR::Function* func) {
-    auto preds = buildPreds(func);
-    auto* entry = func->getEntryBlock();
-    if (!entry) return {};
-
-    std::vector<IR::BasicBlock*> allBBs;
-    for (auto& bb : func->getBlocks()) allBBs.push_back(bb.get());
-    BBSet allSet(allBBs.begin(), allBBs.end());
-
-    std::unordered_map<IR::BasicBlock*, BBSet> dom;
-    for (auto* bb : allBBs) dom[bb] = allSet;
-    dom[entry] = {entry};
-
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (auto* bb : allBBs) {
-            if (bb == entry) continue;
-            BBSet inter = allSet;
-            for (auto* p : preds[bb]) {
-                BBSet temp;
-                for (auto* d : inter)
-                    if (dom[p].count(d)) temp.insert(d);
-                inter = std::move(temp);
-            }
-            inter.insert(bb);
-            if (inter != dom[bb]) {
-                dom[bb] = std::move(inter);
-                changed = true;
-            }
-        }
-    }
-    return dom;
-}
-
-// ---- 回边检测 → 循环 ----
+// ---- 回边检测 → 循环（使用共享的 computeDominators / buildSuccessors / buildPredecessors） ----
 struct LoopInfo {
     IR::BasicBlock* header;
     IR::BasicBlock* latch;       // 回边的源 BB
@@ -104,9 +23,9 @@ struct LoopInfo {
 };
 
 std::vector<LoopInfo> detectLoops(IR::Function* func) {
-    auto dom = computeDom(func);
-    auto succs = buildSuccs(func);
-    auto preds = buildPreds(func);
+    auto dom = computeDominators(func);
+    auto succs = buildSuccessors(func);
+    auto preds = buildPredecessors(func);
     std::vector<LoopInfo> loops;
 
     for (auto& bb : func->getBlocks()) {
@@ -155,11 +74,11 @@ int inferTripCount(IR::BasicBlock* header) {
 
         int64_t val = rc->getValue();
         // 仅处理 slt（有符号小于）：i < N  → tripCount = N
-        if (inst->getName() == "slt" && val > 0 && val <= 32) {
+        if (inst->getName() == "slt" && val > 0 && val <= 64) {
             return static_cast<int>(val);
         }
         // sle（有符号小于等于）：i <= N → tripCount = N+1
-        if (inst->getName() == "sle" && val >= 0 && val < 32) {
+        if (inst->getName() == "sle" && val >= 0 && val < 64) {
             return static_cast<int>(val) + 1;
         }
     }
@@ -234,7 +153,7 @@ IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId,
     return nullptr;
 }
 
-// ---- 对单个循环做展开（优先 4×，回退 2×） ----
+// ---- 对单个循环做展开（最大 8×，按因子 8/6/4/3/2 优先级） ----
 bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     // 仅处理单 BB 循环体
     if (loop.body.size() > 2) return false; // header + body
@@ -254,12 +173,17 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     int tc = loop.tripCount;
     if (tc < 0) tc = inferTripCount(loop.header);
     loop.tripCount = tc;
-    if (tc < 2 || tc > 32) return false;
+    if (tc < 2 || tc > 64) return false;
 
-    // 优先 4× 展开，回退到 2×
+    // 按从大到小尝试因子，最大 8×
     unsigned factor = 0;
-    if (tc % 4 == 0 && tc >= 4) factor = 4;
-    else if (tc % 2 == 0)      factor = 2;
+    static const unsigned candidates[] = {8, 6, 4, 3, 2};
+    for (unsigned f : candidates) {
+        if (tc % f == 0 && tc >= f) {
+            factor = f;
+            break;
+        }
+    }
     if (factor == 0) return false;
 
     // 收集可克隆的非终止指令
@@ -297,14 +221,16 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
 
 } // namespace
 
-void loopUnrolling(IR::Module* mod) {
+bool loopUnrolling(IR::Module* mod) {
+    bool anyChanged = false;
     for (auto& func : mod->getFunctions()) {
         if (func->isExternal()) continue;
         auto loops = detectLoops(func.get());
         for (auto& loop : loops) {
-            unrollLoop(loop, func.get());
+            if (unrollLoop(loop, func.get())) anyChanged = true;
         }
     }
+    return anyChanged;
 }
 
 } // namespace Opt

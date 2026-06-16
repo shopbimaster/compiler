@@ -184,7 +184,7 @@ bool tryInlineCall(IR::Instruction* callInst, IR::Function* callee) {
 
 } // namespace
 
-void inlineExpansion(IR::Module* mod) {
+bool inlineExpansion(IR::Module* mod) {
     // 识别可内联的候选函数
     std::unordered_set<IR::Function*> candidates;
     for (auto& func : mod->getFunctions()) {
@@ -218,6 +218,7 @@ void inlineExpansion(IR::Module* mod) {
             if (changed) break;
         }
     }
+    return changed;
 }
 
 } // namespace Opt

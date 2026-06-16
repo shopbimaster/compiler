@@ -77,6 +77,7 @@ private:
 
     std::string loadToReg(IR::Value* val, const std::string& destReg);
     std::string storeFromReg(IR::Value* val, const std::string& srcReg, bool addNew = false);
+    std::string getValueReg(IR::Value* val);
     std::string emitGlobalAddr(IR::GlobalVariable* gv, const std::string& destReg);
     std::string emitValueToReg(IR::Value* val, const std::string& destReg);
 

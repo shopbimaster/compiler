@@ -182,14 +182,16 @@ bool eliminateOnFunction(IR::Function* func) {
 
 } // namespace
 
-void tailRecursionElimination(IR::Module* mod) {
+bool tailRecursionElimination(IR::Module* mod) {
     bool changed = true;
+    bool anyChanged = false;
     while (changed) {
         changed = false;
         for (auto& func : mod->getFunctions()) {
-            if (eliminateOnFunction(func.get())) changed = true;
+            if (eliminateOnFunction(func.get())) { changed = true; anyChanged = true; }
         }
     }
+    return anyChanged;
 }
 
 } // namespace Opt

@@ -67,6 +67,7 @@ target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
 # ================================================================
 add_library(sysy_opt STATIC
     src/opt/Optimizer.cpp
+    src/opt/DominatorAnalysis.cpp
     src/opt/ConstantFolding.cpp
     src/opt/DeadCodeElimination.cpp
     src/opt/PeepholeOptimizer.cpp
@@ -91,6 +92,7 @@ add_executable(test_ir
     tests/test_ir.cppx
     ${ANTLR_SOURCES}
 )
+set_source_files_properties(tests/test_ir.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_ir PRIVATE ${ANTLR_INCLUDES})
 target_link_libraries(test_ir sysy_ir_builder sysy_opt antlr4_static)
 
@@ -111,5 +113,6 @@ add_executable(test_integration
     tests/test_integration.cppx
     ${ANTLR_SOURCES}
 )
+set_source_files_properties(tests/test_integration.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_integration PRIVATE include ${ANTLR_INCLUDES})
 target_link_libraries(test_integration sysy_compiler sysy_opt antlr4_static)

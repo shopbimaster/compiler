@@ -15,88 +15,7 @@
 namespace Opt {
 namespace {
 
-using BBSet = std::unordered_set<IR::BasicBlock*>;
-
-// ---- 构建后继 ----
-std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>>
-buildSuccs(IR::Function* func) {
-    std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>> succ;
-    for (auto& bb : func->getBlocks()) {
-        succ[bb.get()];
-        auto* term = bb->getTerminator();
-        if (!term) continue;
-        if (term->getOpcode() == IR::Instruction::Opcode::BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(0)))
-                succ[bb.get()].push_back(t);
-        } else if (term->getOpcode() == IR::Instruction::Opcode::COND_BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(1)))
-                succ[bb.get()].push_back(t);
-            if (auto* e = dynamic_cast<IR::BasicBlock*>(term->getOperand(2)))
-                succ[bb.get()].push_back(e);
-        }
-    }
-    return succ;
-}
-
-// ---- 构建前驱 ----
-std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>>
-buildPreds(IR::Function* func) {
-    std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>> pred;
-    for (auto& bb : func->getBlocks()) {
-        pred[bb.get()];
-        auto* term = bb->getTerminator();
-        if (!term) continue;
-        if (term->getOpcode() == IR::Instruction::Opcode::BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(0)))
-                pred[t].push_back(bb.get());
-        } else if (term->getOpcode() == IR::Instruction::Opcode::COND_BR) {
-            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(1)))
-                pred[t].push_back(bb.get());
-            if (auto* e = dynamic_cast<IR::BasicBlock*>(term->getOperand(2)))
-                pred[e].push_back(bb.get());
-        }
-    }
-    return pred;
-}
-
-// ---- 支配者计算 ----
-std::unordered_map<IR::BasicBlock*, BBSet>
-computeDom(IR::Function* func) {
-    auto preds = buildPreds(func);
-    auto* entry = func->getEntryBlock();
-    if (!entry) return {};
-
-    std::vector<IR::BasicBlock*> allBBs;
-    for (auto& bb : func->getBlocks()) allBBs.push_back(bb.get());
-    BBSet allSet(allBBs.begin(), allBBs.end());
-
-    std::unordered_map<IR::BasicBlock*, BBSet> dom;
-    for (auto* bb : allBBs) dom[bb] = allSet;
-    dom[entry] = {entry};
-
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (auto* bb : allBBs) {
-            if (bb == entry) continue;
-            BBSet inter = allSet;
-            for (auto* p : preds[bb]) {
-                BBSet temp;
-                for (auto* d : inter)
-                    if (dom[p].count(d)) temp.insert(d);
-                inter = std::move(temp);
-            }
-            inter.insert(bb);
-            if (inter != dom[bb]) {
-                dom[bb] = std::move(inter);
-                changed = true;
-            }
-        }
-    }
-    return dom;
-}
-
-// ---- 循环信息 ----
+// ---- 循环信息（使用共享的 computeDominators / buildSuccessors / buildPredecessors） ----
 struct LoopInfo {
     IR::BasicBlock* header;
     IR::BasicBlock* latch;
@@ -104,9 +23,9 @@ struct LoopInfo {
 };
 
 std::vector<LoopInfo> detectLoops(IR::Function* func) {
-    auto dom = computeDom(func);
-    auto succs = buildSuccs(func);
-    auto preds = buildPreds(func);
+    auto dom = computeDominators(func);
+    auto succs = buildSuccessors(func);
+    auto preds = buildPredecessors(func);
     std::vector<LoopInfo> loops;
 
     for (auto& bb : func->getBlocks()) {
@@ -367,11 +286,13 @@ bool tryInterchange(IR::Function* func) {
 
 } // namespace
 
-void loopInterchange(IR::Module* mod) {
+bool loopInterchange(IR::Module* mod) {
+    bool anyChanged = false;
     for (auto& func : mod->getFunctions()) {
         if (func->isExternal()) continue;
-        tryInterchange(func.get());
+        if (tryInterchange(func.get())) anyChanged = true;
     }
+    return anyChanged;
 }
 
 } // namespace Opt

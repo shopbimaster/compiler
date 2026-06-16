@@ -125,13 +125,25 @@ void scheduleBB(IR::BasicBlock* bb) {
 
 } // namespace
 
-void instructionScheduling(IR::Module* mod) {
+bool instructionScheduling(IR::Module* mod) {
+    bool anyChanged = false;
     for (auto& func : mod->getFunctions()) {
         if (func->isExternal()) continue;
         for (auto& bb : func->getBlocks()) {
+            // scheduleBB 修改 BB 内部顺序，需跟踪是否变化
+            auto& insts = bb->getInstructions();
+            if (insts.size() <= 2) continue;
+            // 保存原始顺序
+            std::vector<IR::Instruction*> origOrder;
+            for (auto& inst : insts) origOrder.push_back(inst.get());
             scheduleBB(bb.get());
+            // 检查是否变化
+            std::vector<IR::Instruction*> newOrder;
+            for (auto& inst : insts) newOrder.push_back(inst.get());
+            if (origOrder != newOrder) anyChanged = true;
         }
     }
+    return anyChanged;
 }
 
 } // namespace Opt

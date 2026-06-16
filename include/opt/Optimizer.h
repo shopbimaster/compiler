@@ -8,8 +8,25 @@
 
 #include "ir/IR.h"
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace Opt {
+
+// ================================================================
+// 共享支配者分析 — LICM/LoopUnroll/LoopInterchange 复用
+// 避免多次重复计算支配树，减少编译时间
+// ================================================================
+using BBSet = std::unordered_set<IR::BasicBlock*>;
+using DomMap = std::unordered_map<IR::BasicBlock*, BBSet>;
+using PredMap = std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>>;
+using SuccMap = std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>>;
+
+PredMap buildPredecessors(IR::Function* func);
+SuccMap buildSuccessors(IR::Function* func);
+DomMap computeDominators(IR::Function* func);
+bool strictlyDominates(IR::BasicBlock* a, IR::BasicBlock* b, const DomMap& dom);
 
 // ================================================================
 // O1 Pass
@@ -20,21 +37,21 @@ std::string peepholeOptimize(const std::string& asmCode);
 void runO1(IR::Module* mod);
 
 // ================================================================
-// O2 Pass
+// O2 Pass — 返回 bool 表示是否修改了 IR
 // ================================================================
-void inlineExpansion(IR::Module* mod);
-void commonSubexpressionElimination(IR::Module* mod);
-void loopInvariantCodeMotion(IR::Module* mod);
+bool inlineExpansion(IR::Module* mod);
+bool commonSubexpressionElimination(IR::Module* mod);
+bool loopInvariantCodeMotion(IR::Module* mod);
 void runO2(IR::Module* mod);
 
 // ================================================================
-// O3 Pass
+// O3 Pass — 返回 bool 表示是否修改了 IR
 // ================================================================
-void algebraicSimplification(IR::Module* mod);
-void loopUnrolling(IR::Module* mod);
-void loopInterchange(IR::Module* mod);
-void tailRecursionElimination(IR::Module* mod);
-void instructionScheduling(IR::Module* mod);
+bool algebraicSimplification(IR::Module* mod);
+bool loopUnrolling(IR::Module* mod);
+bool loopInterchange(IR::Module* mod);
+bool tailRecursionElimination(IR::Module* mod);
+bool instructionScheduling(IR::Module* mod);
 void runO3(IR::Module* mod);
 
 // ================================================================
@@ -43,10 +60,10 @@ void runO3(IR::Module* mod);
 void runP3(IR::Module* mod);
 
 // ================================================================
-// P0 Pass — 语义级优化
+// P0 Pass — 语义级优化，返回 bool 表示是否修改了 IR
 // ================================================================
-void recursiveMulToNative(IR::Module* mod);
-void bitOpPatternRecognition(IR::Module* mod);
+bool recursiveMulToNative(IR::Module* mod);
+bool bitOpPatternRecognition(IR::Module* mod);
 void runP0(IR::Module* mod);
 
 } // namespace Opt

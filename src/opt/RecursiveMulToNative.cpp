@@ -423,16 +423,19 @@ bool tryConvertFunction(IR::Function* func) {
 // ================================================================
 // recursiveMulToNative 入口
 // ================================================================
-void recursiveMulToNative(IR::Module* mod) {
+bool recursiveMulToNative(IR::Module* mod) {
     bool changed = true;
+    bool anyChanged = false;
     while (changed) {
         changed = false;
         for (auto& func : mod->getFunctions()) {
             if (tryConvertFunction(func.get())) {
                 changed = true;
+                anyChanged = true;
             }
         }
     }
+    return anyChanged;
 }
 
 } // namespace Opt

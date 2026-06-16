@@ -605,24 +605,7 @@ std::string TargetCodeGen::storeFromReg(IR::Value* val, const std::string& srcRe
                 result += "  mv      " + r + ", " + srcReg + "\n";
             }
         }
-        int offset = getStackOffset(val);
-        auto* ty = val->getType();
-        bool valIsFloat = ty && ty->isFloat();
-        bool regIsFloat = !r.empty() && r[0] == 'f';
-
-        if (valIsFloat && regIsFloat) {
-            result += emitStackStore(r, offset, "fsw");
-        } else if (valIsFloat && !regIsFloat) {
-            result += "  fmv.w.x ft0, " + r + "\n";
-            result += emitStackStore("ft0", offset, "fsw");
-        } else if (!valIsFloat && regIsFloat) {
-            result += "  " + std::string((ty && ty->isPointer()) ? "fmv.x.d" : "fmv.x.w") + " t2, " + r + "\n";
-            result += emitStackStore("t2", offset,
-                (ty && ty->isPointer()) ? "sd" : "sw");
-        } else {
-            result += emitStackStore(r, offset,
-                (ty && ty->isPointer()) ? "sd" : "sw");
-        }
+        // Value is safe in callee-saved register, skip stack store
         return result;
     }
 
@@ -727,45 +710,82 @@ void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
     emitter.emitText(code);
 }
 
+std::string TargetCodeGen::getValueReg(IR::Value* val) {
+    if (regAlloc.hasReg(val)) {
+        return regAlloc.getReg(val);
+    }
+    return "";
+}
+
 void TargetCodeGen::emitBinOp(IR::Instruction& inst) {
     std::string code;
-    code += loadToReg(inst.getOperand(0), "t0");
-    code += loadToReg(inst.getOperand(1), "t1");
+
+    std::string r0 = getValueReg(inst.getOperand(0));
+    std::string r1 = getValueReg(inst.getOperand(1));
+    std::string rd = getValueReg(&inst);
+
+    bool op0InReg = !r0.empty();
+    bool op1InReg = !r1.empty();
+    bool rdInReg = !rd.empty();
+
+    if (!op0InReg) code += loadToReg(inst.getOperand(0), "t0");
+    if (!op1InReg) code += loadToReg(inst.getOperand(1), "t1");
+
+    std::string op0 = op0InReg ? r0 : "t0";
+    std::string op1 = op1InReg ? r1 : "t1";
+    std::string dest = rdInReg ? rd : "t0";
 
     using Opc = IR::Instruction::Opcode;
     switch (inst.getOpcode()) {
-    case Opc::ADD:  code += "  addw    t0, t0, t1\n"; break;
-    case Opc::SUB:  code += "  subw    t0, t0, t1\n"; break;
-    case Opc::MUL:  code += "  mulw    t0, t0, t1\n"; break;
-    case Opc::SDIV: code += "  divw    t0, t0, t1\n"; break;
-    case Opc::SREM: code += "  remw    t0, t0, t1\n"; break;
-    case Opc::AND:  code += "  and     t0, t0, t1\n"; break;
-    case Opc::OR:   code += "  or      t0, t0, t1\n"; break;
-    case Opc::XOR:  code += "  xor     t0, t0, t1\n"; break;
-    case Opc::SHL:  code += "  sllw    t0, t0, t1\n"; break;
-    case Opc::ASHR: code += "  sraw    t0, t0, t1\n"; break;
+    case Opc::ADD:  code += "  addw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::SUB:  code += "  subw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::MUL:  code += "  mulw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::SDIV: code += "  divw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::SREM: code += "  remw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::AND:  code += "  and     " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::OR:   code += "  or      " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::XOR:  code += "  xor     " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::SHL:  code += "  sllw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::ASHR: code += "  sraw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
     default: break;
     }
 
-    code += storeFromReg(&inst, "t0");
+    if (!rdInReg) {
+        code += storeFromReg(&inst, dest);
+    }
     emitter.emitText(code);
 }
 
 void TargetCodeGen::emitFBinOp(IR::Instruction& inst) {
     std::string code;
-    code += loadToReg(inst.getOperand(0), "ft0");
-    code += loadToReg(inst.getOperand(1), "ft1");
+
+    std::string r0 = getValueReg(inst.getOperand(0));
+    std::string r1 = getValueReg(inst.getOperand(1));
+    std::string rd = getValueReg(&inst);
+
+    bool op0InReg = !r0.empty();
+    bool op1InReg = !r1.empty();
+    bool rdInReg = !rd.empty();
+
+    if (!op0InReg) code += loadToReg(inst.getOperand(0), "ft0");
+    if (!op1InReg) code += loadToReg(inst.getOperand(1), "ft1");
+
+    std::string op0 = op0InReg ? r0 : "ft0";
+    std::string op1 = op1InReg ? r1 : "ft1";
+    std::string dest = rdInReg ? rd : "ft0";
 
     using Opc = IR::Instruction::Opcode;
     switch (inst.getOpcode()) {
-    case Opc::FADD: code += "  fadd.s  ft0, ft0, ft1\n"; break;
-    case Opc::FSUB: code += "  fsub.s  ft0, ft0, ft1\n"; break;
-    case Opc::FMUL: code += "  fmul.s  ft0, ft0, ft1\n"; break;
-    case Opc::FDIV: code += "  fdiv.s  ft0, ft0, ft1\n"; break;
+    case Opc::FADD: code += "  fadd.s  " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::FSUB: code += "  fsub.s  " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::FMUL: code += "  fmul.s  " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::FDIV: code += "  fdiv.s  " + dest + ", " + op0 + ", " + op1 + "\n"; break;
     default: break;
     }
 
-    code += storeFromReg(&inst, "ft0");
+    if (!rdInReg) {
+        code += storeFromReg(&inst, dest);
+    }
     emitter.emitText(code);
 }
 
@@ -775,55 +795,100 @@ void TargetCodeGen::emitIcmp(IR::Instruction& inst) {
 
     if (isFloat) {
         std::string code;
-        code += loadToReg(inst.getOperand(0), "ft0");
-        code += loadToReg(inst.getOperand(1), "ft1");
+
+        std::string r0 = getValueReg(inst.getOperand(0));
+        std::string r1 = getValueReg(inst.getOperand(1));
+        std::string rd = getValueReg(&inst);
+
+        bool op0InReg = !r0.empty();
+        bool op1InReg = !r1.empty();
+        bool rdInReg = !rd.empty();
+
+        if (!op0InReg) code += loadToReg(inst.getOperand(0), "ft0");
+        if (!op1InReg) code += loadToReg(inst.getOperand(1), "ft1");
+
+        std::string op0 = op0InReg ? r0 : "ft0";
+        std::string op1 = op1InReg ? r1 : "ft1";
+        std::string dest = rdInReg ? rd : "t0";
 
         std::string cond = inst.getName();
-        if (cond == "eq")  code += "  feq.s   t0, ft0, ft1\n";
-        else if (cond == "ne") code += "  feq.s   t0, ft0, ft1\n  xori    t0, t0, 1\n";
-        else if (cond == "slt") code += "  flt.s   t0, ft0, ft1\n";
-        else if (cond == "sle") code += "  fle.s   t0, ft0, ft1\n";
-        else if (cond == "sgt") code += "  flt.s   t0, ft1, ft0\n";
-        else if (cond == "sge") code += "  fle.s   t0, ft1, ft0\n";
-        else code += "  flt.s   t0, ft0, ft1\n";
+        if (cond == "eq")  code += "  feq.s   " + dest + ", " + op0 + ", " + op1 + "\n";
+        else if (cond == "ne") code += "  feq.s   " + dest + ", " + op0 + ", " + op1 + "\n  xori    " + dest + ", " + dest + ", 1\n";
+        else if (cond == "slt") code += "  flt.s   " + dest + ", " + op0 + ", " + op1 + "\n";
+        else if (cond == "sle") code += "  fle.s   " + dest + ", " + op0 + ", " + op1 + "\n";
+        else if (cond == "sgt") code += "  flt.s   " + dest + ", " + op1 + ", " + op0 + "\n";
+        else if (cond == "sge") code += "  fle.s   " + dest + ", " + op1 + ", " + op0 + "\n";
+        else code += "  flt.s   " + dest + ", " + op0 + ", " + op1 + "\n";
 
-        code += storeFromReg(&inst, "t0");
+        if (!rdInReg) {
+            code += storeFromReg(&inst, dest);
+        }
         emitter.emitText(code);
         return;
     }
 
     std::string code;
-    code += loadToReg(inst.getOperand(0), "t0");
-    code += loadToReg(inst.getOperand(1), "t1");
+
+    std::string r0 = getValueReg(inst.getOperand(0));
+    std::string r1 = getValueReg(inst.getOperand(1));
+    std::string rd = getValueReg(&inst);
+
+    bool op0InReg = !r0.empty();
+    bool op1InReg = !r1.empty();
+    bool rdInReg = !rd.empty();
+
+    if (!op0InReg) code += loadToReg(inst.getOperand(0), "t0");
+    if (!op1InReg) code += loadToReg(inst.getOperand(1), "t1");
+
+    std::string op0 = op0InReg ? r0 : "t0";
+    std::string op1 = op1InReg ? r1 : "t1";
+    std::string dest = rdInReg ? rd : "t0";
 
     std::string cond = inst.getName();
-    if (cond == "eq")  code += "  sub     t0, t0, t1\n  seqz    t0, t0\n";
-    else if (cond == "ne")  code += "  sub     t0, t0, t1\n  snez    t0, t0\n";
-    else if (cond == "slt") code += "  slt     t0, t0, t1\n";
-    else if (cond == "sle") code += "  slt     t1, t1, t0\n  xori    t0, t1, 1\n";
-    else if (cond == "sgt") code += "  slt     t0, t1, t0\n";
-    else if (cond == "sge") code += "  slt     t0, t0, t1\n  xori    t0, t0, 1\n";
-    else code += "  slt     t0, t0, t1\n";
+    if (cond == "eq")  code += "  sub     " + dest + ", " + op0 + ", " + op1 + "\n  seqz    " + dest + ", " + dest + "\n";
+    else if (cond == "ne")  code += "  sub     " + dest + ", " + op0 + ", " + op1 + "\n  snez    " + dest + ", " + dest + "\n";
+    else if (cond == "slt") code += "  slt     " + dest + ", " + op0 + ", " + op1 + "\n";
+    else if (cond == "sle") code += "  slt     " + dest + ", " + op1 + ", " + op0 + "\n  xori    " + dest + ", " + dest + ", 1\n";
+    else if (cond == "sgt") code += "  slt     " + dest + ", " + op1 + ", " + op0 + "\n";
+    else if (cond == "sge") code += "  slt     " + dest + ", " + op0 + ", " + op1 + "\n  xori    " + dest + ", " + dest + ", 1\n";
+    else code += "  slt     " + dest + ", " + op0 + ", " + op1 + "\n";
 
-    code += storeFromReg(&inst, "t0");
+    if (!rdInReg) {
+        code += storeFromReg(&inst, dest);
+    }
     emitter.emitText(code);
 }
 
 void TargetCodeGen::emitFcmp(IR::Instruction& inst) {
     std::string code;
-    code += loadToReg(inst.getOperand(0), "ft0");
-    code += loadToReg(inst.getOperand(1), "ft1");
+
+    std::string r0 = getValueReg(inst.getOperand(0));
+    std::string r1 = getValueReg(inst.getOperand(1));
+    std::string rd = getValueReg(&inst);
+
+    bool op0InReg = !r0.empty();
+    bool op1InReg = !r1.empty();
+    bool rdInReg = !rd.empty();
+
+    if (!op0InReg) code += loadToReg(inst.getOperand(0), "ft0");
+    if (!op1InReg) code += loadToReg(inst.getOperand(1), "ft1");
+
+    std::string op0 = op0InReg ? r0 : "ft0";
+    std::string op1 = op1InReg ? r1 : "ft1";
+    std::string dest = rdInReg ? rd : "t0";
 
     std::string cond = inst.getName();
-    if (cond == "eq")  code += "  feq.s   t0, ft0, ft1\n";
-    else if (cond == "ne") code += "  feq.s   t0, ft0, ft1\n  xori    t0, t0, 1\n";
-    else if (cond == "slt") code += "  flt.s   t0, ft0, ft1\n";
-    else if (cond == "sle") code += "  fle.s   t0, ft0, ft1\n";
-    else if (cond == "sgt") code += "  flt.s   t0, ft1, ft0\n";
-    else if (cond == "sge") code += "  fle.s   t0, ft1, ft0\n";
-    else code += "  flt.s   t0, ft0, ft1\n";
+    if (cond == "eq")  code += "  feq.s   " + dest + ", " + op0 + ", " + op1 + "\n";
+    else if (cond == "ne") code += "  feq.s   " + dest + ", " + op0 + ", " + op1 + "\n  xori    " + dest + ", " + dest + ", 1\n";
+    else if (cond == "slt") code += "  flt.s   " + dest + ", " + op0 + ", " + op1 + "\n";
+    else if (cond == "sle") code += "  fle.s   " + dest + ", " + op0 + ", " + op1 + "\n";
+    else if (cond == "sgt") code += "  flt.s   " + dest + ", " + op1 + ", " + op0 + "\n";
+    else if (cond == "sge") code += "  fle.s   " + dest + ", " + op1 + ", " + op0 + "\n";
+    else code += "  flt.s   " + dest + ", " + op0 + ", " + op1 + "\n";
 
-    code += storeFromReg(&inst, "t0");
+    if (!rdInReg) {
+        code += storeFromReg(&inst, dest);
+    }
     emitter.emitText(code);
 }
 
@@ -831,15 +896,22 @@ void TargetCodeGen::emitLoad(IR::Instruction& inst) {
     std::string code;
     code += loadToReg(inst.getOperand(0), "t0");
     auto* loadTy = inst.getType();
+
+    std::string rd = getValueReg(&inst);
+    bool rdInReg = !rd.empty();
+
     if (loadTy && loadTy->isFloat()) {
-        code += "  flw     ft0, 0(t0)\n";
-        code += storeFromReg(&inst, "ft0");
+        std::string dest = rdInReg ? rd : "ft0";
+        code += "  flw     " + dest + ", 0(t0)\n";
+        if (!rdInReg) code += storeFromReg(&inst, dest);
     } else if (loadTy && loadTy->isPointer()) {
-        code += "  ld      t0, 0(t0)\n";
-        code += storeFromReg(&inst, "t0");
+        std::string dest = rdInReg ? rd : "t0";
+        code += "  ld      " + dest + ", 0(t0)\n";
+        if (!rdInReg) code += storeFromReg(&inst, dest);
     } else {
-        code += "  lw      t0, 0(t0)\n";
-        code += storeFromReg(&inst, "t0");
+        std::string dest = rdInReg ? rd : "t0";
+        code += "  lw      " + dest + ", 0(t0)\n";
+        if (!rdInReg) code += storeFromReg(&inst, dest);
     }
     emitter.emitText(code);
 }
@@ -865,6 +937,44 @@ void TargetCodeGen::emitStore(IR::Instruction& inst) {
 
 void TargetCodeGen::emitCall(IR::Instruction& inst) {
     std::string code;
+
+    // Save caller-saved registers that are in use before the call
+    std::string saveCode, restoreCode;
+    int csrOffset = stackSize - 8;
+    for (auto& reg : regAlloc.getUsedCalleeSaved()) {
+        csrOffset -= 8;
+        bool isCallerSaved = false;
+        if (reg.size() >= 2 && reg[0] == 't') isCallerSaved = true;           // t3-t6
+        if (reg.size() >= 3 && reg[0] == 'f' && reg[1] == 't') isCallerSaved = true; // ft*
+        if (isCallerSaved) {
+            if (reg[0] == 'f') {
+                if (fitsImm12(csrOffset)) {
+                    saveCode += "  fsd     " + reg + ", " + std::to_string(csrOffset) + "(sp)\n";
+                    restoreCode += "  fld     " + reg + ", " + std::to_string(csrOffset) + "(sp)\n";
+                } else {
+                    saveCode += "  li      t2, " + std::to_string(csrOffset) + "\n";
+                    saveCode += "  add     t2, sp, t2\n";
+                    saveCode += "  fsd     " + reg + ", 0(t2)\n";
+                    restoreCode += "  li      t2, " + std::to_string(csrOffset) + "\n";
+                    restoreCode += "  add     t2, sp, t2\n";
+                    restoreCode += "  fld     " + reg + ", 0(t2)\n";
+                }
+            } else {
+                if (fitsImm12(csrOffset)) {
+                    saveCode += "  sd      " + reg + ", " + std::to_string(csrOffset) + "(sp)\n";
+                    restoreCode += "  ld      " + reg + ", " + std::to_string(csrOffset) + "(sp)\n";
+                } else {
+                    saveCode += "  li      t2, " + std::to_string(csrOffset) + "\n";
+                    saveCode += "  add     t2, sp, t2\n";
+                    saveCode += "  sd      " + reg + ", 0(t2)\n";
+                    restoreCode += "  li      t2, " + std::to_string(csrOffset) + "\n";
+                    restoreCode += "  add     t2, sp, t2\n";
+                    restoreCode += "  ld      " + reg + ", 0(t2)\n";
+                }
+            }
+        }
+    }
+    code += saveCode;
 
     unsigned numArgs = inst.getNumOperands() - 1;
     unsigned iReg = 0;   // Next available integer argument register (a0-a7)
@@ -920,6 +1030,8 @@ void TargetCodeGen::emitCall(IR::Instruction& inst) {
 
     std::string calleeName = inst.getOperand(0)->getName();
     code += "  call    " + calleeName + "\n";
+
+    code += restoreCode;
 
     auto* retTy = inst.getType();
     if (!retTy->isVoid()) {
@@ -991,17 +1103,43 @@ void TargetCodeGen::emitGetElementPtr(IR::Instruction& inst) {
 
 void TargetCodeGen::emitSitofp(IR::Instruction& inst) {
     std::string code;
-    code += loadToReg(inst.getOperand(0), "t0");
-    code += "  fcvt.s.w ft0, t0\n";
-    code += storeFromReg(&inst, "ft0");
+
+    std::string rs = getValueReg(inst.getOperand(0));
+    std::string rd = getValueReg(&inst);
+
+    bool opInReg = !rs.empty();
+    bool rdInReg = !rd.empty();
+
+    std::string src = opInReg ? rs : "t0";
+    std::string dest = rdInReg ? rd : "ft0";
+
+    if (!opInReg) code += loadToReg(inst.getOperand(0), "t0");
+    code += "  fcvt.s.w " + dest + ", " + src + "\n";
+
+    if (!rdInReg) {
+        code += storeFromReg(&inst, dest);
+    }
     emitter.emitText(code);
 }
 
 void TargetCodeGen::emitFptosi(IR::Instruction& inst) {
     std::string code;
-    code += loadToReg(inst.getOperand(0), "ft0");
-    code += "  fcvt.w.s t0, ft0, rtz\n";
-    code += storeFromReg(&inst, "t0");
+
+    std::string rs = getValueReg(inst.getOperand(0));
+    std::string rd = getValueReg(&inst);
+
+    bool opInReg = !rs.empty();
+    bool rdInReg = !rd.empty();
+
+    std::string src = opInReg ? rs : "ft0";
+    std::string dest = rdInReg ? rd : "t0";
+
+    if (!opInReg) code += loadToReg(inst.getOperand(0), "ft0");
+    code += "  fcvt.w.s " + dest + ", " + src + ", rtz\n";
+
+    if (!rdInReg) {
+        code += storeFromReg(&inst, dest);
+    }
     emitter.emitText(code);
 }
 

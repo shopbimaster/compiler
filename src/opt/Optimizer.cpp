@@ -1,10 +1,6 @@
 // ================================================================
 // O1/O2/O3/P0/P3 优化器统一入口
-// O1: 常量折叠 → 死代码消除
-// O2: 函数内联 → O1 → CSE → LICM → O1
-// O3: 代数化简 → O1 → 循环交换 → O1 → 循环展开 → O1 → 尾递归消除 → O1
-// P0: 递归乘→原生MUL → 位运算模式识别 → O3 → O1
-// P3: 指令调度 → O1
+// 各变换 pass 返回 bool，仅在实际修改 IR 后才运行 CF/DCE 清理
 // ================================================================
 
 #include "opt/Optimizer.h"
@@ -24,36 +20,36 @@ void runO2(IR::Module* mod) {
     inlineExpansion(mod);
     constantFolding(mod);
     deadCodeElimination(mod);
-    commonSubexpressionElimination(mod);
-    loopInvariantCodeMotion(mod);
+    if (commonSubexpressionElimination(mod)) { /* CSE changed */ }
+    if (loopInvariantCodeMotion(mod)) { /* LICM changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
 }
 
 void runO3(IR::Module* mod) {
-    algebraicSimplification(mod);
+    if (algebraicSimplification(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
-    loopInterchange(mod);
+    if (loopInterchange(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
-    loopUnrolling(mod);
+    if (loopUnrolling(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
-    tailRecursionElimination(mod);
+    if (tailRecursionElimination(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
 }
 
 void runP0(IR::Module* mod) {
-    recursiveMulToNative(mod);
-    bitOpPatternRecognition(mod);
+    if (recursiveMulToNative(mod)) { /* changed */ }
+    if (bitOpPatternRecognition(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
 }
 
 void runP3(IR::Module* mod) {
-    instructionScheduling(mod);
+    if (instructionScheduling(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
 }

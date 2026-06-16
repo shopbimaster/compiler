@@ -195,8 +195,9 @@ bool trySimplify(IR::Instruction* inst) {
 // ================================================================
 // algebraicSimplification 入口 — 迭代直到收敛
 // ================================================================
-void algebraicSimplification(IR::Module* mod) {
+bool algebraicSimplification(IR::Module* mod) {
     bool changed = true;
+    bool anyChanged = false;
     while (changed) {
         changed = false;
         for (auto& func : mod->getFunctions()) {
@@ -206,6 +207,7 @@ void algebraicSimplification(IR::Module* mod) {
                     // 强度削减会修改 BB 结构，需重新扫描
                     if (trySimplify(it->get())) {
                         changed = true;
+                        anyChanged = true;
                         it = bb->begin(); // 从头重扫
                     } else {
                         ++it;
@@ -214,6 +216,7 @@ void algebraicSimplification(IR::Module* mod) {
             }
         }
     }
+    return anyChanged;
 }
 
 } // namespace Opt

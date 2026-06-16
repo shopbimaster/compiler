@@ -127,6 +127,22 @@ std::string peepholeOptimize(const std::string& asmCode) {
             }
         }
 
+        // mv reg, src followed by sw reg, offset(sp) → sw src, offset(sp)
+        if (!matched && i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {
+            std::string mvRd, mvRs;
+            if (tryMatch(lines[i], "mv", mvRd, mvRs, imm)) {
+                std::string swReg, swOff;
+                if (tryMatch(lines[i + 1], "sw", swReg, swOff, imm)) {
+                    if (swReg == mvRd) {
+                        // Replace: sw mvRd, offset(sp) → sw mvRs, offset(sp)
+                        result.push_back("  sw      " + mvRs + ", " + swOff);
+                        ++i;
+                        matched = true;
+                    }
+                }
+            }
+        }
+
         if (!matched) {
             result.push_back(lines[i]);
         }

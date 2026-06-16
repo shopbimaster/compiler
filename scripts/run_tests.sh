@@ -84,12 +84,14 @@ run_suite() {
         link_ok=$((link_ok + 1))
 
         # Run
+        set +e
         if [ -f "$infile" ]; then
             timeout ${timeout_s} $QEMU "$bin" < "$infile" > "${TMPDIR}/${tmp_prefix}/${name}_out.txt" 2>/dev/null
         else
             timeout ${timeout_s} $QEMU "$bin" > "${TMPDIR}/${tmp_prefix}/${name}_out.txt" 2>/dev/null
         fi
         local ret=$?
+        set -e
 
         if [ $ret -eq 124 ]; then
             echo -e "  ${YELLOW}TIMEOUT${NC}:      ${name}"
@@ -163,8 +165,10 @@ run_quick() {
             continue
         fi
         local ret
+        set +e
         $QEMU "$bin" > /dev/null 2>&1
         ret=$?
+        set -e
         if [ "$ret" = "$expected" ]; then
             echo -e "  ${GREEN}PASS${NC}: ${name} -> return ${ret}"
             pass=$((pass + 1))
