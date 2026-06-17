@@ -104,6 +104,9 @@ bool isLoopInvariant(
 // 外提循环不变量到前置块
 // ================================================================
 bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
+    static int preheaderCounter = 0;
+    // 头块是入口块 → 跳过（入口块支配所有块，创建preheader会形成新的回边，导致无限循环）
+    if (loop.header == func->getEntryBlock()) return false;
     // 头块含 PHI → 保守跳过
     if (headerHasPhi(loop.header)) return false;
 
@@ -137,9 +140,9 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
     }
     if (outsidePreds.empty()) return false;
 
-    // 4. 创建前置块
-    std::string preName = loop.header->getName() + ".preheader";
-    auto* preheader = func->createBlock(preName);
+    // 4. 创建前置块（使用唯一名称防止重复符号，插入到header之前确保指令ID顺序正确）
+    std::string preName = loop.header->getName() + ".preheader." + std::to_string(++preheaderCounter);
+    auto* preheader = func->insertBlock(preName, loop.header);
 
     // 5. 按原始顺序将不变指令移到前置块（仅从非头块外提）
     for (auto* bb : loop.body) {
@@ -196,7 +199,13 @@ bool licmOnFunction(IR::Function* func) {
 bool loopInvariantCodeMotion(IR::Module* mod) {
     bool changed = true;
     bool anyChanged = false;
+    int iter = 0;
     while (changed) {
+        if (++iter > 10) {
+            // Safety limit: prevent infinite loops in LICM
+            // This can happen when hoisting creates new back edges
+            break;
+        }
         changed = false;
         for (auto& func : mod->getFunctions()) {
             if (licmOnFunction(func.get())) { changed = true; anyChanged = true; }

@@ -331,6 +331,7 @@ namespace IR {
         BasicBlock* getEntryBlock() const { return blocks.empty() ? nullptr : blocks.front().get(); }
 
         BasicBlock* createBlock(const std::string& name = "");
+        BasicBlock* insertBlock(const std::string& name, BasicBlock* before);
 
     private:
         FunctionType*                             funcType;

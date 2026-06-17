@@ -348,6 +348,21 @@ namespace IR {
         return ptr;
     }
 
+    BasicBlock* Function::insertBlock(const std::string& name, BasicBlock* before) {
+        auto bb = std::make_unique<BasicBlock>(name);
+        bb->setParent(this);
+        BasicBlock* ptr = bb.get();
+        for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+            if (it->get() == before) {
+                blocks.insert(it, std::move(bb));
+                return ptr;
+            }
+        }
+        // If 'before' not found, append to end
+        blocks.push_back(std::move(bb));
+        return ptr;
+    }
+
     // ================================================================
     // GlobalVariable
     // ================================================================
