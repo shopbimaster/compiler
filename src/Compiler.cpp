@@ -24,8 +24,11 @@ static void runOptPasses(Module* mod, OptLevel opt) {
         Opt::runO1(mod);
         Opt::runO2(mod);
         Opt::runO3(mod);
-        Opt::runP0(mod);
-        Opt::runP3(mod);
+        // TODO: P0 (recursiveMulToNative, bitOpPatternRecognition) and
+        // P3 (instructionScheduling) cause SEGFAULTs in ~33 functional tests.
+        // Needs further investigation before re-enabling.
+        // Opt::runP0(mod);
+        // Opt::runP3(mod);
         break;
     case OptLevel::O0:
     default:
