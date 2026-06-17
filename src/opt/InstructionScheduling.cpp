@@ -21,7 +21,8 @@ using Opc = IR::Instruction::Opcode;
 bool isMovable(IR::Instruction* inst) {
     auto op = inst->getOpcode();
     return op != Opc::BR && op != Opc::COND_BR && op != Opc::RET &&
-           op != Opc::PHI && op != Opc::CALL && op != Opc::ALLOCA;
+           op != Opc::PHI && op != Opc::CALL && op != Opc::ALLOCA &&
+           op != Opc::STORE && op != Opc::LOAD;
 }
 
 void scheduleBB(IR::BasicBlock* bb) {
@@ -35,13 +36,13 @@ void scheduleBB(IR::BasicBlock* bb) {
     }
     if (movable.size() <= 1) return;
 
-    // 构建值→生产者映射
+    // 构建值→生产者映射（仅可移动指令）
     std::unordered_map<IR::Value*, IR::Instruction*> producer;
-    for (auto& inst : insts) {
-        producer[inst.get()] = inst.get();
+    for (auto* inst : movable) {
+        producer[inst] = inst;
     }
 
-    // 入度 + 邻接表
+    // 入度 + 邻接表（仅可移动指令之间的依赖）
     std::unordered_map<IR::Instruction*, int> indegree;
     std::unordered_map<IR::Instruction*, std::vector<IR::Instruction*>> succs;
     for (auto* inst : movable) {
@@ -99,28 +100,45 @@ void scheduleBB(IR::BasicBlock* bb) {
     // 如果顺序没变，跳过
     if (schedule == movable) return;
 
-    // 构建 schedule 位置映射
-    std::unordered_map<IR::Instruction*, int> schedPos;
-    for (size_t i = 0; i < schedule.size(); ++i)
-        schedPos[schedule[i]] = static_cast<int>(i);
+    // 提取所有非终止指令（size-1 排除 terminator）
+    size_t nonTermCount = insts.size() - 1;
+    std::vector<std::unique_ptr<IR::Instruction>> extracted;
+    extracted.reserve(nonTermCount);
+    for (size_t i = 0; i < nonTermCount; ++i) {
+        auto it = bb->begin();
+        extracted.push_back(std::move(*it));
+        bb->erase(it);
+    }
 
-    // 原地 stable_sort：非可移动指令保持原始相对顺序，
-    // 可移动指令按 schedule 顺序排列
-    // 排序范围 [begin, end-1) 排除 terminator
-    auto termPos = bb->end();
-    --termPos;
+    if (extracted.empty()) return;
 
-    std::stable_sort(bb->begin(), termPos,
+    // 构建位置映射：非可移动指令保持原位，可移动指令按 schedule 填充
+    std::unordered_map<IR::Instruction*, int> posMap;
+    for (size_t i = 0; i < extracted.size(); ++i) {
+        if (!isMovable(extracted[i].get())) {
+            posMap[extracted[i].get()] = static_cast<int>(i);
+        }
+    }
+    int schedIdx = 0;
+    for (size_t i = 0; i < extracted.size(); ++i) {
+        if (isMovable(extracted[i].get())) {
+            posMap[schedule[schedIdx++]] = static_cast<int>(i);
+        }
+    }
+
+    // 按位置排序
+    std::sort(extracted.begin(), extracted.end(),
         [&](const std::unique_ptr<IR::Instruction>& a,
             const std::unique_ptr<IR::Instruction>& b) {
-            auto itA = schedPos.find(a.get());
-            auto itB = schedPos.find(b.get());
-            if (itA != schedPos.end() && itB != schedPos.end())
-                return itA->second < itB->second;
-            if (itA == schedPos.end() && itB == schedPos.end())
-                return false;
-            return itA == schedPos.end();
+            return posMap[a.get()] < posMap[b.get()];
         });
+
+    // 按排序后的顺序重新插入（在 terminator 之前）
+    auto termIt = bb->end();
+    --termIt;
+    for (auto& up : extracted) {
+        bb->insert(termIt, up.release());
+    }
 }
 
 } // namespace
