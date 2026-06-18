@@ -140,8 +140,8 @@ bash scripts/run_tests.sh perf O0
 # 全量测试（所有套件，O0 优化）
 bash scripts/run_tests.sh all O0
 
-# 全量测试（所有优化级别）
-bash scripts/run_tests.sh all Oall
+# 全量测试（测评服务器级别，全部优化）
+bash scripts/run_tests.sh all O1
 ```
 
 ### 2.2 测试套件说明
@@ -156,13 +156,18 @@ bash scripts/run_tests.sh all Oall
 
 ### 2.3 优化级别
 
-| 参数 | 说明 |
-|------|------|
-| `O0` | 无优化（默认） |
-| `O1` | 基础优化 |
-| `O2` | 中级优化 |
-| `O3` | 高级优化 |
-| `Oall` | 全部优化级别 |
+**重要**：测评服务器仅支持 `-O1` 这一个优化选项，编译器将其映射为最高优化级别（OALL = O1+O2+O3）。小写选项仅用于本地逐级调试。
+
+| 命令行参数 | 内部优化级别 | 说明 |
+|-----------|------------|------|
+| `-O1` | OALL | **测评服务器使用**，全部优化 (O1+O2+O3，不含P0/P3) |
+| `-O0` | O0 | 无优化 |
+| `-o0` | O0 | 无优化（本地调试） |
+| `-o1` | O1 | 仅 O1：CF + DCE + CSE + LICM（本地调试） |
+| `-o2` | O2 | O1 + 内联（本地调试） |
+| `-o3` | O3 | O1+O2 + 代数化简/循环交换/展开/尾递归（本地调试） |
+
+> **注意**：大写 `-O1` 对应全部优化，小写 `-o1` 对应仅 O1 优化。这是因测评服务器只支持 `-O1` 选项，我们必须在此选项下输出最佳性能。
 
 ### 2.4 测试流程
 
@@ -238,7 +243,7 @@ bash scripts/test_qemu.sh
 
 ```bash
 cd /mnt/d/VSCodeProjects/compiler
-bash scripts/test_qemu_all.sh [O0|O1|O2|O3|Oall]
+bash scripts/test_qemu_all.sh [O1|O0|o0|o1|o2|o3]
 ```
 
 遍历 functional 全部用例，比对 stdout 和退出码。

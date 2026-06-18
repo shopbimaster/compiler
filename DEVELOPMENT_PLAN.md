@@ -8,7 +8,7 @@
 |----------|------|------|------|
 | 功能测试 | `test/functional/` | 100 | O0 |
 | 高级功能测试 | `test/h_functional/` | 40 | O0 |
-| 性能测试 | `test/performance/` | 68（23组×3） | O2~OALL |
+| 性能测试 | `test/performance/` | 68（23组×3） | O2~O3 |
 | **合计** | | **~208** | |
 
 ---
@@ -80,7 +80,7 @@
 | P0 | 位运算模式识别 | [BitOpPatternRecognition.cpp](file:///d:/VSCodeProjects/compiler/src/opt/BitOpPatternRecognition.cpp) | 4 条规则：and-mask、shift-and、or-shift 组合模式 |
 | P3 | 指令调度 | [InstructionScheduling.cpp](file:///d:/VSCodeProjects/compiler/src/opt/InstructionScheduling.cpp) | 基本块内列表调度：数据依赖 DAG + LOAD 优先 + stable_sort 原地重排 |
 
-#### 优化流水线（OALL）
+#### 优化流水线（OALL = 全部优化，对应命令行 -O1）
 
 ```
 O1  → O2  → O3  → P0  → P3
@@ -193,7 +193,7 @@ compiler/
 │   ├── SysY2022Lexer.g4             词法
 │   └── SysY2022Parser.g4            语法
 ├── include/
-│   ├── Compiler.h                   CLI 封装 + OptLevel 枚举（O0/O1/O2/O3/OALL）
+│   ├── Compiler.h                   CLI 封装 + OptLevel 枚举（O0/O1/O2/O3/OALL，OALL 对应命令行 -O1）
 │   ├── backend/
 │   │   ├── TargetCodeGen.h          指令选择 + 栈帧 + 全局变量
 │   │   ├── RegisterAllocator.h      线性扫描寄存器分配
@@ -207,7 +207,7 @@ compiler/
 │       ├── Error.h
 │       └── Logger.h
 ├── src/
-│   ├── main.cpp                     CLI: -S/-o/-O0~-Oall
+│   ├── main.cpp                     CLI: -S/-o/-O1（测评）/-o1/-o2/-o3（本地调试）
 │   ├── Compiler.cpp                 优化管线调度
 │   ├── antlr/                       ANTLR 生成文件
 │   ├── ir/
@@ -303,7 +303,7 @@ compiler/
 当前（已完成）: O1/O2/O3/P0/P3 全部优化 Pass 实现 ✅
 当前（已完成）: 运行时库集成（SysYlib + 测试脚本） ✅
 当前（已完成）: functional 100 + h_functional 40 + performance 60 回归测试 ✅
-下一阶段:      Oall 优化性能测试 → 38_light2d 浮点精度修复 → 整数溢出语义修复
+下一阶段:      -O1 优化性能测试 → 38_light2d 浮点精度修复 → 整数溢出语义修复
 远期:          循环分块/融合/向量化 → FPGA 上板
 ```
 

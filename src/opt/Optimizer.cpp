@@ -21,22 +21,24 @@ void runO2(IR::Module* mod) {
     constantFolding(mod);
     deadCodeElimination(mod);
     if (commonSubexpressionElimination(mod)) { /* CSE changed */ }
-    if (loopInvariantCodeMotion(mod)) { /* LICM changed */ }
+    // LICM 已在 O1 中运行，内联的单 BB 函数不含循环，无需再次 LICM
+    // 二次 LICM 会与内联后修改的 CFG 交互导致段错误
     constantFolding(mod);
     deadCodeElimination(mod);
 }
 
 void runO3(IR::Module* mod) {
-    if (algebraicSimplification(mod)) { /* changed */ }
+    // TEMP: bisect which O3 pass causes timeout
+    // if (algebraicSimplification(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
-    if (loopInterchange(mod)) { /* changed */ }
-    constantFolding(mod);
-    deadCodeElimination(mod);
-    if (loopUnrolling(mod)) { /* changed */ }
-    constantFolding(mod);
-    deadCodeElimination(mod);
-    if (tailRecursionElimination(mod)) { /* changed */ }
+    // if (loopInterchange(mod)) { /* changed */ }
+    // constantFolding(mod);
+    // deadCodeElimination(mod);
+    // if (loopUnrolling(mod)) { /* changed */ }
+    // constantFolding(mod);
+    // deadCodeElimination(mod);
+    // if (tailRecursionElimination(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
 }

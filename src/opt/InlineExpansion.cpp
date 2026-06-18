@@ -1,6 +1,8 @@
 // ================================================================
 // O2: 函数内联 —— 将小函数体复制到调用点，消除 call 开销
-// 策略：内联 ≤2 基本块、非递归、指令数 < 20 的叶子函数
+// 策略：内联单基本块、非递归、指令数 < 20 的叶子函数
+// 注意：仅内联单 BB 函数，多 BB 函数涉及控制流（BR/COND_BR），
+// 正确克隆控制流需要复制基本块结构并重定向边，过于复杂且收益有限
 // ================================================================
 
 #include "opt/Optimizer.h"
@@ -38,7 +40,7 @@ unsigned countInstructions(IR::Function* func) {
 
 bool isInlineCandidate(IR::Function* func) {
     if (func->isExternal()) return false;
-    if (func->getBlocks().size() > 2) return false;   // 不超过 2 个 BB（entry + body）
+    if (func->getBlocks().size() > 1) return false;   // 仅内联单 BB 函数，避免控制流丢失
     if (countInstructions(func) > MAX_INLINE_INSTS) return false;
     if (!isLeafCall(func)) return false;
     return true;

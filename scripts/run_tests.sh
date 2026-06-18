@@ -2,11 +2,17 @@
 # ================================================================
 # SysY Compiler - Unified Test Runner
 # ================================================================
+# 优化级别说明（详见 src/main.cpp）：
+#   -O1  → 测评服务器使用，映射到全部优化 (OALL = O1+O2+O3)
+#   -O0  → 无优化
+#   小写字母用于本地逐级调试：
+#   -o0  → O0    -o1  → O1    -o2  → O2    -o3  → O3
+# ================================================================
 # Usage:
-#   ./scripts/run_tests.sh func [O1|o0|o1|o2|o3]  # functional tests
-#   ./scripts/run_tests.sh hfunc [O1|o0|o1|o2|o3]  # h_functional tests
-#   ./scripts/run_tests.sh perf [O1|o0|o1|o2|o3]   # performance tests
-#   ./scripts/run_tests.sh all [O1|o0|o1|o2|o3]     # all three suites
+#   ./scripts/run_tests.sh func [O1|O0|o0|o1|o2|o3]  # functional tests
+#   ./scripts/run_tests.sh hfunc [O1|O0|o0|o1|o2|o3]  # h_functional tests
+#   ./scripts/run_tests.sh perf [O1|O0|o0|o1|o2|o3]   # performance tests
+#   ./scripts/run_tests.sh all [O1|O0|o0|o1|o2|o3]     # all three suites
 #   ./scripts/run_tests.sh quick                        # quick smoke test
 # ================================================================
 set -e
@@ -218,13 +224,18 @@ case "$SUITE" in
         run_suite "Performance Tests" "${PROJECT_DIR}/test/performance" 15 "perf"
         ;;
     *)
-        echo "Usage: $0 [quick|func|hfunc|perf|all] [O0|O1|O2|O3|Oall]"
+        echo "Usage: $0 [quick|func|hfunc|perf|all] [O1|O0|o0|o1|o2|o3]"
         echo ""
         echo "  quick   - Quick smoke test (5 cases)"
         echo "  func    - Functional tests (100 cases)"
         echo "  hfunc   - H_functional tests (40 cases)"
         echo "  perf    - Performance tests (60 cases)"
         echo "  all     - All three suites"
+        echo ""
+        echo "优化级别:"
+        echo "  -O1  (大写) 测评服务器级别 → 全部优化 (OALL)"
+        echo "  -O0  (大写) 无优化"
+        echo "  -o0/-o1/-o2/-o3  (小写) 本地调试，精确控制各级优化"
         echo ""
         echo "Default: quick O0"
         exit 1

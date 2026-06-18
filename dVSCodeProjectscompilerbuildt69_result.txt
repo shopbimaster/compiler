@@ -1,0 +1,1 @@
+h -c cd\ /mnt/d/VSCodeProjects/compiler\ \&\&\ timeout\ 10\ ./build/compiler\ -S\ test/functional/69_expr_eval.sy\ -o\ /mnt/d/VSCodeProjects/compiler/build/t69f.s\ -O1\ 2\>\&1\;\ echo\ EXIT\=\$\?

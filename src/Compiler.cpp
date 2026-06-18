@@ -21,12 +21,13 @@ static void runOptPasses(Module* mod, OptLevel opt) {
         Opt::runO3(mod);
         break;
     case OptLevel::OALL:
+        // OALL = O1+O2+O3，对应命令行 -O1（测评服务器唯一支持的优化选项）
         Opt::runO1(mod);
         Opt::runO2(mod);
         Opt::runO3(mod);
-        // TODO: P0 (recursiveMulToNative, bitOpPatternRecognition) and
-        // P3 (instructionScheduling) cause SEGFAULTs in ~33 functional tests.
-        // Needs further investigation before re-enabling.
+        // P0 (recursiveMulToNative, bitOpPatternRecognition) 和
+        // P3 (instructionScheduling) 暂禁用，已知导致段错误
+        // 待修复后启用
         // Opt::runP0(mod);
         // Opt::runP3(mod);
         break;

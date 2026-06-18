@@ -1,4 +1,5 @@
 #include "backend/RegisterAllocator.h"
+#include "opt/Optimizer.h"
 #include <algorithm>
 #include <cassert>
 #include <set>
@@ -45,6 +46,19 @@ int RegisterAllocator::assignInstructionIds(IR::Function& func) {
 void RegisterAllocator::buildIntervals(IR::Function& func) {
     std::unordered_map<IR::Value*, int> firstSeen;
     std::unordered_map<IR::Value*, int> lastSeen;
+
+    // Build instId → block mapping and block → max instId mapping
+    std::unordered_map<int, IR::BasicBlock*> idToBlock;
+    std::unordered_map<IR::BasicBlock*, int> blockMaxId;
+    for (auto& bb : func.getBlocks()) {
+        int maxId = -1;
+        for (auto& inst : bb->getInstructions()) {
+            int curId = instId[inst.get()];
+            idToBlock[curId] = bb.get();
+            maxId = std::max(maxId, curId);
+        }
+        blockMaxId[bb.get()] = maxId;
+    }
 
     for (unsigned i = 0; i < func.getNumArgs(); ++i) {
         auto* arg = func.getArg(i);
@@ -95,6 +109,87 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
                 if (opTy && opTy->isFloat()) {
                     floatValues.insert(opVal);
                 }
+            }
+        }
+    }
+
+    // ================================================================
+    // Loop-aware liveness extension:
+    // Values defined outside a loop body but used inside must have
+    // their live intervals extended to cover the entire loop body.
+    // Without this, the linear scan allocator may assign the same
+    // register to a hoisted value and a loop-local value, causing
+    // the hoisted value to be clobbered across loop iterations.
+    // ================================================================
+    auto dom = Opt::computeDominators(&func);
+    auto preds = Opt::buildPredecessors(&func);
+    auto succs = Opt::buildSuccessors(&func);
+
+    // Find all loops (back-edges) and compute loop body sets
+    struct LoopInfo {
+        Opt::BBSet body;
+        int maxLoopId;
+    };
+    std::vector<LoopInfo> loops;
+
+    for (auto& bb : func.getBlocks()) {
+        for (auto* succ : succs[bb.get()]) {
+            if (Opt::strictlyDominates(succ, bb.get(), dom)) {
+                // Back-edge: bb → succ, where succ is the loop header
+                LoopInfo loop;
+                loop.body.insert(succ); // header is part of loop body
+
+                std::vector<IR::BasicBlock*> worklist;
+                std::unordered_set<IR::BasicBlock*> visited;
+                worklist.push_back(bb.get());
+                visited.insert(bb.get());
+
+                while (!worklist.empty()) {
+                    auto* cur = worklist.back();
+                    worklist.pop_back();
+                    loop.body.insert(cur);
+                    for (auto* p : preds[cur]) {
+                        if (!visited.count(p) && !loop.body.count(p)) {
+                            visited.insert(p);
+                            worklist.push_back(p);
+                        }
+                    }
+                }
+
+                loop.maxLoopId = -1;
+                for (auto* loopBB : loop.body) {
+                    auto it = blockMaxId.find(loopBB);
+                    if (it != blockMaxId.end()) {
+                        loop.maxLoopId = std::max(loop.maxLoopId, it->second);
+                    }
+                }
+                loops.push_back(std::move(loop));
+            }
+        }
+    }
+
+    // Extend intervals for values defined outside a loop but used inside
+    for (auto& loop : loops) {
+        for (auto it = firstSeen.begin(); it != firstSeen.end(); ++it) {
+            auto* val = it->first;
+            int startId = it->second;
+            int endId = lastSeen[val];
+
+            // Check if definition is outside the loop body
+            auto defBlockIt = idToBlock.find(startId);
+            if (defBlockIt == idToBlock.end()) continue;
+            if (loop.body.count(defBlockIt->second)) continue; // defined inside loop, skip
+
+            // Check if any use is inside the loop body
+            bool usedInLoop = false;
+            auto endBlockIt = idToBlock.find(endId);
+            if (endBlockIt != idToBlock.end() && loop.body.count(endBlockIt->second)) {
+                usedInLoop = true;
+            }
+
+            if (usedInLoop) {
+                // Extend the interval to cover the entire loop body
+                lastSeen[val] = std::max(lastSeen[val], loop.maxLoopId);
             }
         }
     }
