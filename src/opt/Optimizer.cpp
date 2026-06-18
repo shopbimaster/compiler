@@ -28,23 +28,23 @@ void runO2(IR::Module* mod) {
 }
 
 void runO3(IR::Module* mod) {
-    // TEMP: bisect which O3 pass causes timeout
-    // if (algebraicSimplification(mod)) { /* changed */ }
+    if (algebraicSimplification(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
-    // if (loopInterchange(mod)) { /* changed */ }
-    // constantFolding(mod);
-    // deadCodeElimination(mod);
-    // if (loopUnrolling(mod)) { /* changed */ }
-    // constantFolding(mod);
-    // deadCodeElimination(mod);
-    // if (tailRecursionElimination(mod)) { /* changed */ }
+    if (loopInterchange(mod)) { /* changed */ }
+    constantFolding(mod);
+    deadCodeElimination(mod);
+    if (loopUnrolling(mod)) { /* changed */ }
+    constantFolding(mod);
+    deadCodeElimination(mod);
+    if (tailRecursionElimination(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
 }
 
 void runP0(IR::Module* mod) {
-    if (recursiveMulToNative(mod)) { /* changed */ }
+    // recursiveMulToNative 已知导致 crypto 编译段错误，暂禁用
+    // if (recursiveMulToNative(mod)) { /* changed */ }
     if (bitOpPatternRecognition(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);

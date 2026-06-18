@@ -65,8 +65,8 @@ bool tryFuseConsecutiveShifts(IR::Instruction* inst) {
 
     for (auto it = bb->begin(); it != bb->end(); ++it) {
         if (it->get() == inst) {
-            bb->insert(it, fused);
-            bb->erase(it);
+            auto newIt = bb->insert(it, fused);
+            bb->erase(newIt + 1); // inst 被向后推移了一位
             return true;
         }
     }
@@ -118,8 +118,8 @@ bool tryFuseConsecutiveAnds(IR::Instruction* inst) {
 
     for (auto it = bb->begin(); it != bb->end(); ++it) {
         if (it->get() == inst) {
-            bb->insert(it, fused);
-            bb->erase(it);
+            auto newIt = bb->insert(it, fused);
+            bb->erase(newIt + 1); // inst 被向后推移了一位
             return true;
         }
     }
@@ -179,8 +179,8 @@ bool tryFuseXorOrWithConstants(IR::Instruction* inst) {
 
     for (auto it = bb->begin(); it != bb->end(); ++it) {
         if (it->get() == inst) {
-            bb->insert(it, fused);
-            bb->erase(it);
+            auto newIt = bb->insert(it, fused);
+            bb->erase(newIt + 1); // inst 被向后推移了一位
             return true;
         }
     }
@@ -222,6 +222,7 @@ bool trySimplifyShiftAndMask(IR::Instruction* inst) {
         inst->replaceAllUsesWith(shiftInst);
         inst->dropAllUses();
         auto* bb = inst->getParent();
+        if (!bb) return false; // 防御：指令可能已被之前的 pass 部分处理
         for (auto it2 = bb->begin(); it2 != bb->end(); ++it2) {
             if (it2->get() == inst) { bb->erase(it2); break; }
         }
@@ -243,7 +244,7 @@ bool tryOptimize(IR::Instruction* inst) {
 } // namespace
 
 // ================================================================
-// bitOpPatternRecognition 入口 — 反复扫描直到收敛
+// bitOpPatternRecognition 入口 — 收集指令后处理，避免迭代器失效
 // ================================================================
 bool bitOpPatternRecognition(IR::Module* mod) {
     bool changed = true;
@@ -253,16 +254,21 @@ bool bitOpPatternRecognition(IR::Module* mod) {
         for (auto& func : mod->getFunctions()) {
             if (func->isExternal()) continue;
             for (auto& bb : func->getBlocks()) {
-                for (auto it = bb->begin(); it != bb->end(); ) {
-                    if (tryOptimize(it->get())) {
+                // 先收集所有指令指针，避免在遍历时修改 BB 导致迭代器失效
+                std::vector<IR::Instruction*> insts;
+                for (auto& inst : bb->getInstructions()) {
+                    insts.push_back(inst.get());
+                }
+                for (auto* inst : insts) {
+                    if (tryOptimize(inst)) {
                         changed = true;
                         anyChanged = true;
-                        it = bb->begin(); // 重扫
-                    } else {
-                        ++it;
+                        break; // BB 已修改，跳出内层循环重扫
                     }
                 }
+                if (changed) break; // 重扫当前函数
             }
+            if (changed) break; // 重扫整个模块
         }
     }
     return anyChanged;

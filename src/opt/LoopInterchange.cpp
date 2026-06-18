@@ -145,7 +145,7 @@ void replaceIncrementInBB(IR::BasicBlock* bb, IR::Value* from, IR::Value* to) {
     }
 }
 
-// ---- 替换 ICMP 中 LOAD from 的指针操作数 ----
+// ---- 替换 ICMP 中 LOAD from 的指针操作数，同时交换常量 bound ----
 void replaceCmpLoadInBB(IR::BasicBlock* bb, IR::Value* from, IR::Value* to) {
     for (auto& inst : bb->getInstructions()) {
         if (inst->getOpcode() != IR::Instruction::Opcode::ICMP) continue;
@@ -156,6 +156,93 @@ void replaceCmpLoadInBB(IR::BasicBlock* bb, IR::Value* from, IR::Value* to) {
                 load->setOperand(0, to);
                 return;
             }
+        }
+    }
+}
+
+// ---- 交换 outer/inner header 中 ICMP 的常量 bound ----
+// 循环交换后，outer loop bound 应从 M 变为 N，inner loop bound 应从 N 变为 M。
+// 当 ICMP 的一个操作数是 LOAD from 全局变量时（如 @M、@N），交换这些 LOAD 的全局引用。
+// 当 ICMP 的一个操作数是 ConstantInt 时，交换这些常量。
+void swapICmpConstants(IR::BasicBlock* outerHeader, IR::BasicBlock* innerHeader) {
+    IR::Instruction* outerICmp = nullptr;
+    IR::Instruction* innerICmp = nullptr;
+    for (auto& inst : outerHeader->getInstructions()) {
+        if (inst->getOpcode() == IR::Instruction::Opcode::ICMP) {
+            outerICmp = inst.get(); break;
+        }
+    }
+    for (auto& inst : innerHeader->getInstructions()) {
+        if (inst->getOpcode() == IR::Instruction::Opcode::ICMP) {
+            innerICmp = inst.get(); break;
+        }
+    }
+    if (!outerICmp || !innerICmp) return;
+
+    // 尝试交换 ConstantInt（如 i < 64 这种字面量 bound）
+    IR::ConstantInt* outerConst = nullptr;
+    unsigned outerConstIdx = 0;
+    IR::ConstantInt* innerConst = nullptr;
+    unsigned innerConstIdx = 0;
+
+    for (unsigned i = 0; i < outerICmp->getNumOperands(); ++i) {
+        auto* ci = dynamic_cast<IR::ConstantInt*>(outerICmp->getOperand(i));
+        if (ci) { outerConst = ci; outerConstIdx = i; break; }
+    }
+    for (unsigned i = 0; i < innerICmp->getNumOperands(); ++i) {
+        auto* ci = dynamic_cast<IR::ConstantInt*>(innerICmp->getOperand(i));
+        if (ci) { innerConst = ci; innerConstIdx = i; break; }
+    }
+
+    if (outerConst && innerConst) {
+        outerICmp->setOperand(outerConstIdx, innerConst);
+        innerICmp->setOperand(innerConstIdx, outerConst);
+        return;
+    }
+
+    // 尝试交换 LOAD from 全局变量（如 LOAD @M、LOAD @N）
+    // ICMP 有两个操作数：一个是 LOAD from 局部 ALLOCA（循环变量），
+    // 另一个是 LOAD from 全局变量（循环边界）。交换后者。
+    for (unsigned i = 0; i < outerICmp->getNumOperands(); ++i) {
+        auto* outerLoad = dynamic_cast<IR::Instruction*>(outerICmp->getOperand(i));
+        if (!outerLoad || outerLoad->getOpcode() != IR::Instruction::Opcode::LOAD) continue;
+        auto* outerPtr = outerLoad->getOperand(0);
+        if (!outerPtr || !dynamic_cast<IR::GlobalVariable*>(outerPtr)) continue;
+
+        for (unsigned j = 0; j < innerICmp->getNumOperands(); ++j) {
+            auto* innerLoad = dynamic_cast<IR::Instruction*>(innerICmp->getOperand(j));
+            if (!innerLoad || innerLoad->getOpcode() != IR::Instruction::Opcode::LOAD) continue;
+            auto* innerPtr = innerLoad->getOperand(0);
+            if (!innerPtr || !dynamic_cast<IR::GlobalVariable*>(innerPtr)) continue;
+
+            outerLoad->setOperand(0, innerPtr);
+            innerLoad->setOperand(0, outerPtr);
+            return;
+        }
+    }
+}
+
+// ---- 将 ALLOCA 指令移动到 entry block ----
+// 当内层循环变量的 ALLOCA 不在 entry block 时，需要先移到 entry block，
+// 否则交换后 entry block 的 STORE 会引用未定义的 ALLOCA
+void moveAllocaToEntry(IR::Function* func, IR::Value* allocaVal) {
+    auto* allocaInst = dynamic_cast<IR::Instruction*>(allocaVal);
+    if (!allocaInst || allocaInst->getOpcode() != IR::Instruction::Opcode::ALLOCA) return;
+    auto* parentBB = allocaInst->getParent();
+    if (!parentBB) return;
+    auto* entry = func->getEntryBlock();
+    if (!entry || parentBB == entry) return;
+
+    // 从原 BB 中移除 ALLOCA，插入到 entry block 末尾（terminator 之前）
+    for (auto it = parentBB->begin(); it != parentBB->end(); ++it) {
+        if (it->get() == allocaInst) {
+            auto node = std::move(*it);
+            parentBB->erase(it);
+
+            auto termIt = entry->end();
+            --termIt; // terminator 之前
+            entry->insert(termIt, node.release());
+            break;
         }
     }
 }
@@ -267,6 +354,9 @@ bool tryInterchange(IR::Function* func) {
             if (outer.body.count(outerExit)) continue;
 
             auto* entry = func->getEntryBlock();
+            // 将 innerVar 的 ALLOCA 移到 entry block，避免 entry block 的 STORE 引用未定义值
+            moveAllocaToEntry(func, innerVar);
+
             if (entry)
                 replaceStore0InBB(entry, outerVar, innerVar);
 
@@ -275,6 +365,10 @@ bool tryInterchange(IR::Function* func) {
             replaceIncrementInBB(outerLatch, outerVar, innerVar);
             replaceCmpLoadInBB(outer.header, outerVar, innerVar);
             replaceCmpLoadInBB(inner.header, innerVar, outerVar);
+
+            // 交换 ICMP 常量 bound：outer loop 的 bound 从 M→N，inner loop 的 bound 从 N→M
+            // 修复非方阵 array[M][N] 交换后越界的问题（如 31_many_indirections）
+            swapICmpConstants(outer.header, inner.header);
 
             changed = true;
             break;

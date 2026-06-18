@@ -85,12 +85,21 @@ int inferTripCount(IR::BasicBlock* header) {
     return -1;
 }
 
-// ---- 判断 BB 是否为简单循环体（无 break/continue/嵌套循环） ----
+// ---- 判断 BB 是否为简单循环体（无 break/continue/if/嵌套循环） ----
+// 必须确保循环体中除了末尾的 BR 终止指令外，不存在其他 BR 或 COND_BR，
+// 否则 continue/break/if 语句会破坏循环展开的语义正确性。
 bool isSimpleBody(IR::BasicBlock* bodyBB) {
-    for (auto& inst : bodyBB->getInstructions()) {
-        auto op = inst->getOpcode();
+    auto& insts = bodyBB->getInstructions();
+    for (auto it = insts.begin(); it != insts.end(); ++it) {
+        auto op = (*it)->getOpcode();
         if (op == IR::Instruction::Opcode::CALL) return false;
         if (op == IR::Instruction::Opcode::PHI) return false;
+        // 检查是否为非终止指令的 BR/COND_BR（continue/break/if）
+        auto next = it; ++next;
+        if (next != insts.end()) {
+            if (op == IR::Instruction::Opcode::BR) return false;
+            if (op == IR::Instruction::Opcode::COND_BR) return false;
+        }
     }
     return true;
 }
@@ -119,7 +128,7 @@ IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId,
 
     if (op == Opc::STORE) {
         auto* val = lookup(src->getOperand(0));
-        auto* ptr = src->getOperand(1);
+        auto* ptr = lookup(src->getOperand(1));
         return IR::Instruction::createStore(val, ptr);
     }
 
