@@ -98,18 +98,28 @@ bool trySimplify(IR::Instruction* inst) {
 
         // ================================================================
         // 强度削减：幂运算 → 移位/位与
+        // 注意：SDIV/SREM 的强度削减仅对非负数正确，因为：
+        //   - ASHR 向负无穷舍入，而 C 除法的 SDIV 向零舍入
+        //   - AND 得到非负低 N 位，而 C 取余的 SREM 保留被除数符号
+        // 因此仅当左操作数为非负常量时才安全应用。
+        // MUL 的强度削减对所有整数均正确。
         // ================================================================
         int shift = isPowerOfTwo(rv);
         if (shift >= 0) {
             auto* i32 = dynamic_cast<IR::IntegerType*>(rc->getType());
             if (!i32) return false;
 
-            if (op == Opc::SDIV) {
-                // x / 2^n  →  x >> n
+            // 检查左操作数是否可证明为非负（仅常量检查）
+            bool lhsNonNeg = false;
+            if (auto* lc = dynamic_cast<IR::ConstantInt*>(l)) {
+                lhsNonNeg = (lc->getValue() >= 0);
+            }
+
+            if (op == Opc::SDIV && lhsNonNeg) {
+                // x / 2^n  →  x >> n    (仅 x >= 0 时正确)
                 auto* shiftVal = IR::ConstantInt::get(i32, shift);
                 auto* repl = IR::Instruction::createBinOp(
                     Opc::ASHR, inst->getType(), inst->getName() + ".sr", l, shiftVal);
-                // 找到 inst 在 BB 中的位置并替换
                 for (auto it = bb->begin(); it != bb->end(); ++it) {
                     if (it->get() == inst) {
                         replaceWithNewInst(it, inst, repl);
@@ -117,8 +127,8 @@ bool trySimplify(IR::Instruction* inst) {
                     }
                 }
             }
-            if (op == Opc::SREM) {
-                // x % 2^n  →  x & (2^n - 1)
+            if (op == Opc::SREM && lhsNonNeg) {
+                // x % 2^n  →  x & (2^n - 1)    (仅 x >= 0 时正确)
                 auto* maskVal = IR::ConstantInt::get(i32, rv - 1);
                 auto* repl = IR::Instruction::createBinOp(
                     Opc::AND, inst->getType(), inst->getName() + ".sr", l, maskVal);
@@ -130,7 +140,7 @@ bool trySimplify(IR::Instruction* inst) {
                 }
             }
             if (op == Opc::MUL) {
-                // x * 2^n  →  x << n
+                // x * 2^n  →  x << n    (对所有整数均正确)
                 auto* shiftVal = IR::ConstantInt::get(i32, shift);
                 auto* repl = IR::Instruction::createBinOp(
                     Opc::SHL, inst->getType(), inst->getName() + ".sr", l, shiftVal);

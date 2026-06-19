@@ -160,6 +160,42 @@ void replaceCmpLoadInBB(IR::BasicBlock* bb, IR::Value* from, IR::Value* to) {
     }
 }
 
+// ---- 替换 BB 中所有 LOAD from 的指针操作数 ----
+// 循环交换时，ALLOCA 值已交换，循环体内的 LOAD 指令也需要交换
+// 以保持数组索引计算的一致性。例如 A[i][k] 在交换后应仍为 A[i][k]，
+// 而不是因为 ALLOCA 值交换而变成 A[k][i]。
+void replaceLoadInBB(IR::BasicBlock* bb, IR::Value* from, IR::Value* to) {
+    for (auto& inst : bb->getInstructions()) {
+        if (inst->getOpcode() != IR::Instruction::Opcode::LOAD) continue;
+        if (inst->getOperand(0) == from) {
+            inst->setOperand(0, to);
+        }
+    }
+}
+
+// ---- 在 BB 中双向交换 LOAD 引用（from↔to），单次遍历避免重复交换 ----
+void swapLoadsInBB(IR::BasicBlock* bb, IR::Value* a, IR::Value* b) {
+    for (auto& inst : bb->getInstructions()) {
+        if (inst->getOpcode() != IR::Instruction::Opcode::LOAD) continue;
+        if (inst->getOperand(0) == a) {
+            inst->setOperand(0, b);
+        } else if (inst->getOperand(0) == b) {
+            inst->setOperand(0, a);
+        }
+    }
+}
+
+// ---- 在 BB 中替换 STORE 的指针操作数（from→to） ----
+// 用于交换自增链中的 STORE 指针，仅在 LOAD 已交换后调用
+void replaceStorePtrInBB(IR::BasicBlock* bb, IR::Value* from, IR::Value* to) {
+    for (auto& inst : bb->getInstructions()) {
+        if (inst->getOpcode() != IR::Instruction::Opcode::STORE) continue;
+        if (inst->getOperand(1) == from) {
+            inst->setOperand(1, to);
+        }
+    }
+}
+
 // ---- 交换 outer/inner header 中 ICMP 的常量 bound ----
 // 循环交换后，outer loop bound 应从 M 变为 N，inner loop bound 应从 N 变为 M。
 // 当 ICMP 的一个操作数是 LOAD from 全局变量时（如 @M、@N），交换这些 LOAD 的全局引用。
@@ -360,9 +396,26 @@ bool tryInterchange(IR::Function* func) {
             if (entry)
                 replaceStore0InBB(entry, outerVar, innerVar);
 
-            replaceStore0InBB(outerBody, innerVar, outerVar);
-            replaceIncrementInBB(innerBody, innerVar, outerVar);
-            replaceIncrementInBB(outerLatch, outerVar, innerVar);
+            // 交换步骤：
+            // 1. 先交换循环体内所有 LOAD 引用（保持数组索引计算一致性）
+            //    例如 A[i][k] 的 LOAD(i)↔LOAD(k) 同步交换
+            swapLoadsInBB(innerBody, innerVar, outerVar);
+            swapLoadsInBB(outerBody, innerVar, outerVar);
+            swapLoadsInBB(outerLatch, innerVar, outerVar);
+
+            // 2. 交换 LOAD 后，自增链变为：
+            //    innerBody: LOAD(outerVar) → ADD 1 → STORE(innerVar)
+            //    outerLatch: LOAD(innerVar) → ADD 1 → STORE(outerVar)
+            //    需要修正 STORE 指针以匹配交换后的 LOAD
+            replaceStorePtrInBB(innerBody, innerVar, outerVar);
+            replaceStorePtrInBB(outerLatch, outerVar, innerVar);
+
+            // 3. 交换 outerBody 中的初始化 STORE（STORE 0, innerVar → STORE 0, outerVar）
+            //    注意：outerBody 中的 LOAD 已在步骤1中交换，STORE 指针需同步
+            replaceStorePtrInBB(outerBody, innerVar, outerVar);
+
+            // 4. 交换 ICMP 中的 LOAD 引用（已在步骤1中通过 swapLoadsInBB 处理）
+            //    但 header 中的 ICMP 未在步骤1中处理，需单独处理
             replaceCmpLoadInBB(outer.header, outerVar, innerVar);
             replaceCmpLoadInBB(inner.header, innerVar, outerVar);
 

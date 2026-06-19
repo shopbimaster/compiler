@@ -387,6 +387,10 @@ bool convertToNativeMul(IR::Function* func) {
 
     auto* bodyBB = func->createBlock("bb_native");
 
+    // entry → bodyBB 分支
+    auto* brInst = IR::Instruction::createBr(bodyBB);
+    entry->pushBack(brInst);
+
     auto* loadA = IR::Instruction::createLoad(i32, allocaA, "t0");
     auto* loadB = IR::Instruction::createLoad(i32, allocaB, "t1");
     auto* mulInst = IR::Instruction::createBinOp(
