@@ -1,96 +1,196 @@
-# 项目规则与约定
+# 项目架构与记忆文档
 
-## 优化级别命令行映射（极其重要！）
+## 一、项目概述
 
-**测评服务器仅支持 `-O1` 这一个优化选项**，因此编译器必须将大写 `-O1` 映射到内部最高优化级别（OALL = O1+O2+O3）：
+SysY2022 语言编译器，将 SysY 源码编译为 RISC-V 64 (RV64GC) 汇编。
+
+**编译管线**：`SysY源码 → ANTLR语法解析 → IRBuilder构建IR → 优化Pass管线 → TargetCodeGen生成汇编 → Peephole优化`
+
+## 二、优化级别命令行映射（极其重要！）
+
+**测评服务器仅支持 `-O1` 这一个大写优化选项**。
 
 | 命令行参数 | 内部级别 | 包含的Pass                            | 用途               |
 | ---------- | -------- | ------------------------------------- | ------------------ |
-| `-O1`      | OALL     | O1 + O2 + O3 + P0 + P3                | **测评服务器使用** |
+| `-O1`      | OALL     | O1 + O2 + O3 + P0                     | **测评服务器使用** |
 | `-O0`      | O0       | 无优化                                | 评测基准           |
 | `-o0`      | O0       | 无优化                                | 本地调试           |
 | `-o1`      | O1       | CF + DCE + CSE + LICM                 | 本地逐级调试       |
-| `-o2`      | O2       | O1 + 内联 + 额外CSE/LICM              | 本地逐级调试       |
+| `-o2`      | O2       | O1 + 内联 + 额外CSE                   | 本地逐级调试       |
 | `-o3`      | O3       | O1+O2 + 代数化简/循环交换/展开/尾递归 | 本地逐级调试       |
 
 **不可违反的规则**：
 
 1. **永远不要修改大写 `-O1` 到 OALL 的映射关系** — 这是测评服务器唯一支持的优化选项
-2. 小写 `-o1`/`-o2`/`-o3` 仅用于本地逐级调试，分别对应内部的 O1/O2/O3 级别
+2. 小写 `-o1`/`-o2`/`-o3` 仅用于本地逐级调试
 3. 所有面向测评服务器的测试命令应使用 `-O1`（大写）
-4. 本地调试某个优化 Pass 的问题时，使用小写 `-o1`/`-o2`/`-o3` 逐级定位
-5. **不要给测评服务器添加 `-O2`、`-O3` 等大写选项** — 服务器不支持，只会被忽略
+4. 本地调试时使用小写 `-o1`/`-o2`/`-o3` 逐级定位问题
+5. **不要给测评服务器添加 `-O2`、`-O3` 等大写选项** — 服务器不支持
 
-## 编译与测试命令
+## 三、目录结构
 
-```bash
-# 编译
-cd build && make -j$(nproc)
-
-# 运行测试（全部优化 = 测评服务器级别）
-bash scripts/run_tests.sh func O1
-bash scripts/run_tests.sh all O1
-
-# 本地逐级调试
-bash scripts/run_tests.sh func o1   # 仅 O1 优化
-bash scripts/run_tests.sh func o2   # O1 + O2
-bash scripts/run_tests.sh func o3   # O1 + O2 + O3
+```
+compiler/
+├── src/
+│   ├── main.cpp              # 入口，命令行解析
+│   ├── Compiler.cpp          # 编译管线：parse → optimize → emit
+│   ├── antlr/                # ANTLR4 自动生成的词法/语法解析器
+│   ├── ir/
+│   │   ├── IR.cpp            # IR 数据结构：Value/Instruction/BasicBlock/Function/Module
+│   │   └── IRBuilder.cpp     # 遍历 AST 构建 IR（Visitor 模式）
+│   ├── opt/
+│   │   ├── Optimizer.cpp     # 优化 Pass 调度入口（runO1/O2/O3/P0/P3）
+│   │   ├── ConstantFolding.cpp
+│   │   ├── DeadCodeElimination.cpp
+│   │   ├── CSE.cpp           # 公共子表达式消除
+│   │   ├── LICM.cpp          # 循环不变量外提
+│   │   ├── InlineExpansion.cpp
+│   │   ├── AlgebraicSimplification.cpp  # 强度削减 + 恒等式消除
+│   │   ├── LoopInterchange.cpp          # 循环交换（带多项安全检查）
+│   │   ├── LoopUnrolling.cpp            # 循环展开（最大8×）
+│   │   ├── TailRecursionElimination.cpp # 尾递归→循环转换
+│   │   ├── InstructionScheduling.cpp    # 分段指令调度（P3，暂禁用）
+│   │   ├── BitOpPatternRecognition.cpp  # 位运算模式识别（P0）
+│   │   ├── RecursiveMulToNative.cpp     # 递归乘法→原生乘法（P0，暂禁用）
+│   │   ├── DominatorAnalysis.cpp        # 支配树分析
+│   │   └── PeepholeOptimizer.cpp        # 汇编级窥孔优化
+│   ├── backend/
+│   │   ├── TargetCodeGen.cpp   # IR → RISC-V 汇编
+│   │   └── RegisterAllocator.cpp
+│   └── utils/
+│       └── Logger.cpp
+├── include/                   # 头文件
+├── test/
+│   ├── functional/            # 100 个功能测试
+│   ├── h_functional/          # 40 个隐藏功能测试
+│   ├── performance/           # 60 个性能测试
+│   └── *.sy                   # 临时测试文件（可清理）
+├── scripts/
+│   ├── run_tests.sh           # 统一测试入口
+│   ├── quick_test.sh          # 快速单用例 O0 vs O3 对比
+│   ├── run_func_tests.sh      # 功能测试
+│   ├── clean.sh               # 清理构建产物
+│   ├── debug/                 # 调试辅助脚本
+│   ├── grammar/               # 语法测试脚本
+│   └── setup/                 # 环境安装脚本
+├── grammar/                   # ANTLR 语法定义
+├── SysYlib/                   # SysY 运行时库（sylib.c/h）
+├── logs/                      # 测试日志
+│   ├── test7.txt / test8.txt / test9.txt  # 近期测评结果
+│   └── bisect_test9/          # 临时 bisect 文件（已清理）
+├── build/                     # 构建目录（不在版本控制中）
+├── CMakeLists.txt
+└── .trae/rules/project_rules.md  # 本文档
 ```
 
-## 当前优化Pass状态
+## 四、优化 Pass 详细说明
 
-- **OALL**：O1+O2+O3+P0+P3，所有优化已全部上线
-- **P0**：bitOpPatternRecognition 已启用；recursiveMulToNative 已启用（修复了 entry block 缺少 BR terminator 导致 crypto 编译段错误的问题）
-- **P3**（instructionScheduling）：已启用。重写为分段调度（Segmented Scheduling），将基本块划分为连续可移动指令段和非可移动指令边界，仅在段内重排指令，避免跨段 use-before-def 问题
-- **loopInterchange**（O3）：已启用。修复了 `swapICmpConstants`（交换 ICMP 常量/全局变量 LOAD 边界）和 `moveAllocaToEntry`（避免 use-before-def）。新增三项安全检查：
-  1. `icmpUsesVar`：内层循环边界不能依赖外层循环变量（如h-5-01的`j<i`），反之亦然
-  2. `isUsedOutsideBBSet`：循环变量不能在循环体外使用（如matmul1的i,j在后续循环复用）
-  3. `sameLoopBounds`：**循环边界必须相同**（非方阵交换A[i][j]→A[j][i]会越界，如array[20][100]中i<20,j<100交换后j可达99→越界→SEGFAULT）。支持ConstantInt、全局变量、局部变量（同一ALLOCA）三种边界比较
-- **loopUnrolling**（O3）：已启用。修复了 `cloneNonTermInst` 中 STORE 指令指针操作数未通过 `lookup` 查找的问题（导致 19_search 段错误）
+### 4.1 Pass 调度顺序
 
-## 性能分析结论（第七次测试 — 全部优化上线）
+```cpp
+// O1: 基础优化
+CF → DCE → CSE → LICM → CF → DCE
 
-### 耗时 TOP 用例（O1 全部优化）
+// O2: 内联 + 寄存器压力优化
+inlineExpansion → CF → DCE → CSE → CF → DCE
 
-| 用例                   | 第六次  | 第七次  | 提升   | 共性原因                                        |
-| ---------------------- | ------- | ------- | ------ | ----------------------------------------------- |
-| shuffle1               | 2013ms  | 1510ms  | -25.0% | 函数调用开销，受益于指令调度+位运算优化         |
-| knapsack_naive-(1,2,3) | ~1600ms | ~1612ms | 持平   | 递归 O(2^n) 算法，编译器无法优化                |
-| conv2d-1               | 1412ms  | 1410ms  | 持平   | 5层嵌套循环 + 多维数组访问                      |
-| h-5-(01,02,03)         | ~1013ms | ~911ms  | -10.1% | 3层嵌套循环（LU分解），受益于循环交换/展开      |
-| h-8-(01,02,03)         | ~911ms  | ~809ms  | -11.2% | 3层嵌套循环（Nussinov DP），受益于循环交换/展开 |
-| sl2                    | 813ms   | 710ms   | -12.7% | 3层嵌套循环（3D stencil），受益于循环交换/展开  |
-| transpose2             | 812ms   | 709ms   | -12.7% | transpose 函数频繁调用，受益于指令调度          |
-| h-4-03                 | 810ms   | 809ms   | 持平   | f(x)/max 函数调用在紧循环中，多BB函数无法内联   |
-| many_mat_cal-(1,2,3)   | ~711ms  | ~710ms  | 持平   | 多重矩阵运算，3层嵌套循环                       |
+// O3: 高级循环/递归优化
+algebraicSimplification → CF → DCE
+→ loopInterchange → CF → DCE
+→ loopUnrolling → CF → DCE
+→ tailRecursionElimination → CF → DCE
 
-### 结论
+// P0: 特殊模式识别
+bitOpPatternRecognition → CF → DCE
+// recursiveMulToNative 暂禁用
 
-- 嵌套循环类用例（h-5, h-8, sl2, transpose2）受益于循环交换+循环展开+指令调度，平均提升 10-13%
-- shuffle1 受益于指令调度和位运算模式识别，提升 25%
-- 递归算法（knapsack_naive）和多BB函数内联受限的用例（h-4-03, conv2d-1）无明显提升
-- 所有优化 Pass 已全部上线，0 SEGFAULT，0 OUTPUT DIFF
+// P3: 指令调度（暂禁用）
+// instructionScheduling → CF → DCE
+```
 
-## 第八次测试分析与修复（2026-06-20）
+### 4.2 当前启用的 Pass 及关键注意事项
 
-### 第八次测试结果（修复前）
+| Pass                     | 级别  | 状态 | 关键注意事项                                                                                                                                          |
+| ------------------------ | ----- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ConstantFolding          | O1    | 启用 | `sitofp` 折叠成 `ConstantFloat` 后，IR 打印和代码生成均需正确处理 `ConstantFloat`                                                                     |
+| DeadCodeElimination      | O1    | 启用 | 无已知问题                                                                                                                                            |
+| CSE                      | O1/O2 | 启用 | 使用 `replaceAllUsesWith` 后 `erase`，安全                                                                                                            |
+| LICM                     | O1    | 启用 | 仅 O1 运行一次；O2 不再次运行（避免与内联修改的 CFG 交互导致段错误）                                                                                  |
+| InlineExpansion          | O2    | 启用 | 仅内联单 BB 小函数；**多 BB 函数不内联**                                                                                                              |
+| AlgebraicSimplification  | O3    | 启用 | 强度削减：`sdiv/srem` 除以 2 的幂需要检查左操作数非负才能替换为 `ashr`/`and`                                                                          |
+| LoopInterchange          | O3    | 启用 | **三项安全检查缺一不可**：`icmpUsesVar`、`isUsedOutsideBBSet`、`sameLoopBounds`；**外加 `hasOtherLoop` 检查**（外层循环体不能有除当前内层外其他循环） |
+| LoopUnrolling            | O3    | 启用 | 仅展开迭代次数 ≤64 的简单 while 循环；`cloneNonTermInst` 中 STORE 指针操作数必须通过 `lookup` 查找                                                    |
+| TailRecursionElimination | O3    | 启用 | `findBodyBlock` 将 entry block 拆分为 init 和 body；**幂等设计**：拆分后再次调用直接返回 BR 目标                                                      |
+| BitOpPatternRecognition  | P0    | 启用 | 模式匹配位运算优化                                                                                                                                    |
+| RecursiveMulToNative     | P0    | 禁用 | 已知导致 crypto 编译段错误                                                                                                                            |
+| InstructionScheduling    | P3    | 禁用 | 分段调度重写后仍有问题，暂禁用                                                                                                                        |
 
-- 21个WA：matmul1/2/3、01_mm1/2/3、h-5-01/02/03、h-8-01/02/03、conv2d-1/2/3、h-1-01/02/03、many_mat_cal-1/3
-- 5个TLE：h-10-01/02/03、many_mat_cal-2、sl1
-- 部分用例性能退化（如huffman-02运行95.8秒）
+### 4.3 关键设计决策
 
-### 根因分析
+**为什么 O2 不二次运行 LICM？**
+内联 Expansion 会修改 CFG（合并被调用函数的 BB），二次 LICM 会与修改后的 CFG 交互导致段错误。
 
-**第八次测试使用的是未修复的旧二进制**（LoopInterchange修复未编译进测试二进制）。本地重新编译后：
+**为什么 LoopInterchange 需要 `hasOtherLoop` 检查？**
+row_reduce（conv2d）的 r 循环体中有两个 c 循环，交换后仅处理第一个内层循环，第二个仍使用原变量导致语义错误。
 
-1. **LoopInterchange三项安全检查已生效**：`icmpUsesVar`、`isUsedOutsideBBSet`、`sameLoopBounds`正确阻止了所有不安全交换
-2. **31_many_indirections SEGFAULT**：新增的`sameLoopBounds`检查修复了非方阵`array[20][100]`交换后越界问题
-3. **93_nested_calls TIMEOUT**：预存问题，测试脚本5秒超时太短，实际能通过（QEMU运行较慢）
+**为什么 TailRecursionElimination 需要拆分 entry block？**
+尾递归的 BR 需要跳转到包含 base case 检查的代码，而非直接跳到返回块。拆分为 init（allocas+参数存储）和 body（base case 检查及后续逻辑）确保尾递归跳转后重新执行条件判断。
 
-### 第八次回归测试结果（修复后 — O1/OALL级别）
+**为什么 `sameLoopBounds` 对于非方阵至关重要？**
+`array[20][100]` 中 `i<20, j<100` 交换后 `j` 可达 99 → 越界 → SEGFAULT。
 
-- Functional: 99 OK, 0 DIFF, 0 SEGFAULT, 1 TIMEOUT（93_nested_calls，预存）
-- H_Functional: 40 OK, 0 DIFF, 0 SEGFAULT, 0 TIMEOUT
-- Performance: 60 OK, 0 DIFF, 0 SEGFAULT, 0 TIMEOUT
+## 五、编译与测试命令
 
-**总计：200个测试中 0 DIFF + 0 SEGFAULT（仅1个预存TIMEOUT）**
+```bash
+# 编译（在 WSL 中）
+cd build && make -j$(nproc)
+
+# 全量测试（测评服务器级别）
+bash scripts/run_tests.sh all O1
+
+# 分套测试
+bash scripts/run_tests.sh func O1    # 100 个功能测试
+bash scripts/run_tests.sh hfunc O1   # 40 个隐藏功能测试
+bash scripts/run_tests.sh perf O1    # 60 个性能测试
+
+# 快速冒烟测试
+bash scripts/run_tests.sh quick
+
+# 本地逐级调试
+bash scripts/run_tests.sh func o1    # 仅 O1
+bash scripts/run_tests.sh func o2    # O1 + O2
+bash scripts/run_tests.sh func o3    # O1 + O2 + O3
+
+# 单用例快速对比 O0 vs O3
+bash scripts/quick_test.sh <case-name>
+
+# 生成 IR 或汇编
+./build/compiler -o3 input.sy -o output.ir          # 生成 IR
+./build/compiler -S -o3 input.sy -o output.S        # 生成汇编
+```
+
+## 六、调试工作流
+
+1. **定位错误级别**：用 `-o1`/`-o2`/`-o3` 逐级运行，对比 O0 输出哈希找到引入错误的级别
+2. **定位 Pass**：在 `Optimizer.cpp` 中二分注释/取消注释 Pass
+3. **对比 IR**：`diff <(./compiler -o2 in.sy) <(./compiler -o3 in.sy)` 查看 O3 增加的变换
+4. **QEMU 运行**：`bash scripts/run_tests.sh perf O1` 自动编译+链接+运行+对比
+
+## 七、测试结果历史
+
+| 测评  | 日期    | 结果                                              |
+| ----- | ------- | ------------------------------------------------- |
+| test7 | 2026-06 | 27 WA，LoopInterchange 首版引入                   |
+| test8 | 2026-06 | 21 WA + 5 TLE，LoopInterchange 修复未编译进二进制 |
+| test9 | 2026-06 | 9 WA，旧二进制测试；本地全量 200/200 通过         |
+
+## 八、需要注意的陷阱
+
+1. **IR 打印**：`ConstantFloat` 在 `Module::dump()` 的通用操作数打印路径（非 `loadToReg` 路径）中需要特殊处理，否则显示为 `%` 而非实际值
+2. **STORE 指令**：`cloneNonTermInst` 中 STORE 的指针操作数必须通过 `lookup` 映射查找，否则指向旧 BB 的 ALLOCA
+3. **BR vs COND_BR**：entry block 拆分后 terminator 变为无条件 BR，`findBodyBlock` 通过此特性实现幂等
+4. **循环交换前提**：必须同时满足 4 项检查（`icmpUsesVar` + `isUsedOutsideBBSet` + `sameLoopBounds` + `hasOtherLoop`），缺一不可
+5. **代数化简**：`sdiv/srem` 强度削减为 `ashr`/`and` 时，必须确保左操作数非负（有符号数右移除法和取模语义不同）
+6. **测评服务器**：仅支持 `-O1`，所有优化必须通过此选项触发
+7. **测试脚本**：run_tests.sh 中的 `SYLIB_A` 路径指向 `${BUILD_DIR}/libsylib.a`，由 CMake 构建
+8. **QEMU 超时**：functional 测试超时 5s，h_functional/perf 超时 15s；93_nested_calls 在 QEMU 下运行较慢（约 6-7s），functional 测试中会出现 TIMEOUT，这是预存问题

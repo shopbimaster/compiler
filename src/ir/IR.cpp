@@ -434,6 +434,8 @@ namespace IR {
                             oss << val->getType()->toString() << " ";
                             if (auto* ci = dynamic_cast<ConstantInt*>(val)) {
                                 oss << ci->getValue();
+                            } else if (auto* cf = dynamic_cast<ConstantFloat*>(val)) {
+                                oss << cf->getValue();
                             } else {
                                 oss << "%" << val->getName();
                             }
@@ -459,6 +461,8 @@ namespace IR {
                             oss << "store " << val->getType()->toString() << " ";
                             if (auto* ci = dynamic_cast<ConstantInt*>(val))
                                 oss << ci->getValue();
+                            else if (auto* cf = dynamic_cast<ConstantFloat*>(val))
+                                oss << cf->getValue();
                             else
                                 oss << "%" << val->getName();
                             oss << ", " << ptr->getType()->toString() << " %" << ptr->getName() << "\n";
@@ -480,6 +484,8 @@ namespace IR {
                                 oss << v->getType()->toString() << " ";
                                 if (auto* ci = dynamic_cast<ConstantInt*>(v))
                                     oss << ci->getValue();
+                                else if (auto* cf = dynamic_cast<ConstantFloat*>(v))
+                                    oss << cf->getValue();
                                 else
                                     oss << "%" << v->getName();
                             }
@@ -517,6 +523,8 @@ namespace IR {
                                 oss << "null";
                             } else if (auto* ci = dynamic_cast<ConstantInt*>(v)) {
                                 oss << ci->getValue();
+                            } else if (auto* cf = dynamic_cast<ConstantFloat*>(v)) {
+                                oss << cf->getValue();
                             } else {
                                 oss << "%" << v->getName();
                             }

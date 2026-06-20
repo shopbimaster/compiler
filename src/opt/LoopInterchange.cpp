@@ -385,16 +385,21 @@ bool tryInterchange(IR::Function* func) {
             if (outer.body.count(inner.header) == 0) continue;
             if (inner.body.count(outer.header) != 0) continue;
 
-            bool hasIntermediate = false;
+            // 安全检查：外层循环体中不能有其他循环（除了当前内层循环）
+            // 例如 row_reduce: r 循环体中有两个 c 循环，交换后第二个 c 循环仍使用
+            // 原来的循环变量，导致语义错误
+            // 例如 trsm_optimized: i 循环中有 k 和 j 两个内层循环，交换后 j 循环
+            // 依赖的 i 变量变成内层变量，导致 use-before-def
+            bool hasOtherLoop = false;
             for (size_t mi = 0; mi < loops.size(); ++mi) {
                 if (mi == oi || mi == ii) continue;
                 auto& mid = loops[mi];
-                if (outer.body.count(mid.header) && mid.body.count(inner.header)) {
-                    hasIntermediate = true;
+                if (outer.body.count(mid.header)) {
+                    hasOtherLoop = true;
                     break;
                 }
             }
-            if (hasIntermediate) continue;
+            if (hasOtherLoop) continue;
 
             auto* outerVar = extractIndVar(outer.header);
             auto* innerVar = extractIndVar(inner.header);

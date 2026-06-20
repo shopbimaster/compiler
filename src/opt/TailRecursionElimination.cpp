@@ -56,14 +56,72 @@ std::unordered_map<IR::Argument*, IR::Instruction*> findParamAllocas(IR::Functio
     return argToAlloca;
 }
 
-// ---- 找到函数体第一个 BB（entry 之后的第一个非空 BB） ----
+// ---- 找到函数体入口 BB ----
+// 尾递归消除后，BR 需要跳转到函数体的起始位置（包括 base case 检查）。
+// 如果 entry block 中包含 allocas/init-stores 和 base case 检查，
+// 则将 entry block 拆分为 init 和 body 两部分，BR 跳转到 body。
+// 该函数是幂等的：拆分后 entry 的 terminator 变为 unconditional BR，
+// 再次调用时直接返回 BR 的目标。
 IR::BasicBlock* findBodyBlock(IR::Function* func) {
-    bool foundEntry = false;
-    for (auto& bb : func->getBlocks()) {
-        if (foundEntry && !bb->empty()) return bb.get();
-        if (bb.get() == func->getEntryBlock()) foundEntry = true;
+    auto* entry = func->getEntryBlock();
+    if (!entry) return nullptr;
+    using Opc = IR::Instruction::Opcode;
+
+    // 如果 entry 已经被拆分过（terminator 是 unconditional BR），
+    // 直接返回 BR 的目标
+    auto* term = entry->getTerminator();
+    if (term && term->getOpcode() == Opc::BR) {
+        return dynamic_cast<IR::BasicBlock*>(term->getOperand(0));
     }
-    return nullptr;
+
+    // 找到 entry block 中第一个非 alloca/init-store 的指令位置
+    size_t splitIdx = 0;
+    const auto& insts = entry->getInstructions();
+    for (size_t i = 0; i < insts.size(); ++i) {
+        auto op = insts[i]->getOpcode();
+        if (op == Opc::ALLOCA) continue;
+        if (op == Opc::STORE) {
+            auto* val = insts[i]->getOperand(0);
+            auto* ptr = insts[i]->getOperand(1);
+            // init-store: store Argument → alloca
+            if (dynamic_cast<IR::Argument*>(val)) {
+                auto* ptrInst = dynamic_cast<IR::Instruction*>(ptr);
+                if (ptrInst && ptrInst->getOpcode() == Opc::ALLOCA) {
+                    continue;
+                }
+            }
+        }
+        splitIdx = i;
+        break;
+    }
+
+    if (splitIdx == 0) {
+        // 没有 init 指令，entry 本身就是 body
+        return entry;
+    }
+
+    if (splitIdx >= insts.size()) {
+        // 只有 init 指令，没有 body（不应该发生）
+        return nullptr;
+    }
+
+    // 需要拆分 entry block：创建新的 body block
+    auto* bodyBB = func->createBlock("body");
+
+    // 将 splitIdx 之后的指令移动到 bodyBB
+    auto it = entry->begin();
+    for (size_t i = 0; i < splitIdx; ++i) ++it;
+    while (it != entry->end()) {
+        auto* inst = it->release();  // 释放 unique_ptr 所有权
+        bodyBB->pushBack(inst);      // bodyBB 取得所有权
+        it = entry->erase(it);       // 删除空 unique_ptr，返回下一个迭代器
+    }
+
+    // 在 entry 末尾添加 BR bodyBB
+    auto* br = IR::Instruction::createBr(bodyBB);
+    entry->pushBack(br);
+
+    return bodyBB;
 }
 
 // ---- 对单个尾调用做消除变换 ----
