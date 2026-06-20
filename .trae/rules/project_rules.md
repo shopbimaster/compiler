@@ -42,7 +42,10 @@ bash scripts/run_tests.sh func o3   # O1 + O2 + O3
 - **OALL**：O1+O2+O3+P0+P3，所有优化已全部上线
 - **P0**：bitOpPatternRecognition 已启用；recursiveMulToNative 已启用（修复了 entry block 缺少 BR terminator 导致 crypto 编译段错误的问题）
 - **P3**（instructionScheduling）：已启用。重写为分段调度（Segmented Scheduling），将基本块划分为连续可移动指令段和非可移动指令边界，仅在段内重排指令，避免跨段 use-before-def 问题
-- **loopInterchange**（O3）：已启用。修复了 `swapICmpConstants`（交换 ICMP 常量/全局变量 LOAD 边界）和 `moveAllocaToEntry`（避免 use-before-def），非方阵越界问题已解决
+- **loopInterchange**（O3）：已启用。修复了 `swapICmpConstants`（交换 ICMP 常量/全局变量 LOAD 边界）和 `moveAllocaToEntry`（避免 use-before-def）。新增三项安全检查：
+  1. `icmpUsesVar`：内层循环边界不能依赖外层循环变量（如h-5-01的`j<i`），反之亦然
+  2. `isUsedOutsideBBSet`：循环变量不能在循环体外使用（如matmul1的i,j在后续循环复用）
+  3. `sameLoopBounds`：**循环边界必须相同**（非方阵交换A[i][j]→A[j][i]会越界，如array[20][100]中i<20,j<100交换后j可达99→越界→SEGFAULT）。支持ConstantInt、全局变量、局部变量（同一ALLOCA）三种边界比较
 - **loopUnrolling**（O3）：已启用。修复了 `cloneNonTermInst` 中 STORE 指令指针操作数未通过 `lookup` 查找的问题（导致 19_search 段错误）
 
 ## 性能分析结论（第七次测试 — 全部优化上线）
@@ -67,3 +70,27 @@ bash scripts/run_tests.sh func o3   # O1 + O2 + O3
 - shuffle1 受益于指令调度和位运算模式识别，提升 25%
 - 递归算法（knapsack_naive）和多BB函数内联受限的用例（h-4-03, conv2d-1）无明显提升
 - 所有优化 Pass 已全部上线，0 SEGFAULT，0 OUTPUT DIFF
+
+## 第八次测试分析与修复（2026-06-20）
+
+### 第八次测试结果（修复前）
+
+- 21个WA：matmul1/2/3、01_mm1/2/3、h-5-01/02/03、h-8-01/02/03、conv2d-1/2/3、h-1-01/02/03、many_mat_cal-1/3
+- 5个TLE：h-10-01/02/03、many_mat_cal-2、sl1
+- 部分用例性能退化（如huffman-02运行95.8秒）
+
+### 根因分析
+
+**第八次测试使用的是未修复的旧二进制**（LoopInterchange修复未编译进测试二进制）。本地重新编译后：
+
+1. **LoopInterchange三项安全检查已生效**：`icmpUsesVar`、`isUsedOutsideBBSet`、`sameLoopBounds`正确阻止了所有不安全交换
+2. **31_many_indirections SEGFAULT**：新增的`sameLoopBounds`检查修复了非方阵`array[20][100]`交换后越界问题
+3. **93_nested_calls TIMEOUT**：预存问题，测试脚本5秒超时太短，实际能通过（QEMU运行较慢）
+
+### 第八次回归测试结果（修复后 — O1/OALL级别）
+
+- Functional: 99 OK, 0 DIFF, 0 SEGFAULT, 1 TIMEOUT（93_nested_calls，预存）
+- H_Functional: 40 OK, 0 DIFF, 0 SEGFAULT, 0 TIMEOUT
+- Performance: 60 OK, 0 DIFF, 0 SEGFAULT, 0 TIMEOUT
+
+**总计：200个测试中 0 DIFF + 0 SEGFAULT（仅1个预存TIMEOUT）**

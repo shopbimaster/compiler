@@ -258,6 +258,94 @@ void swapICmpConstants(IR::BasicBlock* outerHeader, IR::BasicBlock* innerHeader)
     }
 }
 
+// ---- 检查 header 的 ICMP 中是否引用了指定的变量（作为 LOAD 的操作数） ----
+// 用于防止循环交换时内层循环边界依赖外层循环变量
+bool icmpUsesVar(IR::BasicBlock* header, IR::Value* var) {
+    for (auto& inst : header->getInstructions()) {
+        if (inst->getOpcode() != IR::Instruction::Opcode::ICMP) continue;
+        for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
+            auto* load = dynamic_cast<IR::Instruction*>(inst->getOperand(i));
+            if (load && load->getOpcode() == IR::Instruction::Opcode::LOAD
+                && load->getOperand(0) == var) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ---- 检查两个循环 header 的边界是否相同 ----
+// 循环交换要求 A[i][j] → A[j][i] 的访问模式在数组维度上安全，
+// 仅当两个循环边界相同时才安全（否则非方阵会越界）。
+// 例如 array[20][100] 中 i<20, j<100，交换后 A[j][i] 写 j 可达 99 越界。
+// 边界可以是：ConstantInt、全局变量、或局部变量（同一 ALLOCA）。
+bool sameLoopBounds(IR::BasicBlock* outerHeader, IR::BasicBlock* innerHeader,
+                    IR::Value* outerVar, IR::Value* innerVar) {
+    IR::Instruction* outerICmp = nullptr;
+    IR::Instruction* innerICmp = nullptr;
+    for (auto& inst : outerHeader->getInstructions()) {
+        if (inst->getOpcode() == IR::Instruction::Opcode::ICMP) {
+            outerICmp = inst.get(); break;
+        }
+    }
+    for (auto& inst : innerHeader->getInstructions()) {
+        if (inst->getOpcode() == IR::Instruction::Opcode::ICMP) {
+            innerICmp = inst.get(); break;
+        }
+    }
+    if (!outerICmp || !innerICmp) return false;
+
+    // 提取非循环变量的操作数作为边界
+    auto getBound = [](IR::Instruction* icmp, IR::Value* indVar) -> IR::Value* {
+        for (unsigned i = 0; i < icmp->getNumOperands(); ++i) {
+            auto* op = icmp->getOperand(i);
+            auto* load = dynamic_cast<IR::Instruction*>(op);
+            if (load && load->getOpcode() == IR::Instruction::Opcode::LOAD
+                && load->getOperand(0) == indVar) {
+                continue; // 这是循环变量，跳过
+            }
+            return op; // 这是边界
+        }
+        return nullptr;
+    };
+
+    IR::Value* outerBound = getBound(outerICmp, outerVar);
+    IR::Value* innerBound = getBound(innerICmp, innerVar);
+    if (!outerBound || !innerBound) return false;
+
+    // 同一 Value → 相同
+    if (outerBound == innerBound) return true;
+
+    // 两个 ConstantInt → 比较值
+    auto* oc = dynamic_cast<IR::ConstantInt*>(outerBound);
+    auto* ic = dynamic_cast<IR::ConstantInt*>(innerBound);
+    if (oc && ic) return oc->getValue() == ic->getValue();
+
+    // 两个 LOAD → 比较指针操作数（ALLOCA 或 GlobalVariable）
+    auto* ol = dynamic_cast<IR::Instruction*>(outerBound);
+    auto* il = dynamic_cast<IR::Instruction*>(innerBound);
+    if (ol && ol->getOpcode() == IR::Instruction::Opcode::LOAD
+        && il && il->getOpcode() == IR::Instruction::Opcode::LOAD) {
+        return ol->getOperand(0) == il->getOperand(0);
+    }
+
+    // 无法确定 → 保守地拒绝
+    return false;
+}
+
+// ---- 检查变量是否在指定的 BB 集合之外被使用 ----
+// 如果循环变量在循环体外被使用（如后续的循环嵌套），则交换会破坏后续代码的正确性
+bool isUsedOutsideBBSet(IR::Value* var, const BBSet& allowed) {
+    for (auto& use : var->getUses()) {
+        auto* userInst = dynamic_cast<IR::Instruction*>(use.user);
+        if (!userInst) continue;
+        auto* userBB = userInst->getParent();
+        if (!userBB) continue;
+        if (!allowed.count(userBB)) return true;
+    }
+    return false;
+}
+
 // ---- 将 ALLOCA 指令移动到 entry block ----
 // 当内层循环变量的 ALLOCA 不在 entry block 时，需要先移到 entry block，
 // 否则交换后 entry block 的 STORE 会引用未定义的 ALLOCA
@@ -311,6 +399,12 @@ bool tryInterchange(IR::Function* func) {
             auto* outerVar = extractIndVar(outer.header);
             auto* innerVar = extractIndVar(inner.header);
             if (!outerVar || !innerVar || outerVar == innerVar) continue;
+
+            // 安全检查1：内层循环边界不能依赖外层循环变量
+            // 例如 h-5-01: while(j < i) 中内层边界是外层变量 i，交换后语义错误
+            if (icmpUsesVar(inner.header, outerVar)) continue;
+            // 安全检查1b：外层循环边界也不能依赖内层循环变量
+            if (icmpUsesVar(outer.header, innerVar)) continue;
 
             IR::BasicBlock* outerBody = nullptr;
             for (auto* bb : outer.body) {
@@ -390,6 +484,21 @@ bool tryInterchange(IR::Function* func) {
             if (outer.body.count(outerExit)) continue;
 
             auto* entry = func->getEntryBlock();
+
+            // 安全检查2：循环变量不能在循环体外被使用
+            // 例如 matmul1: i,j 在后续的循环嵌套中复用，交换会破坏后续代码的正确性
+            // 允许的 BB 集合：循环体 + entry block（初始化）
+            BBSet allowedBBs = outer.body;
+            allowedBBs.insert(innerBody);
+            allowedBBs.insert(outerLatch);
+            if (entry) allowedBBs.insert(entry);
+            if (isUsedOutsideBBSet(outerVar, allowedBBs)) continue;
+            if (isUsedOutsideBBSet(innerVar, allowedBBs)) continue;
+
+            // 安全检查3：循环边界必须相同（非方阵交换 A[i][j]→A[j][i] 会越界）
+            // 例如 array[20][100] 中 i<20, j<100，交换后 A[j][i] 的 j 可达 99 越界
+            if (!sameLoopBounds(outer.header, inner.header, outerVar, innerVar)) continue;
+
             // 将 innerVar 的 ALLOCA 移到 entry block，避免 entry block 的 STORE 引用未定义值
             moveAllocaToEntry(func, innerVar);
 
@@ -414,10 +523,11 @@ bool tryInterchange(IR::Function* func) {
             //    注意：outerBody 中的 LOAD 已在步骤1中交换，STORE 指针需同步
             replaceStorePtrInBB(outerBody, innerVar, outerVar);
 
-            // 4. 交换 ICMP 中的 LOAD 引用（已在步骤1中通过 swapLoadsInBB 处理）
-            //    但 header 中的 ICMP 未在步骤1中处理，需单独处理
-            replaceCmpLoadInBB(outer.header, outerVar, innerVar);
-            replaceCmpLoadInBB(inner.header, innerVar, outerVar);
+            // 4. 交换 header 中 ICMP 的 LOAD 引用
+            //    使用 swapLoadsInBB 双向交换，因为 inner header 的 ICMP 有两个 LOAD 操作数
+            //   （循环变量 LOAD 和 bound LOAD），需要同时交换
+            swapLoadsInBB(outer.header, outerVar, innerVar);
+            swapLoadsInBB(inner.header, innerVar, outerVar);
 
             // 交换 ICMP 常量 bound：outer loop 的 bound 从 M→N，inner loop 的 bound 从 N→M
             // 修复非方阵 array[M][N] 交换后越界的问题（如 31_many_indirections）
