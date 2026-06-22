@@ -1,0 +1,116 @@
+@__HELLO = global [100 x i32]
+@N4__mE___ = global [6 x [50 x i32]]
+@saY_HeI10_To = global [40 x i32]
+@RET = global [5 x i32]
+declare i32 @getint()
+
+declare i32 @getch()
+
+declare i32 @getarray(i32* %arg0)
+
+declare float @getfloat()
+
+declare i32 @getfarray(float* %arg0)
+
+declare void @putint(i32 %arg0)
+
+declare void @putch(i32 %arg0)
+
+declare void @putarray(i32 %arg0, i32* %arg1)
+
+declare void @putfloat(float %arg0)
+
+declare void @putfarray(i32 %arg0, float* %arg1)
+
+declare void @_sysy_starttime(i32 %arg0)
+
+declare void @_sysy_stoptime(i32 %arg0)
+
+define i32 @putstr(i32* %arg0) {
+entry:
+  %str = alloca i32*
+  store i32* %arg0, i32** %str
+  %iNd__1X = alloca i32
+  store i32 0, i32* %iNd__1X
+  br label %while_cond_0
+while_cond_0:
+  %t0 = load i32*, i32** %str
+  %t1 = load i32, i32* %iNd__1X
+  %t2 = getelementptr i32* %t0, %t1
+  %t3 = load i32, i32* %t2
+  %ne = icmp i1 %t3, 0
+  br i1 %ne, label %while_body_1, label %while_end_2
+while_body_1:
+  %t4 = load i32*, i32** %str
+  %t5 = load i32, i32* %iNd__1X
+  %t6 = getelementptr i32* %t4, %t5
+  %t7 = load i32, i32* %t6
+  call void %putch(i32 %t7)
+  %t8 = load i32, i32* %iNd__1X
+  %t9 = add i32 %t8, 1
+  store i32 %t9, i32* %iNd__1X
+  br label %while_cond_0
+while_end_2:
+  %t10 = load i32, i32* %iNd__1X
+  ret i32 %t10
+}
+
+define i32 @main() {
+entry:
+  %t11 = getelementptr i32* %__HELLO, 0, 0
+  %t12 = call i32 %putstr(i32* %t11)
+  %i = alloca i32
+  store i32 0, i32* %i
+  br label %while_cond_3.preheader.1
+while_cond_3.preheader.1:
+  %t23 = getelementptr i32* %saY_HeI10_To, 0, 0
+  %t29 = getelementptr i32* %RET, 0, 0
+  br label %while_cond_3
+while_cond_3:
+  br i1 %, label %while_body_4, label %while_end_5
+while_body_4:
+  %_ = alloca i32
+  %t13 = load i32, i32* %i
+  %t14 = sdiv i32 %t13, 6
+  store i32 %t14, i32* %_
+  %__ = alloca i32
+  %t15 = load i32, i32* %i
+  %t16 = srem i32 %t15, 6
+  store i32 %t16, i32* %__
+  %t17 = load i32, i32* %_
+  %t18 = load i32, i32* %__
+  %ne = icmp i1 %t17, %t18
+  br i1 %ne, label %then_6, label %endif_7
+while_end_5:
+  ret i32 0
+then_6:
+  %t19 = load i32, i32* %_
+  %t20 = getelementptr [50 x i32]* %N4__mE___, 0, %t19
+  %t21 = getelementptr i32* %t20, 0, 0
+  %t22 = call i32 %putstr(i32* %t21)
+  %t24 = call i32 %putstr(i32* %t23)
+  %t25 = load i32, i32* %__
+  %t26 = getelementptr [50 x i32]* %N4__mE___, 0, %t25
+  %t27 = getelementptr i32* %t26, 0, 0
+  %t28 = call i32 %putstr(i32* %t27)
+  %t30 = call i32 %putstr(i32* %t29)
+  br label %merge_8
+endif_7:
+  br label %merge_8
+merge_8:
+  %t31 = load i32, i32* %i
+  %t32 = mul i32 %t31, 17
+  %t33 = add i32 %t32, 23
+  %t34 = srem i32 %t33, 32
+  store i32 %t34, i32* %i
+  %t35 = load i32, i32* %i
+  %eq = icmp i1 %t35, 0
+  br i1 %eq, label %then_9, label %endif_10
+then_9:
+  br label %while_end_5
+endif_10:
+  br label %merge_11
+merge_11:
+  br label %while_cond_3
+}
+

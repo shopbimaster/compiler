@@ -365,12 +365,36 @@ std::string peepholeOptimize(const std::string& asmCode) {
 
                     if (isThreeReg && tryMatch(lines[nextIdx], "mv", mvRd, mvRs, imm)) {
                         if (mvRs == opRd) {
-                            result.push_back("  " + opName + "    " + mvRd + ", " + opRs + ", " + opRs2);
-                            for (size_t j = i + 1; j < nextIdx; ++j) {
-                                result.push_back(lines[j]);
+                            // 检查 opRd 在 mv 之后是否还被后续指令使用
+                            // 如果被使用，不能合并，因为合并后 opRd 不再被写入
+                            bool opRdUsedAfter = false;
+                            for (size_t k = nextIdx + 1; k < lines.size(); ++k) {
+                                if (isEmptyOrComment(lines[k])) continue;
+                                // 检查 opRd 是否作为寄存器操作数出现
+                                // 匹配 opRd 前后有空格、逗号、括号或行尾
+                                const std::string& l = lines[k];
+                                size_t pos = 0;
+                                while ((pos = l.find(opRd, pos)) != std::string::npos) {
+                                    char before = (pos > 0) ? l[pos - 1] : ' ';
+                                    char after = (pos + opRd.size() < l.size()) ? l[pos + opRd.size()] : ' ';
+                                    bool validBefore = (before == ' ' || before == '\t' || before == ',' || before == '(');
+                                    bool validAfter = (after == ' ' || after == '\t' || after == ',' || after == ')');
+                                    if (validBefore && validAfter) {
+                                        opRdUsedAfter = true;
+                                        break;
+                                    }
+                                    pos += opRd.size();
+                                }
+                                if (opRdUsedAfter) break;
                             }
-                            i = nextIdx;
-                            matched = true;
+                            if (!opRdUsedAfter) {
+                                result.push_back("  " + opName + "    " + mvRd + ", " + opRs + ", " + opRs2);
+                                for (size_t j = i + 1; j < nextIdx; ++j) {
+                                    result.push_back(lines[j]);
+                                }
+                                i = nextIdx;
+                                matched = true;
+                            }
                         }
                     }
 
@@ -384,12 +408,33 @@ std::string peepholeOptimize(const std::string& asmCode) {
                             opName = extractOpName(lines[i]);
                             if (tryMatch(lines[nextIdx], "mv", mvRd, mvRs, imm)) {
                                 if (mvRs == opRd) {
-                                    result.push_back("  " + opName + "    " + mvRd + ", " + opRs + ", " + opRs2);
-                                    for (size_t j = i + 1; j < nextIdx; ++j) {
-                                        result.push_back(lines[j]);
+                                    // 检查 opRd 在 mv 之后是否还被后续指令使用
+                                    bool opRdUsedAfter = false;
+                                    for (size_t k = nextIdx + 1; k < lines.size(); ++k) {
+                                        if (isEmptyOrComment(lines[k])) continue;
+                                        const std::string& l = lines[k];
+                                        size_t pos = 0;
+                                        while ((pos = l.find(opRd, pos)) != std::string::npos) {
+                                            char before = (pos > 0) ? l[pos - 1] : ' ';
+                                            char after = (pos + opRd.size() < l.size()) ? l[pos + opRd.size()] : ' ';
+                                            bool validBefore = (before == ' ' || before == '\t' || before == ',' || before == '(');
+                                            bool validAfter = (after == ' ' || after == '\t' || after == ',' || after == ')');
+                                            if (validBefore && validAfter) {
+                                                opRdUsedAfter = true;
+                                                break;
+                                            }
+                                            pos += opRd.size();
+                                        }
+                                        if (opRdUsedAfter) break;
                                     }
-                                    i = nextIdx;
-                                    matched = true;
+                                    if (!opRdUsedAfter) {
+                                        result.push_back("  " + opName + "    " + mvRd + ", " + opRs + ", " + opRs2);
+                                        for (size_t j = i + 1; j < nextIdx; ++j) {
+                                            result.push_back(lines[j]);
+                                        }
+                                        i = nextIdx;
+                                        matched = true;
+                                    }
                                 }
                             }
                         }
@@ -418,12 +463,33 @@ std::string peepholeOptimize(const std::string& asmCode) {
                         std::string mvRd, mvRs;
                         if (mvIdx < lines.size() && tryMatch(lines[mvIdx], "mv", mvRd, mvRs, imm)) {
                             if (mvRs == opRd) {
-                                result.push_back("  " + opi + "    " + mvRd + ", " + opRs + ", " + std::to_string(val));
-                                for (size_t j = i + 2; j < mvIdx; ++j) {
-                                    result.push_back(lines[j]);
+                                // 检查 opRd 在 mv 之后是否还被后续指令使用
+                                bool opRdUsedAfter = false;
+                                for (size_t k = mvIdx + 1; k < lines.size(); ++k) {
+                                    if (isEmptyOrComment(lines[k])) continue;
+                                    const std::string& l = lines[k];
+                                    size_t pos = 0;
+                                    while ((pos = l.find(opRd, pos)) != std::string::npos) {
+                                        char before = (pos > 0) ? l[pos - 1] : ' ';
+                                        char after = (pos + opRd.size() < l.size()) ? l[pos + opRd.size()] : ' ';
+                                        bool validBefore = (before == ' ' || before == '\t' || before == ',' || before == '(');
+                                        bool validAfter = (after == ' ' || after == '\t' || after == ',' || after == ')');
+                                        if (validBefore && validAfter) {
+                                            opRdUsedAfter = true;
+                                            break;
+                                        }
+                                        pos += opRd.size();
+                                    }
+                                    if (opRdUsedAfter) break;
                                 }
-                                i = mvIdx;
-                                return true;
+                                if (!opRdUsedAfter) {
+                                    result.push_back("  " + opi + "    " + mvRd + ", " + opRs + ", " + std::to_string(val));
+                                    for (size_t j = i + 2; j < mvIdx; ++j) {
+                                        result.push_back(lines[j]);
+                                    }
+                                    i = mvIdx;
+                                    return true;
+                                }
                             }
                         }
                         // 无 mv 合并
