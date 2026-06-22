@@ -58,6 +58,46 @@ bool trySimplify(IR::Instruction* inst) {
     if (!l || !r) return false;
 
     // ================================================================
+    // 恒等式消除 — 左右操作数相同
+    // x - x → 0, x & x → x, x | x → x
+    // ================================================================
+    if (l == r) {
+        struct { Opc opcode; } sameOpIds[] = {
+            {Opc::SUB}, {Opc::AND}, {Opc::OR}, {Opc::XOR},
+        };
+        for (auto& s : sameOpIds) {
+            if (op == s.opcode) {
+                if (op == Opc::SUB || op == Opc::XOR) {
+                    auto* zero = IR::ConstantInt::get(dynamic_cast<IR::IntegerType*>(inst->getType()), 0);
+                    inst->replaceAllUsesWith(zero);
+                } else {
+                    inst->replaceAllUsesWith(l);
+                }
+                inst->dropAllUses();
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) { bb->erase(it); break; }
+                }
+                return true;
+            }
+        }
+        // x + x → x << 1
+        if (op == Opc::ADD) {
+            auto* i32 = dynamic_cast<IR::IntegerType*>(l->getType());
+            if (i32) {
+                auto* one = IR::ConstantInt::get(i32, 1);
+                auto* repl = IR::Instruction::createBinOp(
+                    Opc::SHL, inst->getType(), inst->getName() + ".sr", l, one);
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) {
+                        replaceWithNewInst(it, inst, repl);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ================================================================
     // 恒等式消除 — 右操作数为常量 0 或 1
     // ================================================================
     if (auto* rc = dynamic_cast<IR::ConstantInt*>(r)) {

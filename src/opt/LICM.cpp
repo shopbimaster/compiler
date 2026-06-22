@@ -68,19 +68,49 @@ bool headerHasPhi(IR::BasicBlock* header) {
 }
 
 // ================================================================
+// 收集函数中所有被 STORE 的全局变量
+// ================================================================
+std::unordered_set<IR::GlobalVariable*> collectStoredGlobals(IR::Function* func) {
+    std::unordered_set<IR::GlobalVariable*> storedGlobals;
+    for (auto& bb : func->getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::STORE) {
+                // STORE 的指针操作数是 operand(1)
+                auto* ptr = inst->getOperand(1);
+                if (auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr)) {
+                    storedGlobals.insert(gv);
+                }
+            }
+        }
+    }
+    return storedGlobals;
+}
+
+// ================================================================
 // 不变量判定：所有操作数是常量 || 在循环外定义 || 已标不变量
 // ================================================================
 bool isLoopInvariant(
     IR::Instruction* inst,
     const Loop& loop,
-    const std::unordered_set<IR::Instruction*>& invariants) {
+    const std::unordered_set<IR::Instruction*>& invariants,
+    const std::unordered_set<IR::GlobalVariable*>& storedGlobals) {
     auto op = inst->getOpcode();
     using Opc = IR::Instruction::Opcode;
     // 不可外提的副作用指令
     if (op == Opc::PHI || op == Opc::STORE || op == Opc::CALL ||
         op == Opc::BR || op == Opc::COND_BR || op == Opc::RET ||
-        op == Opc::ALLOCA || op == Opc::LOAD)
+        op == Opc::ALLOCA)
         return false;
+
+    // LOAD 指令：仅当加载自全局变量且该全局变量在函数中从未被 STORE 时，允许外提
+    // 这样可以安全地外提如 N_eff、N 等循环边界常量的 LOAD
+    if (op == Opc::LOAD) {
+        auto* ptr = inst->getOperand(0);
+        auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr);
+        if (!gv || storedGlobals.count(gv)) return false;
+        // 全局变量未被存储 → LOAD 是循环不变量
+        return true;
+    }
 
     for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
         auto* opVal = inst->getOperand(i);
@@ -119,12 +149,13 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
     }
 
     // 2. 迭代标记不变量直到收敛
+    auto storedGlobals = collectStoredGlobals(func);
     std::unordered_set<IR::Instruction*> invariants;
     bool changed = true;
     while (changed) {
         changed = false;
         for (auto* inst : loopInsts) {
-            if (!invariants.count(inst) && isLoopInvariant(inst, loop, invariants)) {
+            if (!invariants.count(inst) && isLoopInvariant(inst, loop, invariants, storedGlobals)) {
                 invariants.insert(inst);
                 changed = true;
             }

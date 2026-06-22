@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 
 namespace Backend {
 
@@ -23,8 +24,13 @@ public:
 
     void allocate(IR::Function& func);
 
+    void reserveReg(const std::string& reg);
+    void clearReservedRegs();
+    bool isRegReserved(const std::string& reg) const;
+
     bool hasReg(IR::Value* val) const;
     std::string getReg(IR::Value* val) const;
+    void setReg(IR::Value* val, const std::string& reg);
     int getSpillSlot(IR::Value* val) const;
     bool isFloatValue(IR::Value* val) const;
     const std::vector<std::string>& getUsedCalleeSaved() const;
@@ -48,6 +54,7 @@ private:
     int spillSlotSize;
 
     std::vector<std::string> usedCalleeSaved;
+    std::unordered_set<std::string> reservedRegs;
 
     static const std::vector<std::string> INT_REGS;
     static const std::vector<std::string> FLOAT_REGS;

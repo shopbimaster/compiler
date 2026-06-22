@@ -17,9 +17,21 @@ void runO1(IR::Module* mod) {
 }
 
 void runO2(IR::Module* mod) {
+    // 位运算模式识别提前运行，消除自定义位运算函数调用（_and/_or/rotlN 等），
+    // 让 read_bits 等函数变为叶子函数，以便后续内联 pass 进行内联
+    if (bitOpPatternRecognition(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
     inlineExpansion(mod);
     constantFolding(mod);
     deadCodeElimination(mod);
+    // 全局变量提升：将频繁访问的标量全局变量提升为局部变量，
+    // 让寄存器分配器将其放入寄存器，消除 la + lw/sw 开销
+    if (globalVariablePromotion(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
     if (commonSubexpressionElimination(mod)) { /* CSE changed */ }
     // LICM 已在 O1 中运行，内联的单 BB 函数不含循环，无需再次 LICM
     // 二次 LICM 会与内联后修改的 CFG 交互导致段错误

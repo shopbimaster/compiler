@@ -1,6 +1,8 @@
 #include "backend/TargetCodeGen.h"
 #include <algorithm>
 #include <cassert>
+#include <iostream>
+#include <set>
 
 namespace Backend {
 
@@ -149,9 +151,41 @@ void TargetCodeGen::emitGlobalInitData(IR::Constant* init, IR::Type* type, const
 
 void TargetCodeGen::emitFunction(IR::Function& func) {
     currentFunc = &func;
+    promotedAllocas.clear();
+    regAlloc.clearReservedRegs();
+
+    // 先收集全局变量地址并分配 callee-saved 寄存器缓存（优先级高于 ALLOCA 提升）
+    globalAddrCache.clear();
+    collectGlobalAddresses(func);
+    for (auto& [gv, reg] : globalAddrCache) {
+        regAlloc.reserveReg(reg);
+    }
+
+    // 再提升 ALLOCA 到寄存器（跳过已被全局地址缓存占用的寄存器）
+    promoteAllocasInFunction(func);
+
     computeStackLayout(func);
 
+    // 预留被提升的寄存器，防止寄存器分配器使用它们
+    for (auto& [alloca, reg] : promotedAllocas) {
+        regAlloc.reserveReg(reg);
+    }
+
     regAlloc.allocate(func);
+
+    // 将 promoted ALLOCA 的 LOAD 指令映射到 callee-saved 寄存器，
+    // 避免后续 emitLoad 生成冗余的 mv 指令
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::LOAD) {
+                auto* ptrOp = inst->getOperand(0);
+                auto promotedIt = promotedAllocas.find(ptrOp);
+                if (promotedIt != promotedAllocas.end()) {
+                    regAlloc.setReg(inst.get(), promotedIt->second);
+                }
+            }
+        }
+    }
 
     int savedRegCount = static_cast<int>(regAlloc.getUsedCalleeSaved().size());
     int savedRegSpace = savedRegCount * 8;
@@ -210,6 +244,8 @@ void TargetCodeGen::computeStackLayout(IR::Function& func) {
     for (auto& bb : func.getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
             if (inst->getOpcode() == IR::Instruction::Opcode::ALLOCA) {
+                // 跳过已提升到寄存器的 ALLOCA
+                if (promotedAllocas.find(inst.get()) != promotedAllocas.end()) continue;
                 allocaOffset[inst.get()] = stackSize;
                 if (auto* ptrTy = dynamic_cast<IR::PointerType*>(inst->getType())) {
                     int typeSize = getTypeSize(ptrTy->getPointeeType());
@@ -400,6 +436,11 @@ void TargetCodeGen::emitPrologue(IR::Function& func) {
             }
         }
     }
+
+    // 初始化全局变量地址缓存
+    for (auto& [gv, reg] : globalAddrCache) {
+        emitter.emitText("  la      " + reg + ", " + gv->getName());
+    }
 }
 
 void TargetCodeGen::emitEpilogue(IR::Function& func) {
@@ -513,18 +554,23 @@ std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg)
     if (auto* cf = dynamic_cast<IR::ConstantFloat*>(val)) {
         union { float f; uint32_t i; } u;
         u.f = static_cast<float>(cf->getValue());
-        result += "  li      t2, " + std::to_string(u.i) + "\n";
         if (!destIsFloat) {
-            result += "  mv      " + destReg + ", t2\n";
+            result += "  li      " + destReg + ", " + std::to_string(u.i) + "\n";
         } else {
+            result += "  li      t2, " + std::to_string(u.i) + "\n";
             result += "  fmv.w.x " + destReg + ", t2\n";
         }
         return result;
     }
 
     if (auto* gv = dynamic_cast<IR::GlobalVariable*>(val)) {
-        result += "  la      t2, " + gv->getName() + "\n";
-        result += "  mv      " + destReg + ", t2\n";
+        auto it = globalAddrCache.find(gv);
+        if (it != globalAddrCache.end()) {
+            // 已缓存，直接从缓存寄存器获取
+            result += "  mv      " + destReg + ", " + it->second + "\n";
+        } else {
+            result += "  la      " + destReg + ", " + gv->getName() + "\n";
+        }
         return result;
     }
 
@@ -669,11 +715,11 @@ std::string TargetCodeGen::emitValueToReg(IR::Value* val, const std::string& des
     if (auto* ci = dynamic_cast<IR::ConstantInt*>(val)) {
         bool destIsFloat = isFloatReg(destReg);
         std::string result;
-        result += "  li      t2, " + std::to_string(ci->getValue()) + "\n";
         if (destIsFloat) {
+            result += "  li      t2, " + std::to_string(ci->getValue()) + "\n";
             result += "  fcvt.s.w " + destReg + ", t2\n";
         } else {
-            result += "  mv      " + destReg + ", t2\n";
+            result += "  li      " + destReg + ", " + std::to_string(ci->getValue()) + "\n";
         }
         return result;
     }
@@ -894,7 +940,28 @@ void TargetCodeGen::emitFcmp(IR::Instruction& inst) {
 
 void TargetCodeGen::emitLoad(IR::Instruction& inst) {
     std::string code;
-    code += loadToReg(inst.getOperand(0), "t0");
+
+    // 检查是否从已提升的 ALLOCA 加载
+    auto* ptrOp = inst.getOperand(0);
+    auto promotedIt = promotedAllocas.find(ptrOp);
+    if (promotedIt != promotedAllocas.end()) {
+        // 直接从寄存器获取值，无需内存访问
+        std::string allocaReg = promotedIt->second;
+        std::string rd = getValueReg(&inst);
+        bool rdInReg = !rd.empty();
+        bool isFloat = allocaReg[0] == 'f';
+        std::string dest = rdInReg ? rd : (isFloat ? "ft0" : "t0");
+        if (isFloat) {
+            code += "  fmv.s   " + dest + ", " + allocaReg + "\n";
+        } else {
+            code += "  mv      " + dest + ", " + allocaReg + "\n";
+        }
+        if (!rdInReg) code += storeFromReg(&inst, dest);
+        emitter.emitText(code);
+        return;
+    }
+
+    code += loadToReg(ptrOp, "t0");
     auto* loadTy = inst.getType();
 
     std::string rd = getValueReg(&inst);
@@ -918,6 +985,37 @@ void TargetCodeGen::emitLoad(IR::Instruction& inst) {
 
 void TargetCodeGen::emitStore(IR::Instruction& inst) {
     std::string code;
+
+    // 检查是否存储到已提升的 ALLOCA
+    auto* ptrOp = inst.getOperand(1);
+    auto promotedIt = promotedAllocas.find(ptrOp);
+    if (promotedIt != promotedAllocas.end()) {
+        // 直接存储到寄存器，无需内存访问
+        std::string allocaReg = promotedIt->second;
+        auto* valTy = inst.getOperand(0)->getType();
+        bool isFloat = valTy && valTy->isFloat();
+        std::string srcReg = getValueReg(inst.getOperand(0));
+        if (!srcReg.empty()) {
+            // 源操作数已经在寄存器中，直接 mv
+            if (isFloat) {
+                code += "  fmv.s   " + allocaReg + ", " + srcReg + "\n";
+            } else {
+                code += "  mv      " + allocaReg + ", " + srcReg + "\n";
+            }
+        } else {
+            // 源操作数不在寄存器中，需要先加载
+            if (isFloat) {
+                code += loadToReg(inst.getOperand(0), "ft0");
+                code += "  fmv.s   " + allocaReg + ", ft0\n";
+            } else {
+                code += loadToReg(inst.getOperand(0), "t0");
+                code += "  mv      " + allocaReg + ", t0\n";
+            }
+        }
+        emitter.emitText(code);
+        return;
+    }
+
     auto* valTy = inst.getOperand(0)->getType();
     if (valTy && valTy->isFloat()) {
         code += loadToReg(inst.getOperand(0), "ft0");
@@ -1057,24 +1155,40 @@ void TargetCodeGen::emitGetElementPtr(IR::Instruction& inst) {
 
         // First index (operand 1) is the pointer offset:
         // advance by sizeof(pointee). Do NOT update curPointee here.
-        int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
-        code += loadToReg(inst.getOperand(1), "t1");
-        if (ptrStride == 1) {
-        } else if (ptrStride == 2) {
-            code += "  slli    t1, t1, 1\n";
-        } else if (ptrStride == 4) {
-            code += "  slli    t1, t1, 2\n";
-        } else if (ptrStride == 8) {
-            code += "  slli    t1, t1, 3\n";
-        } else {
-            code += "  li      t2, " + std::to_string(ptrStride) + "\n";
-            code += "  mul     t1, t1, t2\n";
+        // 优化：跳过常量 0 索引，避免无用的 li+mul+add 指令
+        auto* firstIdx = dynamic_cast<IR::ConstantInt*>(inst.getOperand(1));
+        bool firstIsZero = firstIdx && firstIdx->getValue() == 0;
+        if (!firstIsZero) {
+            int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
+            code += loadToReg(inst.getOperand(1), "t1");
+            if (ptrStride == 1) {
+            } else if (ptrStride == 2) {
+                code += "  slli    t1, t1, 1\n";
+            } else if (ptrStride == 4) {
+                code += "  slli    t1, t1, 2\n";
+            } else if (ptrStride == 8) {
+                code += "  slli    t1, t1, 3\n";
+            } else {
+                code += "  li      t2, " + std::to_string(ptrStride) + "\n";
+                code += "  mul     t1, t1, t2\n";
+            }
+            code += "  add     t0, t0, t1\n";
         }
-        code += "  add     t0, t0, t1\n";
 
         // Remaining indices (operand 2+) are array indices:
         // advance by sizeof(element of current array type), then descend.
         for (unsigned i = 2; i < numOps; ++i) {
+            // 优化：跳过常量 0 索引
+            auto* idxConst = dynamic_cast<IR::ConstantInt*>(inst.getOperand(i));
+            if (idxConst && idxConst->getValue() == 0) {
+                // 仍需更新 curPointee 以正确计算后续索引的 stride
+                if (curPointee && curPointee->isArray()) {
+                    auto* arrTy = dynamic_cast<IR::ArrayType*>(curPointee);
+                    curPointee = arrTy->getElementType();
+                }
+                continue;
+            }
+
             int stride = 4;
             if (curPointee && curPointee->isArray()) {
                 auto* arrTy = dynamic_cast<IR::ArrayType*>(curPointee);
@@ -1141,6 +1255,129 @@ void TargetCodeGen::emitFptosi(IR::Instruction& inst) {
         code += storeFromReg(&inst, dest);
     }
     emitter.emitText(code);
+}
+
+// ================================================================
+// ALLOCA 寄存器提升
+// 将仅用于 LOAD/STORE 的标量 ALLOCA 映射到 callee-saved 寄存器，
+// 避免每次访问都通过栈内存（sp+offset）
+// ================================================================
+
+bool TargetCodeGen::isAllocaPromotable(IR::Instruction* alloca) const {
+    if (alloca->getOpcode() != IR::Instruction::Opcode::ALLOCA) return false;
+
+    // 只提升标量类型（int/float），不提升数组或指针
+    auto* ptrTy = dynamic_cast<IR::PointerType*>(alloca->getType());
+    if (!ptrTy) return false;
+    auto* pointee = ptrTy->getPointeeType();
+    if (!pointee || (!pointee->isInteger() && !pointee->isFloat())) return false;
+
+    // 检查所有使用：只允许 LOAD 和 STORE
+    for (auto& use : alloca->getUses()) {
+        auto* userInst = dynamic_cast<IR::Instruction*>(use.user);
+        if (!userInst) return false;
+        auto op = userInst->getOpcode();
+        if (op != IR::Instruction::Opcode::LOAD && op != IR::Instruction::Opcode::STORE) {
+            return false; // GEP 或 CALL 参数等，不能提升
+        }
+    }
+
+    return true;
+}
+
+void TargetCodeGen::promoteAllocasInFunction(IR::Function& func) {
+    // 可用的 callee-saved 寄存器池（按优先级排序）
+    static const std::vector<std::string> intRegPool = {
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "s8", "s9", "s10", "s11"
+    };
+    static const std::vector<std::string> floatRegPool = {
+        "fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7",
+        "fs8", "fs9", "fs10", "fs11"
+    };
+
+    int intIdx = 0, floatIdx = 0;
+
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::ALLOCA) continue;
+            if (!isAllocaPromotable(inst.get())) continue;
+
+            auto* ptrTy = dynamic_cast<IR::PointerType*>(inst->getType());
+            auto* pointee = ptrTy->getPointeeType();
+            bool isFloat = pointee->isFloat();
+
+            std::string reg;
+            if (isFloat) {
+                while (floatIdx < static_cast<int>(floatRegPool.size()) &&
+                       regAlloc.isRegReserved(floatRegPool[floatIdx])) {
+                    floatIdx++;
+                }
+                if (floatIdx < static_cast<int>(floatRegPool.size())) {
+                    reg = floatRegPool[floatIdx++];
+                }
+            } else {
+                while (intIdx < static_cast<int>(intRegPool.size()) &&
+                       regAlloc.isRegReserved(intRegPool[intIdx])) {
+                    intIdx++;
+                }
+                if (intIdx < static_cast<int>(intRegPool.size())) {
+                    reg = intRegPool[intIdx++];
+                }
+            }
+
+            if (!reg.empty()) {
+                promotedAllocas[inst.get()] = reg;
+            }
+        }
+    }
+}
+
+void TargetCodeGen::collectGlobalAddresses(IR::Function& func) {
+    // 收集函数中引用的全局变量
+    // 只缓存数组全局变量的地址（标量全局变量会被 GlobalVariablePromotion
+    // 提升为 ALLOCA，无需缓存地址）
+    std::set<IR::GlobalVariable*> usedGlobals;
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
+                if (auto* gv = dynamic_cast<IR::GlobalVariable*>(inst->getOperand(i))) {
+                    // 只缓存数组类型的全局变量（标量会被提升为 ALLOCA）
+                    auto* ptrTy = dynamic_cast<IR::PointerType*>(gv->getType());
+                    if (ptrTy) {
+                        auto* pointee = ptrTy->getPointeeType();
+                        if (pointee && pointee->isArray()) {
+                            usedGlobals.insert(gv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 收集已使用的寄存器（promotedAllocas 已分配）
+    std::set<std::string> usedRegs;
+    for (auto& [alloca, reg] : promotedAllocas) {
+        usedRegs.insert(reg);
+    }
+
+    // 为每个全局变量分配 callee-saved 寄存器（跳过已使用的）
+    static const std::vector<std::string> intRegPool = {
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "s8", "s9", "s10", "s11"
+    };
+
+    int regIdx = 0;
+    for (auto* gv : usedGlobals) {
+        while (regIdx < static_cast<int>(intRegPool.size()) &&
+               usedRegs.count(intRegPool[regIdx])) {
+            regIdx++;
+        }
+        if (regIdx < static_cast<int>(intRegPool.size())) {
+            std::string reg = intRegPool[regIdx++];
+            globalAddrCache[gv] = reg;
+        }
+    }
 }
 
 } // namespace Backend

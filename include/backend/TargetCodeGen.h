@@ -46,6 +46,15 @@ private:
     std::unordered_map<IR::Argument*, int> paramOffsets;
     RegisterAllocator regAlloc;
 
+    // ALLOCA 寄存器提升：将符合条件的 ALLOCA 映射到物理寄存器
+    std::unordered_map<IR::Value*, std::string> promotedAllocas;
+    void promoteAllocasInFunction(IR::Function& func);
+    bool isAllocaPromotable(IR::Instruction* alloca) const;
+
+    // 全局变量地址缓存：避免循环内重复 la 指令
+    std::unordered_map<IR::GlobalVariable*, std::string> globalAddrCache;
+    void collectGlobalAddresses(IR::Function& func);
+
     void emitGlobal(IR::GlobalVariable* gv);
     void emitGlobalInitData(IR::Constant* init, IR::Type* type, const std::string& indent);
 

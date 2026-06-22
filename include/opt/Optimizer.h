@@ -64,6 +64,7 @@ void runP3(IR::Module* mod);
 // ================================================================
 bool recursiveMulToNative(IR::Module* mod);
 bool bitOpPatternRecognition(IR::Module* mod);
+bool globalVariablePromotion(IR::Module* mod);
 void runP0(IR::Module* mod);
 
 } // namespace Opt

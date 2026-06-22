@@ -8,12 +8,15 @@ namespace Backend {
 
 const std::vector<std::string> RegisterAllocator::INT_REGS = {
     "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-    "s8", "s9", "s10", "s11"
+    "s8", "s9", "s10", "s11",
+    "t3", "t4", "t5", "t6"   // caller-saved registers for short-lived values
 };
 
 const std::vector<std::string> RegisterAllocator::FLOAT_REGS = {
     "fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7",
-    "fs8", "fs9", "fs10", "fs11"
+    "fs8", "fs9", "fs10", "fs11",
+    "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "ft8", "ft9", "ft10", "ft11"
+    // ft0/ft1 are reserved as scratch registers in codegen
 };
 
 RegisterAllocator::RegisterAllocator()
@@ -24,13 +27,30 @@ void RegisterAllocator::allocate(IR::Function& func) {
     spillMap.clear();
     floatValues.clear();
     intervals.clear();
-    usedCalleeSaved.clear();
+    // usedCalleeSaved 不清空 — reserveReg() 在 allocate() 之前调用会预填充
     nextSpillSlot = 0;
     spillSlotSize = 0;
 
     maxInstId = assignInstructionIds(func);
     buildIntervals(func);
     linearScan();
+}
+
+void RegisterAllocator::reserveReg(const std::string& reg) {
+    reservedRegs.insert(reg);
+    if (std::find(usedCalleeSaved.begin(), usedCalleeSaved.end(), reg)
+        == usedCalleeSaved.end()) {
+        usedCalleeSaved.push_back(reg);
+    }
+}
+
+bool RegisterAllocator::isRegReserved(const std::string& reg) const {
+    return reservedRegs.count(reg) > 0;
+}
+
+void RegisterAllocator::clearReservedRegs() {
+    reservedRegs.clear();
+    usedCalleeSaved.clear();
 }
 
 int RegisterAllocator::assignInstructionIds(IR::Function& func) {
@@ -220,6 +240,11 @@ void RegisterAllocator::linearScan() {
         const auto& regPool = current.isFloat ? FLOAT_REGS : INT_REGS;
         std::set<std::string> freeRegs(regPool.begin(), regPool.end());
 
+        // 移除已被预留的寄存器
+        for (const auto& r : reservedRegs) {
+            freeRegs.erase(r);
+        }
+
         for (auto* a : active) {
             if (!a->reg.empty()) {
                 freeRegs.erase(a->reg);
@@ -295,6 +320,10 @@ bool RegisterAllocator::hasReg(IR::Value* val) const {
 std::string RegisterAllocator::getReg(IR::Value* val) const {
     auto it = regMap.find(val);
     return it != regMap.end() ? it->second : "";
+}
+
+void RegisterAllocator::setReg(IR::Value* val, const std::string& reg) {
+    regMap[val] = reg;
 }
 
 int RegisterAllocator::getSpillSlot(IR::Value* val) const {

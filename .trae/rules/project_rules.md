@@ -91,8 +91,11 @@ compiler/
 // O1: 基础优化
 CF → DCE → CSE → LICM → CF → DCE
 
-// O2: 内联 + 寄存器压力优化
-inlineExpansion → CF → DCE → CSE → CF → DCE
+// O2: 内联 + 全局变量提升 + 寄存器压力优化
+bitOpPatternRecognition → CF → DCE
+→ inlineExpansion → CF → DCE
+→ globalVariablePromotion → CF → DCE
+→ CSE → CF → DCE
 
 // O3: 高级循环/递归优化
 algebraicSimplification → CF → DCE
@@ -110,20 +113,21 @@ bitOpPatternRecognition → CF → DCE
 
 ### 4.2 当前启用的 Pass 及关键注意事项
 
-| Pass                     | 级别  | 状态 | 关键注意事项                                                                                                                                          |
-| ------------------------ | ----- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ConstantFolding          | O1    | 启用 | `sitofp` 折叠成 `ConstantFloat` 后，IR 打印和代码生成均需正确处理 `ConstantFloat`                                                                     |
-| DeadCodeElimination      | O1    | 启用 | 无已知问题                                                                                                                                            |
-| CSE                      | O1/O2 | 启用 | 使用 `replaceAllUsesWith` 后 `erase`，安全                                                                                                            |
-| LICM                     | O1    | 启用 | 仅 O1 运行一次；O2 不再次运行（避免与内联修改的 CFG 交互导致段错误）                                                                                  |
-| InlineExpansion          | O2    | 启用 | 仅内联单 BB 小函数；**多 BB 函数不内联**                                                                                                              |
-| AlgebraicSimplification  | O3    | 启用 | 强度削减：`sdiv/srem` 除以 2 的幂需要检查左操作数非负才能替换为 `ashr`/`and`                                                                          |
-| LoopInterchange          | O3    | 启用 | **三项安全检查缺一不可**：`icmpUsesVar`、`isUsedOutsideBBSet`、`sameLoopBounds`；**外加 `hasOtherLoop` 检查**（外层循环体不能有除当前内层外其他循环） |
-| LoopUnrolling            | O3    | 启用 | 仅展开迭代次数 ≤64 的简单 while 循环；`cloneNonTermInst` 中 STORE 指针操作数必须通过 `lookup` 查找                                                    |
-| TailRecursionElimination | O3    | 启用 | `findBodyBlock` 将 entry block 拆分为 init 和 body；**幂等设计**：拆分后再次调用直接返回 BR 目标                                                      |
-| BitOpPatternRecognition  | P0    | 启用 | 模式匹配位运算优化                                                                                                                                    |
-| RecursiveMulToNative     | P0    | 禁用 | 已知导致 crypto 编译段错误                                                                                                                            |
-| InstructionScheduling    | P3    | 禁用 | 分段调度重写后仍有问题，暂禁用                                                                                                                        |
+| Pass                     | 级别  | 状态 | 关键注意事项                                                                                                                                                                       |
+| ------------------------ | ----- | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ConstantFolding          | O1    | 启用 | `sitofp` 折叠成 `ConstantFloat` 后，IR 打印和代码生成均需正确处理 `ConstantFloat`                                                                                                  |
+| DeadCodeElimination      | O1    | 启用 | 无已知问题                                                                                                                                                                         |
+| CSE                      | O1/O2 | 启用 | 使用 `replaceAllUsesWith` 后 `erase`，安全                                                                                                                                         |
+| LICM                     | O1    | 启用 | 仅 O1 运行一次；O2 不再次运行（避免与内联修改的 CFG 交互导致段错误）                                                                                                               |
+| InlineExpansion          | O2    | 启用 | 仅内联单 BB 小函数；**多 BB 函数不内联**                                                                                                                                           |
+| AlgebraicSimplification  | O3    | 启用 | 强度削减：`sdiv/srem` 除以 2 的幂需要检查左操作数非负才能替换为 `ashr`/`and`                                                                                                       |
+| LoopInterchange          | O3    | 启用 | **三项安全检查缺一不可**：`icmpUsesVar`、`isUsedOutsideBBSet`、`sameLoopBounds`；**外加 `hasOtherLoop` 检查**（外层循环体不能有除当前内层外其他循环）                              |
+| LoopUnrolling            | O3    | 启用 | 仅展开迭代次数 ≤64 的简单 while 循环；`cloneNonTermInst` 中 STORE 指针操作数必须通过 `lookup` 查找                                                                                 |
+| TailRecursionElimination | O3    | 启用 | `findBodyBlock` 将 entry block 拆分为 init 和 body；**幂等设计**：拆分后再次调用直接返回 BR 目标                                                                                   |
+| BitOpPatternRecognition  | P0    | 启用 | 模式匹配位运算优化；O2 中提前运行以消除自定义位运算函数，使 read_bits 等函数可被内联                                                                                               |
+| GlobalVariablePromotion  | O2    | 启用 | 将标量全局变量提升为局部 ALLOCA；**跳过 const 全局变量**（.rodata 只读段）；**在遍历 BB 前先收集 RET 指令**，避免插入时迭代器失效；init 指令插入到 entry block 开头（ALLOCA 之后） |
+| RecursiveMulToNative     | P0    | 禁用 | 已知导致 crypto 编译段错误                                                                                                                                                         |
+| InstructionScheduling    | P3    | 禁用 | 分段调度重写后仍有问题，暂禁用                                                                                                                                                     |
 
 ### 4.3 关键设计决策
 
@@ -138,6 +142,15 @@ row_reduce（conv2d）的 r 循环体中有两个 c 循环，交换后仅处理�
 
 **为什么 `sameLoopBounds` 对于非方阵至关重要？**
 `array[20][100]` 中 `i<20, j<100` 交换后 `j` 可达 99 → 越界 → SEGFAULT。
+
+**为什么 GlobalVariablePromotion 要跳过 const 全局变量？**
+const 全局变量放在 `.rodata` 只读段，退出时 STORE 回写会导致 SEGFAULT。const 全局变量值不变，无需回写。
+
+**为什么 GlobalVariablePromotion 的 init 指令要插入到 entry block 开头？**
+原始 LOAD 指令可能在 entry block 中，如果 init 指令插入到 terminator 之前，ALLOCA 定义会在 USE 之后。必须插入到所有 ALLOCA 之后、第一个非 ALLOCA 指令之前。
+
+**为什么 GlobalVariablePromotion 要先收集 RET 再插入？**
+在遍历指令列表时调用 `insertBefore` 修改列表会导致迭代器失效，exit LOAD 可能未被正确插入，导致 `%n.exit` 未定义。必须先收集所有 RET 指令，再批量插入。
 
 ## 五、编译与测试命令
 
@@ -178,11 +191,12 @@ bash scripts/quick_test.sh <case-name>
 
 ## 七、测试结果历史
 
-| 测评  | 日期    | 结果                                              |
-| ----- | ------- | ------------------------------------------------- |
-| test7 | 2026-06 | 27 WA，LoopInterchange 首版引入                   |
-| test8 | 2026-06 | 21 WA + 5 TLE，LoopInterchange 修复未编译进二进制 |
-| test9 | 2026-06 | 9 WA，旧二进制测试；本地全量 200/200 通过         |
+| 测评   | 日期    | 结果                                                                                                                        |
+| ------ | ------- | --------------------------------------------------------------------------------------------------------------------------- |
+| test7  | 2026-06 | 27 WA，LoopInterchange 首版引入                                                                                             |
+| test8  | 2026-06 | 21 WA + 5 TLE，LoopInterchange 修复未编译进二进制                                                                           |
+| test9  | 2026-06 | 9 WA，旧二进制测试；本地全量 200/200 通过                                                                                   |
+| test10 | 2026-06 | 本地全量 200/200 通过（含 GlobalVariablePromotion）；conv2d/many_mat_cal/knapsack_naive 从超时→通过；huffman 仍超时（~96s） |
 
 ## 八、需要注意的陷阱
 

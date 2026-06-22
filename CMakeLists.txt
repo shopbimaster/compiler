@@ -81,6 +81,7 @@ add_library(sysy_opt STATIC
     src/opt/InstructionScheduling.cpp
     src/opt/RecursiveMulToNative.cpp
     src/opt/BitOpPatternRecognition.cpp
+    src/opt/GlobalVariablePromotion.cpp
 )
 target_include_directories(sysy_opt PUBLIC include)
 target_link_libraries(sysy_opt PUBLIC sysy_ir_core)
