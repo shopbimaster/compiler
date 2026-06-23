@@ -293,6 +293,14 @@ namespace IR {
         return new Instruction(Opcode::PHI, ty, name, reserve);
     }
 
+    Instruction* Instruction::createSelect(Value* cond, Value* trueVal, Value* falseVal, const std::string& name) {
+        auto* inst = new Instruction(Opcode::SELECT, trueVal->getType(), name, 3);
+        inst->addOperand(cond);
+        inst->addOperand(trueVal);
+        inst->addOperand(falseVal);
+        return inst;
+    }
+
     // ================================================================
     // BasicBlock
     // ================================================================
@@ -513,6 +521,7 @@ namespace IR {
                         case Instruction::Opcode::ZEXT: oss << "zext "; break;
                         case Instruction::Opcode::SEXT: oss << "sext "; break;
                         case Instruction::Opcode::GETELEMENTPTR: oss << "getelementptr "; break;
+                        case Instruction::Opcode::SELECT: oss << "select "; break;
                         default: oss << "unknown "; break;
                         }
                         oss << inst->getType()->toString();

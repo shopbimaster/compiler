@@ -70,6 +70,13 @@ add_library(sysy_opt STATIC
     src/opt/DominatorAnalysis.cpp
     src/opt/ConstantFolding.cpp
     src/opt/DeadCodeElimination.cpp
+    src/opt/DeadStoreElimination.cpp
+    src/opt/LoadElimination.cpp
+    src/opt/Reassociate.cpp
+    src/opt/TreeShaking.cpp
+    src/opt/CodeSink.cpp
+    src/opt/IfConversion.cpp
+    src/opt/ADCE.cpp
     src/opt/PeepholeOptimizer.cpp
     src/opt/InlineExpansion.cpp
     src/opt/CSE.cpp

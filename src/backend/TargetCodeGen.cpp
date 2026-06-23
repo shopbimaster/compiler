@@ -528,6 +528,9 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
     case Opc::FCMP:
         emitFcmp(inst);
         break;
+    case Opc::SELECT:
+        emitSelect(inst);
+        break;
     default:
         emitter.emitText("  # unknown opcode " + std::to_string(static_cast<int>(inst.getOpcode())));
         break;
@@ -1254,6 +1257,63 @@ void TargetCodeGen::emitFptosi(IR::Instruction& inst) {
     if (!rdInReg) {
         code += storeFromReg(&inst, dest);
     }
+    emitter.emitText(code);
+}
+
+void TargetCodeGen::emitSelect(IR::Instruction& inst) {
+    // SELECT %cond, %trueVal, %falseVal -> %result
+    // RISC-V has no native select; use branch pattern
+    static int selectLabelCounter = 0;
+    int labelId = selectLabelCounter++;
+    std::string labelFalse = ".Lselect_false_" + std::to_string(labelId);
+    std::string labelEnd   = ".Lselect_end_"   + std::to_string(labelId);
+
+    std::string code;
+    std::string condReg = getValueReg(inst.getOperand(0));
+    std::string trueReg = getValueReg(inst.getOperand(1));
+    std::string falseReg = getValueReg(inst.getOperand(2));
+    std::string rd = getValueReg(&inst);
+
+    std::string cond = condReg;
+    if (cond.empty()) {
+        code += loadToReg(inst.getOperand(0), "t3");
+        cond = "t3";
+    }
+    std::string tv = trueReg;
+    if (tv.empty()) {
+        code += loadToReg(inst.getOperand(1), "t4");
+        tv = "t4";
+    }
+    std::string fv = falseReg;
+    if (fv.empty()) {
+        code += loadToReg(inst.getOperand(2), "t5");
+        fv = "t5";
+    }
+
+    std::string dest = rd.empty() ? "t0" : rd;
+
+    bool isFloat = inst.getType()->isFloat();
+
+    if (isFloat) {
+        code += "  beqz    " + cond + ", " + labelFalse + "\n";
+        code += "  fmv.s   " + dest + ", " + tv + "\n";
+        code += "  j       " + labelEnd + "\n";
+        code += labelFalse + ":\n";
+        code += "  fmv.s   " + dest + ", " + fv + "\n";
+        code += labelEnd + ":\n";
+    } else {
+        code += "  beqz    " + cond + ", " + labelFalse + "\n";
+        code += "  mv      " + dest + ", " + tv + "\n";
+        code += "  j       " + labelEnd + "\n";
+        code += labelFalse + ":\n";
+        code += "  mv      " + dest + ", " + fv + "\n";
+        code += labelEnd + ":\n";
+    }
+
+    if (rd.empty()) {
+        code += storeFromReg(&inst, dest);
+    }
+
     emitter.emitText(code);
 }
 

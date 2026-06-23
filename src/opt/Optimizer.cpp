@@ -17,6 +17,10 @@ void runO1(IR::Module* mod) {
 }
 
 void runO2(IR::Module* mod) {
+    // 树摇：移除未使用的函数和全局变量，减少后续优化的工作量
+    if (treeShaking(mod)) {
+        // 树摇后无需 CF/DCE，因为被移除的函数不影响其他函数
+    }
     // 位运算模式识别提前运行，消除自定义位运算函数调用（_and/_or/rotlN 等），
     // 让 read_bits 等函数变为叶子函数，以便后续内联 pass 进行内联
     if (bitOpPatternRecognition(mod)) {
@@ -32,11 +36,36 @@ void runO2(IR::Module* mod) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
+    if (deadStoreElimination(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    if (loadElimination(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    if (reassociate(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    if (ifConversion(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
     if (commonSubexpressionElimination(mod)) { /* CSE changed */ }
     // LICM 已在 O1 中运行，内联的单 BB 函数不含循环，无需再次 LICM
     // 二次 LICM 会与内联后修改的 CFG 交互导致段错误
     constantFolding(mod);
     deadCodeElimination(mod);
+    if (adce(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    // 代码下沉：将指令移动到更靠近使用者的位置，减少寄存器压力
+    if (codeSink(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
 }
 
 void runO3(IR::Module* mod) {

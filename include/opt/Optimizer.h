@@ -26,6 +26,7 @@ using SuccMap = std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>
 PredMap buildPredecessors(IR::Function* func);
 SuccMap buildSuccessors(IR::Function* func);
 DomMap computeDominators(IR::Function* func);
+DomMap computePostDominators(IR::Function* func);
 bool strictlyDominates(IR::BasicBlock* a, IR::BasicBlock* b, const DomMap& dom);
 
 // ================================================================
@@ -65,6 +66,13 @@ void runP3(IR::Module* mod);
 bool recursiveMulToNative(IR::Module* mod);
 bool bitOpPatternRecognition(IR::Module* mod);
 bool globalVariablePromotion(IR::Module* mod);
+bool deadStoreElimination(IR::Module* mod);
+bool loadElimination(IR::Module* mod);
+bool reassociate(IR::Module* mod);
+bool treeShaking(IR::Module* mod);
+bool codeSink(IR::Module* mod);
+bool ifConversion(IR::Module* mod);
+bool adce(IR::Module* mod);
 void runP0(IR::Module* mod);
 
 } // namespace Opt

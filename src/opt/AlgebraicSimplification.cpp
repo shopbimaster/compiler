@@ -237,6 +237,169 @@ bool trySimplify(IR::Instruction* inst) {
         }
     }
 
+    // ================================================================
+    // 借鉴 Cpl1 InstSimplify：x + (y - x) = y  和  (y - x) + x = y
+    // ================================================================
+    if (op == Opc::ADD) {
+        // 检查 r = (y - x) 且 l == x
+        if (auto* rInst = dynamic_cast<IR::Instruction*>(r)) {
+            if (rInst->getOpcode() == Opc::SUB && rInst->getNumOperands() >= 2) {
+                if (l == rInst->getOperand(1)) {
+                    // x + (y - x) = y
+                    inst->replaceAllUsesWith(rInst->getOperand(0));
+                    inst->dropAllUses();
+                    for (auto it = bb->begin(); it != bb->end(); ++it) {
+                        if (it->get() == inst) { bb->erase(it); break; }
+                    }
+                    return true;
+                }
+            }
+        }
+        // 检查 l = (y - x) 且 r == x
+        if (auto* lInst = dynamic_cast<IR::Instruction*>(l)) {
+            if (lInst->getOpcode() == Opc::SUB && lInst->getNumOperands() >= 2) {
+                if (r == lInst->getOperand(1)) {
+                    // (y - x) + x = y
+                    inst->replaceAllUsesWith(lInst->getOperand(0));
+                    inst->dropAllUses();
+                    for (auto it = bb->begin(); it != bb->end(); ++it) {
+                        if (it->get() == inst) { bb->erase(it); break; }
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    // ================================================================
+    // 借鉴 Cpl1 InstSimplify：x - (x + y) = -y  →  SUB 0, y
+    // ================================================================
+    if (op == Opc::SUB) {
+        if (auto* rInst = dynamic_cast<IR::Instruction*>(r)) {
+            if (rInst->getOpcode() == Opc::ADD && rInst->getNumOperands() >= 2) {
+                if (l == rInst->getOperand(0)) {
+                    // x - (x + y) = -y  →  SUB 0, y
+                    auto* i32 = dynamic_cast<IR::IntegerType*>(inst->getType());
+                    if (i32) {
+                        auto* zero = IR::ConstantInt::get(i32, 0);
+                        auto* repl = IR::Instruction::createBinOp(
+                            Opc::SUB, inst->getType(), inst->getName() + ".is", zero, rInst->getOperand(1));
+                        for (auto it = bb->begin(); it != bb->end(); ++it) {
+                            if (it->get() == inst) {
+                                replaceWithNewInst(it, inst, repl);
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if (l == rInst->getOperand(1)) {
+                    // x - (y + x) = -y  →  SUB 0, y
+                    auto* i32 = dynamic_cast<IR::IntegerType*>(inst->getType());
+                    if (i32) {
+                        auto* zero = IR::ConstantInt::get(i32, 0);
+                        auto* repl = IR::Instruction::createBinOp(
+                            Opc::SUB, inst->getType(), inst->getName() + ".is", zero, rInst->getOperand(0));
+                        for (auto it = bb->begin(); it != bb->end(); ++it) {
+                            if (it->get() == inst) {
+                                replaceWithNewInst(it, inst, repl);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ================================================================
+    // 借鉴 Cpl1 InstSimplify：x - (0 - y) = x + y
+    // ================================================================
+    if (op == Opc::SUB) {
+        if (auto* rInst = dynamic_cast<IR::Instruction*>(r)) {
+            if (rInst->getOpcode() == Opc::SUB && rInst->getNumOperands() >= 2) {
+                if (auto* zeroC = dynamic_cast<IR::ConstantInt*>(rInst->getOperand(0))) {
+                    if (zeroC->getValue() == 0) {
+                        // x - (0 - y) = x + y
+                        auto* repl = IR::Instruction::createBinOp(
+                            Opc::ADD, inst->getType(), inst->getName() + ".is", l, rInst->getOperand(1));
+                        for (auto it = bb->begin(); it != bb->end(); ++it) {
+                            if (it->get() == inst) {
+                                replaceWithNewInst(it, inst, repl);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ================================================================
+    // 借鉴 Cpl1 InstSimplify：(x + c1) + c2 = x + (c1 + c2)
+    // 常量重结合，将嵌套的加法常量合并，有助于后续 CSE
+    // ================================================================
+    if (op == Opc::ADD) {
+        if (auto* rc = dynamic_cast<IR::ConstantInt*>(r)) {
+            if (auto* lInst = dynamic_cast<IR::Instruction*>(l)) {
+                if (lInst->getOpcode() == Opc::ADD && lInst->getNumOperands() >= 2) {
+                    if (auto* lrc = dynamic_cast<IR::ConstantInt*>(lInst->getOperand(1))) {
+                        // (x + c1) + c2 = x + (c1 + c2)
+                        int64_t sum = lrc->getValue() + rc->getValue();
+                        auto* i32 = dynamic_cast<IR::IntegerType*>(rc->getType());
+                        if (i32) {
+                            auto* sumC = IR::ConstantInt::get(i32, sum);
+                            auto* repl = IR::Instruction::createBinOp(
+                                Opc::ADD, inst->getType(), inst->getName() + ".is",
+                                lInst->getOperand(0), sumC);
+                            for (auto it = bb->begin(); it != bb->end(); ++it) {
+                                if (it->get() == inst) {
+                                    replaceWithNewInst(it, inst, repl);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ================================================================
+    // 借鉴 Cpl1 GEP Flatten：gep(gep(x, c1), c2) = gep(x, c1 + c2)
+    // 将嵌套的 GEP 展开为单层 GEP，合并常量偏移
+    // ================================================================
+    if (op == Opc::GETELEMENTPTR && inst->getNumOperands() >= 2) {
+        if (auto* innerGEP = dynamic_cast<IR::Instruction*>(inst->getOperand(0))) {
+            if (innerGEP->getOpcode() == Opc::GETELEMENTPTR && innerGEP->getNumOperands() >= 2) {
+                // 检查：当前 GEP 的第二个操作数（第一个索引）和内部 GEP 的第二个操作数是否都是常量
+                auto* outerIdx = dynamic_cast<IR::ConstantInt*>(inst->getOperand(1));
+                auto* innerIdx = dynamic_cast<IR::ConstantInt*>(innerGEP->getOperand(1));
+                if (outerIdx && innerIdx) {
+                    // 仅处理单层索引的情况（最简形式）
+                    if (inst->getNumOperands() == 2 && innerGEP->getNumOperands() == 2) {
+                        int64_t sum = innerIdx->getValue() + outerIdx->getValue();
+                        auto* i32 = dynamic_cast<IR::IntegerType*>(outerIdx->getType());
+                        if (i32) {
+                            auto* sumC = IR::ConstantInt::get(i32, sum);
+                            // 获取内部 GEP 的基址指针类型
+                            auto* ptrType = dynamic_cast<IR::PointerType*>(innerGEP->getOperand(0)->getType());
+                            IR::Type* pointee = ptrType ? ptrType->getPointeeType() : inst->getType();
+                            std::vector<IR::Value*> indices = {sumC};
+                            auto* repl = IR::Instruction::createGetElementPtr(
+                                pointee, innerGEP->getOperand(0), indices, inst->getName() + ".is");
+                            for (auto it = bb->begin(); it != bb->end(); ++it) {
+                                if (it->get() == inst) {
+                                    replaceWithNewInst(it, inst, repl);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return false;
 }
 

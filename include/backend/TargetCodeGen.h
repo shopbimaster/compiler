@@ -83,6 +83,7 @@ private:
     void emitGetElementPtr(IR::Instruction& inst);
     void emitSitofp(IR::Instruction& inst);
     void emitFptosi(IR::Instruction& inst);
+    void emitSelect(IR::Instruction& inst);
 
     std::string loadToReg(IR::Value* val, const std::string& destReg);
     std::string storeFromReg(IR::Value* val, const std::string& srcReg, bool addNew = false);

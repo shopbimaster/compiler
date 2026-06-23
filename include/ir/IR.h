@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <cstdint>
 #include <stdexcept>
+#include <algorithm>
 
 namespace IR {
 
@@ -226,7 +227,7 @@ namespace IR {
             CALL,
             GETELEMENTPTR,
             ZEXT, SEXT, TRUNC, SITOFP, FPTOSI,
-            PHI
+            PHI, SELECT
         };
 
         Opcode      getOpcode()    const { return opcode; }
@@ -250,6 +251,7 @@ namespace IR {
         static Instruction* createCmp(Opcode op, Value* lhs, Value* rhs, const std::string& name);
         static Instruction* createCast(Opcode op, Type* toTy, Value* src, const std::string& name);
         static Instruction* createPhi(Type* ty, const std::string& name, unsigned reserve);
+        static Instruction* createSelect(Value* cond, Value* trueVal, Value* falseVal, const std::string& name);
 
     protected:
         Instruction(Opcode op, Type* ty, const std::string& name, unsigned reserve)
@@ -378,7 +380,27 @@ namespace IR {
                                             bool isConst, Constant* init = nullptr);
 
         const std::vector<std::unique_ptr<Function>>&       getFunctions() const { return functions; }
+        std::vector<std::unique_ptr<Function>>&             getFunctions()       { return functions; }
         const std::vector<std::unique_ptr<GlobalVariable>>& getGlobals()   const { return globals; }
+        std::vector<std::unique_ptr<GlobalVariable>>&       getGlobals()         { return globals; }
+
+        // 移除满足谓词的函数（用于 TreeShaking 等死代码消除）
+        template<typename Pred>
+        void removeFunctionsIf(Pred pred) {
+            functions.erase(
+                std::remove_if(functions.begin(), functions.end(),
+                    [&](const std::unique_ptr<Function>& f) { return pred(f.get()); }),
+                functions.end());
+        }
+
+        // 移除满足谓词的全局变量
+        template<typename Pred>
+        void removeGlobalsIf(Pred pred) {
+            globals.erase(
+                std::remove_if(globals.begin(), globals.end(),
+                    [&](const std::unique_ptr<GlobalVariable>& g) { return pred(g.get()); }),
+                globals.end());
+        }
 
         std::string dump() const;
 
