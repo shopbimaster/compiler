@@ -87,13 +87,29 @@ std::unordered_set<IR::GlobalVariable*> collectStoredGlobals(IR::Function* func)
 }
 
 // ================================================================
+// 检查循环体中是否包含 CALL 指令
+// 如果包含，则被调用函数可能修改全局变量，
+// 因此 LOAD 全局变量不能视为循环不变量
+// ================================================================
+bool loopHasCalls(const Loop& loop) {
+    for (auto* bb : loop.body) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::CALL)
+                return true;
+        }
+    }
+    return false;
+}
+
+// ================================================================
 // 不变量判定：所有操作数是常量 || 在循环外定义 || 已标不变量
 // ================================================================
 bool isLoopInvariant(
     IR::Instruction* inst,
     const Loop& loop,
     const std::unordered_set<IR::Instruction*>& invariants,
-    const std::unordered_set<IR::GlobalVariable*>& storedGlobals) {
+    const std::unordered_set<IR::GlobalVariable*>& storedGlobals,
+    bool hasCalls) {
     auto op = inst->getOpcode();
     using Opc = IR::Instruction::Opcode;
     // 不可外提的副作用指令
@@ -103,12 +119,12 @@ bool isLoopInvariant(
         return false;
 
     // LOAD 指令：仅当加载自全局变量且该全局变量在函数中从未被 STORE 时，允许外提
-    // 这样可以安全地外提如 N_eff、N 等循环边界常量的 LOAD
+    // 但若循环体中有 CALL 指令，被调用函数可能修改全局变量，保守不提升
     if (op == Opc::LOAD) {
         auto* ptr = inst->getOperand(0);
         auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr);
         if (!gv || storedGlobals.count(gv)) return false;
-        // 全局变量未被存储 → LOAD 是循环不变量
+        if (hasCalls) return false;
         return true;
     }
 
@@ -150,12 +166,13 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
 
     // 2. 迭代标记不变量直到收敛
     auto storedGlobals = collectStoredGlobals(func);
+    bool hasCalls = loopHasCalls(loop);
     std::unordered_set<IR::Instruction*> invariants;
     bool changed = true;
     while (changed) {
         changed = false;
         for (auto* inst : loopInsts) {
-            if (!invariants.count(inst) && isLoopInvariant(inst, loop, invariants, storedGlobals)) {
+            if (!invariants.count(inst) && isLoopInvariant(inst, loop, invariants, storedGlobals, hasCalls)) {
                 invariants.insert(inst);
                 changed = true;
             }
