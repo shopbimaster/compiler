@@ -514,6 +514,7 @@ namespace IR {
                         case Instruction::Opcode::XOR:  oss << "xor ";  break;
                         case Instruction::Opcode::SHL:  oss << "shl ";  break;
                         case Instruction::Opcode::ASHR: oss << "ashr "; break;
+                        case Instruction::Opcode::SMULH: oss << "smulh "; break;
                         case Instruction::Opcode::ICMP: oss << "icmp "; break;
                         case Instruction::Opcode::FCMP: oss << "fcmp "; break;
                         case Instruction::Opcode::SITOFP: oss << "sitofp "; break;

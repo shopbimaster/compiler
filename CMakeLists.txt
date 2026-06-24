@@ -76,6 +76,11 @@ add_library(sysy_opt STATIC
     src/opt/TreeShaking.cpp
     src/opt/CodeSink.cpp
     src/opt/IfConversion.cpp
+    src/opt/InstCombine.cpp
+    src/opt/SimplifyCFG.cpp
+    src/opt/CopyPropagation.cpp
+    src/opt/MagicDivision.cpp
+    src/opt/BasicBlockReordering.cpp
     src/opt/ADCE.cpp
     src/opt/PeepholeOptimizer.cpp
     src/opt/InlineExpansion.cpp

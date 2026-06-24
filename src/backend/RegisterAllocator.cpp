@@ -121,7 +121,13 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
                 if (dynamic_cast<IR::GlobalVariable*>(opVal)) continue;
 
                 if (firstSeen.find(opVal) == firstSeen.end()) {
-                    firstSeen[opVal] = curId;
+                    // 不在此处设置 firstSeen。
+                    // firstSeen 应当始终是定义点（产生该值的指令），
+                    // 而非第一个使用点。如果基本块重排导致使用
+                    // 先于定义被遍历到，此处错误设置 firstSeen
+                    // 会破坏活跃区间，导致线性扫描分配器错误分配寄存器。
+                    // 仅由 ALLOCA 产生且未被提升的指针值不会出现在
+                    // firstSeen 中，这是正确的——它们不需要寄存器。
                 }
                 lastSeen[opVal] = curId;
 
@@ -210,6 +216,48 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
             if (usedInLoop) {
                 // Extend the interval to cover the entire loop body
                 lastSeen[val] = std::max(lastSeen[val], loop.maxLoopId);
+            }
+        }
+    }
+
+    // ================================================================
+    // FoldMemoryAccess liveness extension:
+    // When a GEP has only one use (a LOAD/STORE), the GEP's operands
+    // must be live until the LOAD/STORE instruction, not just until
+    // the GEP instruction. Otherwise the register allocator may reuse
+    // the GEP operands' registers for the LOAD/STORE's value.
+    // ================================================================
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::GETELEMENTPTR)
+                continue;
+            if (!inst->hasOneUse())
+                continue;
+            auto& uses = inst->getUses();
+            auto* user = dynamic_cast<IR::Instruction*>(uses[0].user);
+            if (!user) continue;
+            auto userOp = user->getOpcode();
+            if (userOp != IR::Instruction::Opcode::LOAD &&
+                userOp != IR::Instruction::Opcode::STORE)
+                continue;
+
+            // Folded GEP: extend the live ranges of all GEP operands
+            // to cover the LOAD/STORE instruction
+            auto userIdIt = instId.find(user);
+            if (userIdIt == instId.end()) continue;
+            int userId = userIdIt->second;
+
+            for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
+                auto* opVal = inst->getOperand(i);
+                if (!opVal) continue;
+                if (dynamic_cast<IR::Constant*>(opVal)) continue;
+                if (dynamic_cast<IR::BasicBlock*>(opVal)) continue;
+                if (dynamic_cast<IR::Function*>(opVal)) continue;
+                if (dynamic_cast<IR::GlobalVariable*>(opVal)) continue;
+                auto it = lastSeen.find(opVal);
+                if (it != lastSeen.end()) {
+                    it->second = std::max(it->second, userId);
+                }
             }
         }
     }

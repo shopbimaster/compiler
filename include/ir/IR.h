@@ -222,6 +222,7 @@ namespace IR {
             ADD, SUB, MUL, SDIV, SREM,
             FADD, FSUB, FMUL, FDIV,
             AND, OR, XOR, SHL, ASHR,
+            SMULH,
             ICMP, FCMP,
             ALLOCA, LOAD, STORE,
             CALL,
@@ -330,6 +331,7 @@ namespace IR {
         Argument* getArg(unsigned i) const;
 
         const std::vector<std::unique_ptr<BasicBlock>>& getBlocks() const { return blocks; }
+        std::vector<std::unique_ptr<BasicBlock>>& getBlocks() { return blocks; }
         BasicBlock* getEntryBlock() const { return blocks.empty() ? nullptr : blocks.front().get(); }
 
         BasicBlock* createBlock(const std::string& name = "");

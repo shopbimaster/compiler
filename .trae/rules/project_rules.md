@@ -65,6 +65,10 @@ compiler/
 │   ├── h_functional/          # 40 个隐藏功能测试
 │   ├── performance/           # 60 个性能测试
 │   └── *.sy                   # 临时测试文件（可清理）
+├── Solutions/
+│   ├── 调研文档.md             # 优秀编译器范例调研与对比分析
+│   ├── Cpl1/                  # 范例1：Gnalc（三层IR，仿射分析，高级循环变换）
+│   └── Cpl2/                  # 范例2：LLVM风格IR（完整SSA，丰富后端优化）
 ├── scripts/
 │   ├── run_tests.sh           # 统一测试入口
 │   ├── quick_test.sh          # 快速单用例 O0 vs O3 对比
@@ -197,8 +201,27 @@ bash scripts/quick_test.sh <case-name>
 | test8  | 2026-06 | 21 WA + 5 TLE，LoopInterchange 修复未编译进二进制                                                                           |
 | test9  | 2026-06 | 9 WA，旧二进制测试；本地全量 200/200 通过                                                                                   |
 | test10 | 2026-06 | 本地全量 200/200 通过（含 GlobalVariablePromotion）；conv2d/many_mat_cal/knapsack_naive 从超时→通过；huffman 仍超时（~96s） |
+| test12 | 2026-06 | 旧二进制测试（huffman TLE, conv2d 116s 等）；当前二进制全量 200/200 通过，LICM 修复后 huffman 107ms，conv2d-1 807ms         |
 
-## 八、需要注意的陷阱
+## 八、调研文档规则
+
+**`Solutions/调研文档.md`** 是项目的重要参考文档，记录了所有已调研的优秀编译器范例、横向对比分析和优化建议。
+
+**必须遵守的规则**：
+
+1. **每次引入新范例（Solutions/CplN）后**，必须更新调研文档，新增该范例的详细分析
+2. **每次参照范例改进项目后**，必须更新调研文档的"更新记录"和对应章节，标记已实施的优化
+3. **调研文档的结构**：
+   - 范例概览表（一）
+   - 各范例详细分析（二）
+   - 横向对比：公共基础设施（三）
+   - 横向对比：优化思路（四）
+   - 建议实施路线（五）
+   - 更新记录（六）
+4. 横向对比部分应保持三列（Cpl1 / Cpl2 / 我们）或更多列，清晰展示差异
+5. 建议实施路线按优先级分阶段，每个优化标注来源范例
+
+## 九、需要注意的陷阱
 
 1. **IR 打印**：`ConstantFloat` 在 `Module::dump()` 的通用操作数打印路径（非 `loadToReg` 路径）中需要特殊处理，否则显示为 `%` 而非实际值
 2. **STORE 指令**：`cloneNonTermInst` 中 STORE 的指针操作数必须通过 `lookup` 映射查找，否则指向旧 BB 的 ALLOCA

@@ -173,6 +173,10 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
 
     regAlloc.allocate(func);
 
+    // 收集可以融合的 GEP+LOAD/STORE 模式（FoldMemoryAccess）
+    foldedGeps.clear();
+    collectFoldedGeps(func);
+
     // 将 promoted ALLOCA 的 LOAD 指令映射到 callee-saved 寄存器，
     // 避免后续 emitLoad 生成冗余的 mv 指令
     for (auto& bb : func.getBlocks()) {
@@ -460,6 +464,109 @@ void TargetCodeGen::emitEpilogue(IR::Function& func) {
     emitter.emitText("  ret");
 }
 
+// ================================================================
+// FoldMemoryAccess: 收集 GEP 指令，其唯一使用者是 LOAD 或 STORE
+// 这些 GEP 的地址计算将被内联到 LOAD/STORE 中，避免
+// 存储→加载 GEP 结果的往返开销
+// ================================================================
+void TargetCodeGen::collectFoldedGeps(IR::Function& func) {
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::GETELEMENTPTR)
+                continue;
+            // 仅当 GEP 恰好有一个使用者时才可融合
+            if (!inst->hasOneUse())
+                continue;
+            auto& uses = inst->getUses();
+            auto* user = dynamic_cast<IR::Instruction*>(uses[0].user);
+            if (!user)
+                continue;
+            auto userOp = user->getOpcode();
+            if (userOp != IR::Instruction::Opcode::LOAD &&
+                userOp != IR::Instruction::Opcode::STORE)
+                continue;
+
+            // 安全检查：如果 GEP 的基指针（operand 0）本身也是一个 GEP 指令，
+            // 则跳过融合。嵌套 GEP 融合会导致复杂的活跃范围交互，
+            // 可能使寄存器分配器错误地复用寄存器。
+            auto* basePtr = inst->getOperand(0);
+            if (auto* baseInst = dynamic_cast<IR::Instruction*>(basePtr)) {
+                if (baseInst->getOpcode() == IR::Instruction::Opcode::GETELEMENTPTR)
+                    continue;
+            }
+
+            foldedGeps.insert(inst.get());
+        }
+    }
+}
+
+// 将 GEP 的地址计算内联到指定寄存器中，不存储结果
+// 使用 addrReg 作为基址/结果寄存器，t1 作为索引寄存器，t3 作为临时乘法寄存器
+std::string TargetCodeGen::emitGEPAddressToReg(IR::Instruction& gep,
+                                                const std::string& addrReg) {
+    std::string code;
+    code += loadToReg(gep.getOperand(0), addrReg);
+
+    unsigned numOps = gep.getNumOperands();
+    if (numOps >= 2) {
+        auto* ptrTy = dynamic_cast<IR::PointerType*>(gep.getOperand(0)->getType());
+        IR::Type* curPointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
+
+        // 第一个索引（operand 1）：指针偏移，乘以 sizeof(pointee)
+        auto* firstIdx = dynamic_cast<IR::ConstantInt*>(gep.getOperand(1));
+        bool firstIsZero = firstIdx && firstIdx->getValue() == 0;
+        if (!firstIsZero) {
+            int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
+            code += loadToReg(gep.getOperand(1), "t1");
+            if (ptrStride == 1) {
+            } else if (ptrStride == 2) {
+                code += "  slli    t1, t1, 1\n";
+            } else if (ptrStride == 4) {
+                code += "  slli    t1, t1, 2\n";
+            } else if (ptrStride == 8) {
+                code += "  slli    t1, t1, 3\n";
+            } else {
+                code += "  li      t3, " + std::to_string(ptrStride) + "\n";
+                code += "  mul     t1, t1, t3\n";
+            }
+            code += "  add     " + addrReg + ", " + addrReg + ", t1\n";
+        }
+
+        // 后续索引（operand 2+）：数组索引
+        for (unsigned i = 2; i < numOps; ++i) {
+            auto* idxConst = dynamic_cast<IR::ConstantInt*>(gep.getOperand(i));
+            if (idxConst && idxConst->getValue() == 0) {
+                if (curPointee && curPointee->isArray()) {
+                    auto* arrTy = dynamic_cast<IR::ArrayType*>(curPointee);
+                    curPointee = arrTy->getElementType();
+                }
+                continue;
+            }
+
+            int stride = 4;
+            if (curPointee && curPointee->isArray()) {
+                auto* arrTy = dynamic_cast<IR::ArrayType*>(curPointee);
+                stride = getTypeSize(arrTy->getElementType());
+                curPointee = arrTy->getElementType();
+            }
+            code += loadToReg(gep.getOperand(i), "t1");
+            if (stride == 1) {
+            } else if (stride == 2) {
+                code += "  slli    t1, t1, 1\n";
+            } else if (stride == 4) {
+                code += "  slli    t1, t1, 2\n";
+            } else if (stride == 8) {
+                code += "  slli    t1, t1, 3\n";
+            } else {
+                code += "  li      t3, " + std::to_string(stride) + "\n";
+                code += "  mul     t1, t1, t3\n";
+            }
+            code += "  add     " + addrReg + ", " + addrReg + ", t1\n";
+        }
+    }
+    return code;
+}
+
 void TargetCodeGen::emitBasicBlock(IR::BasicBlock& bb) {
     // Use .L prefix for local labels to avoid symbol conflicts across functions
     emitter.emitText(".L" + currentFunc->getName() + "_" + bb.getName() + ":");
@@ -491,6 +598,7 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
     case Opc::XOR:
     case Opc::SHL:
     case Opc::ASHR:
+    case Opc::SMULH:
         emitBinOp(inst);
         break;
     case Opc::ICMP:
@@ -796,6 +904,13 @@ void TargetCodeGen::emitBinOp(IR::Instruction& inst) {
     case Opc::XOR:  code += "  xor     " + dest + ", " + op0 + ", " + op1 + "\n"; break;
     case Opc::SHL:  code += "  sllw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
     case Opc::ASHR: code += "  sraw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
+    case Opc::SMULH:
+        // smulh: 返回两个 i32 有符号乘积的高 32 位
+        // RISC-V: mul 得到 64 位全乘积，srai 32 取高 32 位并符号扩展
+        // 使用 t2 作为临时寄存器（避免与 t0/t1 的 operand 加载冲突）
+        code += "  mul     t2, " + op0 + ", " + op1 + "\n";
+        code += "  srai    " + dest + ", t2, 32\n";
+        break;
     default: break;
     }
 
@@ -964,7 +1079,16 @@ void TargetCodeGen::emitLoad(IR::Instruction& inst) {
         return;
     }
 
-    code += loadToReg(ptrOp, "t0");
+    // FoldMemoryAccess: 如果指针操作数是一个已被融合的 GEP，
+    // 则内联地址计算，避免存储/加载 GEP 结果的往返开销
+    auto* gepInst = dynamic_cast<IR::Instruction*>(ptrOp);
+    bool isFoldedGep = gepInst && foldedGeps.count(gepInst);
+    if (isFoldedGep) {
+        code += emitGEPAddressToReg(*gepInst, "t0");
+    } else {
+        code += loadToReg(ptrOp, "t0");
+    }
+
     auto* loadTy = inst.getType();
 
     std::string rd = getValueReg(&inst);
@@ -1019,19 +1143,38 @@ void TargetCodeGen::emitStore(IR::Instruction& inst) {
         return;
     }
 
+    // FoldMemoryAccess: 检查指针操作数是否是已融合的 GEP
+    auto* gepInst = dynamic_cast<IR::Instruction*>(ptrOp);
+    bool isFoldedGep = gepInst && foldedGeps.count(gepInst);
+
     auto* valTy = inst.getOperand(0)->getType();
     if (valTy && valTy->isFloat()) {
         code += loadToReg(inst.getOperand(0), "ft0");
-        code += loadToReg(inst.getOperand(1), "t0");
+        // 浮点存储：值在 ft0，地址可用 t0（不与 GEP 内部使用的 t1/t3 冲突）
+        if (isFoldedGep) {
+            code += emitGEPAddressToReg(*gepInst, "t0");
+        } else {
+            code += loadToReg(inst.getOperand(1), "t0");
+        }
         code += "  fsw     ft0, 0(t0)\n";
     } else if (valTy && valTy->isPointer()) {
         code += loadToReg(inst.getOperand(0), "t0");
-        code += loadToReg(inst.getOperand(1), "t1");
-        code += "  sd      t0, 0(t1)\n";
+        // 指针存储：值在 t0，地址用 t2（避免与 GEP 的 t1 索引寄存器冲突）
+        if (isFoldedGep) {
+            code += emitGEPAddressToReg(*gepInst, "t2");
+        } else {
+            code += loadToReg(inst.getOperand(1), "t1");
+        }
+        code += "  sd      t0, 0(" + std::string(isFoldedGep ? "t2" : "t1") + ")\n";
     } else {
         code += loadToReg(inst.getOperand(0), "t0");
-        code += loadToReg(inst.getOperand(1), "t1");
-        code += "  sw      t0, 0(t1)\n";
+        // 整数存储：值在 t0，地址用 t2（避免与 GEP 的 t1 索引寄存器冲突）
+        if (isFoldedGep) {
+            code += emitGEPAddressToReg(*gepInst, "t2");
+        } else {
+            code += loadToReg(inst.getOperand(1), "t1");
+        }
+        code += "  sw      t0, 0(" + std::string(isFoldedGep ? "t2" : "t1") + ")\n";
     }
     emitter.emitText(code);
 }
@@ -1147,6 +1290,9 @@ void TargetCodeGen::emitCall(IR::Instruction& inst) {
 }
 
 void TargetCodeGen::emitGetElementPtr(IR::Instruction& inst) {
+    // 如果此 GEP 已被融合到 LOAD/STORE 中，跳过发射
+    if (foldedGeps.count(&inst)) return;
+
     std::string code;
 
     code += loadToReg(inst.getOperand(0), "t0");

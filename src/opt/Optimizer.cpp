@@ -40,10 +40,26 @@ void runO2(IR::Module* mod) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
-    if (loadElimination(mod)) {
+    if (instCombine(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
+    if (simplifyCFG(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    if (copyPropagation(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    if (magicDivision(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    // if (loadElimination(mod)) {
+    //     constantFolding(mod);
+    //     deadCodeElimination(mod);
+    // }
     if (reassociate(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
@@ -65,6 +81,11 @@ void runO2(IR::Module* mod) {
     if (codeSink(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
+    }
+    // 基本块重排：基于支配树的拓扑排序，优化 fall-through
+    // 确保定义在使用之前，避免寄存器分配器的活跃区间错误
+    if (basicBlockReordering(mod)) {
+        // 仅布局变化，无需 CF/DCE
     }
 }
 

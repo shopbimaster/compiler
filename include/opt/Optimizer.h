@@ -73,6 +73,11 @@ bool treeShaking(IR::Module* mod);
 bool codeSink(IR::Module* mod);
 bool ifConversion(IR::Module* mod);
 bool adce(IR::Module* mod);
+bool instCombine(IR::Module* mod);
+bool simplifyCFG(IR::Module* mod);
+bool copyPropagation(IR::Module* mod);
+bool magicDivision(IR::Module* mod);
+bool basicBlockReordering(IR::Module* mod);
 void runP0(IR::Module* mod);
 
 } // namespace Opt

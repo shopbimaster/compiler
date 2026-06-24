@@ -55,6 +55,11 @@ private:
     std::unordered_map<IR::GlobalVariable*, std::string> globalAddrCache;
     void collectGlobalAddresses(IR::Function& func);
 
+    // FoldMemoryAccess：将 GETELEMENTPTR+LOAD/STORE 融合为单次地址计算+内存访问
+    std::unordered_set<IR::Instruction*> foldedGeps;
+    void collectFoldedGeps(IR::Function& func);
+    std::string emitGEPAddressToReg(IR::Instruction& gep, const std::string& addrReg);
+
     void emitGlobal(IR::GlobalVariable* gv);
     void emitGlobalInitData(IR::Constant* init, IR::Type* type, const std::string& indent);
 
