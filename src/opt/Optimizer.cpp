@@ -56,10 +56,10 @@ void runO2(IR::Module* mod) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
-    // if (loadElimination(mod)) {
-    //     constantFolding(mod);
-    //     deadCodeElimination(mod);
-    // }
+    if (loadElimination(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
     if (reassociate(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
@@ -105,8 +105,7 @@ void runO3(IR::Module* mod) {
 }
 
 void runP0(IR::Module* mod) {
-    // recursiveMulToNative 已知导致 crypto 编译段错误，暂禁用
-    // if (recursiveMulToNative(mod)) { /* changed */ }
+    if (recursiveMulToNative(mod)) { /* changed */ }
     if (bitOpPatternRecognition(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);

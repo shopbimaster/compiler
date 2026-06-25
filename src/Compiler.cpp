@@ -26,8 +26,7 @@ static void runOptPasses(Module* mod, OptLevel opt) {
         Opt::runO2(mod);
         Opt::runO3(mod);
         Opt::runP0(mod);
-        // P3 (instructionScheduling) 已知导致段错误，暂禁用
-        // Opt::runP3(mod);
+        Opt::runP3(mod);
         break;
     case OptLevel::O0:
     default:

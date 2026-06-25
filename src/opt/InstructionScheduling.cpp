@@ -145,16 +145,25 @@ void scheduleBB(IR::BasicBlock* bb) {
     if (!changed) return;
 
     // ---- 重建 BB（在 terminator 之前） ----
+    // 先保存并移除 terminator，避免 vector::insert 导致迭代器失效
+    auto termIt = bb->end();
+    --termIt;
+    auto termInst = std::move(*termIt);
+    bb->erase(termIt);
+
     // 提取所有非 terminator 指令
     std::vector<std::unique_ptr<IR::Instruction>> extracted;
-    size_t nonTermCount = insts.size() - 1;
-    for (size_t i = 0; i < nonTermCount; ++i) {
+    while (bb->begin() != bb->end()) {
         auto it = bb->begin();
         extracted.push_back(std::move(*it));
         bb->erase(it);
     }
 
-    if (extracted.empty()) return;
+    if (extracted.empty()) {
+        // 恢复 terminator
+        bb->pushBack(termInst.release());
+        return;
+    }
 
     // 按 segments + boundaries 顺序重建
     size_t segIdx = 0, bndIdx = 0;
@@ -170,19 +179,18 @@ void scheduleBB(IR::BasicBlock* bb) {
         }
     }
 
-    // 检查是否有遗漏（理论上不应该）
-    // 重新插入到 terminator 之前
-    auto termIt = bb->end();
-    --termIt;
+    // 按新顺序插入指令（BB 为空，直接 pushBack 即可）
     for (auto* inst : newOrder) {
-        // 从 extracted 中找到对应的 unique_ptr 并释放
         for (auto& up : extracted) {
             if (up.get() == inst) {
-                bb->insert(termIt, up.release());
+                bb->pushBack(up.release());
                 break;
             }
         }
     }
+
+    // 恢复 terminator 到末尾
+    bb->pushBack(termInst.release());
 }
 
 } // namespace

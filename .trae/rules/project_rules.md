@@ -95,11 +95,23 @@ compiler/
 // O1: 基础优化
 CF → DCE → CSE → LICM → CF → DCE
 
-// O2: 内联 + 全局变量提升 + 寄存器压力优化
-bitOpPatternRecognition → CF → DCE
+// O2: 内联 + 全局变量提升 + 寄存器压力优化 + 新Pass
+treeShaking
+→ bitOpPatternRecognition → CF → DCE
 → inlineExpansion → CF → DCE
 → globalVariablePromotion → CF → DCE
+→ deadStoreElimination → CF → DCE
+→ instCombine → CF → DCE
+→ simplifyCFG → CF → DCE
+→ copyPropagation → CF → DCE
+→ magicDivision → CF → DCE
+→ loadElimination → CF → DCE
+→ reassociate → CF → DCE
+→ ifConversion → CF → DCE
 → CSE → CF → DCE
+→ adce → CF → DCE
+→ codeSink → CF → DCE
+→ basicBlockReordering
 
 // O3: 高级循环/递归优化
 algebraicSimplification → CF → DCE
@@ -108,11 +120,11 @@ algebraicSimplification → CF → DCE
 → tailRecursionElimination → CF → DCE
 
 // P0: 特殊模式识别
-bitOpPatternRecognition → CF → DCE
-// recursiveMulToNative 暂禁用
+recursiveMulToNative
+→ bitOpPatternRecognition → CF → DCE
 
-// P3: 指令调度（暂禁用）
-// instructionScheduling → CF → DCE
+// P3: 指令调度
+instructionScheduling → CF → DCE
 ```
 
 ### 4.2 当前启用的 Pass 及关键注意事项
@@ -123,15 +135,27 @@ bitOpPatternRecognition → CF → DCE
 | DeadCodeElimination      | O1    | 启用 | 无已知问题                                                                                                                                                                         |
 | CSE                      | O1/O2 | 启用 | 使用 `replaceAllUsesWith` 后 `erase`，安全                                                                                                                                         |
 | LICM                     | O1    | 启用 | 仅 O1 运行一次；O2 不再次运行（避免与内联修改的 CFG 交互导致段错误）                                                                                                               |
-| InlineExpansion          | O2    | 启用 | 仅内联单 BB 小函数；**多 BB 函数不内联**                                                                                                                                           |
+| InlineExpansion          | O2    | 启用 | 单 BB 小函数（指令数 <20）和多 BB 函数（≤8 BB、≤60 指令）均可内联；多 BB 函数在同一 caller 中被调用超过 2 次跳过内联，避免代码膨胀导致性能下降                                     |
 | AlgebraicSimplification  | O3    | 启用 | 强度削减：`sdiv/srem` 除以 2 的幂需要检查左操作数非负才能替换为 `ashr`/`and`                                                                                                       |
 | LoopInterchange          | O3    | 启用 | **三项安全检查缺一不可**：`icmpUsesVar`、`isUsedOutsideBBSet`、`sameLoopBounds`；**外加 `hasOtherLoop` 检查**（外层循环体不能有除当前内层外其他循环）                              |
 | LoopUnrolling            | O3    | 启用 | 仅展开迭代次数 ≤64 的简单 while 循环；`cloneNonTermInst` 中 STORE 指针操作数必须通过 `lookup` 查找                                                                                 |
 | TailRecursionElimination | O3    | 启用 | `findBodyBlock` 将 entry block 拆分为 init 和 body；**幂等设计**：拆分后再次调用直接返回 BR 目标                                                                                   |
-| BitOpPatternRecognition  | P0    | 启用 | 模式匹配位运算优化；O2 中提前运行以消除自定义位运算函数，使 read_bits 等函数可被内联                                                                                               |
+| BitOpPatternRecognition  | P0/O2 | 启用 | 模式匹配位运算优化；O2 中提前运行以消除自定义位运算函数，使 read_bits 等函数可被内联                                                                                               |
 | GlobalVariablePromotion  | O2    | 启用 | 将标量全局变量提升为局部 ALLOCA；**跳过 const 全局变量**（.rodata 只读段）；**在遍历 BB 前先收集 RET 指令**，避免插入时迭代器失效；init 指令插入到 entry block 开头（ALLOCA 之后） |
-| RecursiveMulToNative     | P0    | 禁用 | 已知导致 crypto 编译段错误                                                                                                                                                         |
-| InstructionScheduling    | P3    | 禁用 | 分段调度重写后仍有问题，暂禁用                                                                                                                                                     |
+| RecursiveMulToNative     | P0    | 启用 | 将递归乘法转换为原生 MUL 指令；**修复**：转换后清除空的非 entry BB，避免 CFG 中出现空 BB 导致段错误                                                                                |
+| InstructionScheduling    | P3    | 启用 | **修复**：`scheduleBB` 中 vector::insert 导致迭代器失效的 bug — 先移除 terminator，清空 BB 后按新顺序 pushBack，最后恢复 terminator                                                |
+| LoadElimination          | O2    | 启用 | 消除冗余 LOAD 指令；**安全检查**：跳过全局变量（`involvesGlobal`）、跳过跨 BB 被 STORE 的 ALLOCA、仅替换同 BB 内 uses、使用严格指针相等（`a == b`）                                |
+| CodeSink                 | O2    | 启用 | 将指令下沉到更靠近使用者的位置；**安全约束**：LOAD 指令不可下沉（可能越过 STORE/CALL 改变内存读写顺序）                                                                            |
+| DeadStoreElimination     | O2    | 启用 | 消除无用的 STORE 指令                                                                                                                                                              |
+| InstCombine              | O2    | 启用 | 代数恒等式简化 + Store-to-Load 转发                                                                                                                                                |
+| SimplifyCFG              | O2    | 启用 | 常量分支折叠 + 不可达块删除 + 块合并 + 空块消除                                                                                                                                    |
+| CopyPropagation          | O2    | 启用 | 数据流复制传播                                                                                                                                                                     |
+| MagicDivision            | O2    | 启用 | 常量除法转换为乘法+移位序列                                                                                                                                                        |
+| Reassociate              | O2    | 启用 | 表达式重结合，优化常量折叠机会                                                                                                                                                     |
+| IfConversion             | O2    | 启用 | 条件转换                                                                                                                                                                           |
+| ADCE                     | O2    | 启用 | 激进死代码消除                                                                                                                                                                     |
+| BasicBlockReordering     | O2    | 启用 | 基于支配树的拓扑排序基本块重排，优化 fall-through，确保定义在使用之前                                                                                                              |
+| TreeShaking              | O2    | 启用 | 移除未使用的函数和全局变量                                                                                                                                                         |
 
 ### 4.3 关键设计决策
 
@@ -155,6 +179,15 @@ const 全局变量放在 `.rodata` 只读段，退出时 STORE 回写会导致 S
 
 **为什么 GlobalVariablePromotion 要先收集 RET 再插入？**
 在遍历指令列表时调用 `insertBefore` 修改列表会导致迭代器失效，exit LOAD 可能未被正确插入，导致 `%n.exit` 未定义。必须先收集所有 RET 指令，再批量插入。
+
+**为什么 InstructionScheduling 的 scheduleBB 要先移除 terminator？**
+指令列表是 `std::vector`，`vector::insert` 会使迭代器失效。原代码保存 terminator 迭代器后多次 insert，第一次 insert 后迭代器即失效导致 UB。修复：先移除 terminator → 清空 BB → 按序 pushBack → 恢复 terminator。
+
+**为什么 CodeSink 不能下沉 LOAD 指令？**
+LOAD 指令下沉可能越过 STORE/CALL 指令，改变内存读写顺序。例如：`load %ptr` → `store %val, %ptr` → `use %load`，若将 LOAD 下沉到 STORE 之后，LOAD 会读取到 STORE 写入的新值，而非原始值。
+
+**为什么 RecursiveMulToNative 要清除空的非 entry BB？**
+转换后非 entry BB 的指令被清空，但空 BB 仍留在 CFG 中，后续 Pass（如寄存器分配）遍历时遇到空 BB 可能段错误。必须清除这些空 BB。
 
 ## 五、编译与测试命令
 

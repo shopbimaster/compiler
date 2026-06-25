@@ -14,12 +14,15 @@ namespace Opt {
 namespace {
 
 // 判断指令是否有副作用，不能下沉
+// LOAD 也不能下沉：下沉 LOAD 可能越过 STORE/CALL，
+// 改变内存读写顺序，导致读取到错误的值
 bool hasSideEffect(IR::Instruction* inst) {
     auto op = inst->getOpcode();
     using Opc = IR::Instruction::Opcode;
     return op == Opc::STORE || op == Opc::CALL ||
            op == Opc::RET   || op == Opc::BR ||
-           op == Opc::COND_BR || op == Opc::ALLOCA;
+           op == Opc::COND_BR || op == Opc::ALLOCA ||
+           op == Opc::LOAD;
 }
 
 // 对单个 BB 做代码下沉

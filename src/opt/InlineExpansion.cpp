@@ -17,9 +17,9 @@ namespace {
 
 const unsigned MAX_INLINE_INSTS_SINGLE = 20;
 const unsigned MAX_INLINE_INSTS_MULTI = 60;
-// 多 BB 函数内联已知导致运行时死循环（如 03_sort1 radix 排序），
-// 且与项目规则一致：仅内联单 BB 小函数；多 BB 函数不内联
-const unsigned MAX_INLINE_BBS_MULTI = 0; // 禁用多 BB 内联
+const unsigned MAX_INLINE_BBS_MULTI = 8;
+// 多BB函数在同一caller中被调用超过此次数则不内联，避免代码膨胀导致性能下降
+const unsigned MAX_MULTI_BB_CALL_SITES = 2;
 
 bool isLeafCall(IR::Function* func) {
     if (func->isExternal()) return false;
@@ -495,13 +495,36 @@ bool inlineExpansion(IR::Module* mod) {
             if (func->isExternal()) continue;
             // 跳过候选函数自身（避免内联到自身）
             if (candidates.count(func.get())) continue;
+
+            // 统计当前 caller 中各候选 callee 的调用次数
+            // 多BB函数如果被调用太多次，内联会导致代码膨胀和性能下降
+            std::unordered_map<IR::Function*, unsigned> callCount;
+            for (auto& bb : func->getBlocks()) {
+                for (auto& inst : bb->getInstructions()) {
+                    if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
+                        auto* calleeVal = inst->getOperand(0);
+                        auto* calleeFunc = dynamic_cast<IR::Function*>(calleeVal);
+                        if (calleeFunc && candidates.count(calleeFunc)) {
+                            callCount[calleeFunc]++;
+                        }
+                    }
+                }
+            }
+            // 标记需要跳过的多BB函数（被调用次数超过阈值）
+            std::unordered_set<IR::Function*> skipMultiBB;
+            for (auto& [callee, cnt] : callCount) {
+                if (callee->getBlocks().size() > 1 && cnt > MAX_MULTI_BB_CALL_SITES) {
+                    skipMultiBB.insert(callee);
+                }
+            }
+
             for (auto& bb : func->getBlocks()) {
                 for (auto it = bb->begin(); it != bb->end(); ) {
                     auto* inst = it->get();
                     if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
                         auto* calleeVal = inst->getOperand(0);
                         auto* calleeFunc = dynamic_cast<IR::Function*>(calleeVal);
-                        if (calleeFunc && candidates.count(calleeFunc)) {
+                        if (calleeFunc && candidates.count(calleeFunc) && !skipMultiBB.count(calleeFunc)) {
                             if (tryInlineCall(inst, calleeFunc)) {
                                 changed = true;
                                 it = bb->begin(); // restart iteration

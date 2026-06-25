@@ -22,22 +22,20 @@ bool mayWriteMemory(IR::Instruction* inst) {
 }
 
 // 判断两个指针是否"必须相同"
-// 对于 ALLOCA/GEP，直接比较结构等价性
+// 最保守策略：仅当指针完全相同（同一 Value）时才返回 true
+// 即使 GEP 结构等价，也可能因为索引值被 loadElimination 替换而产生错误交互
 bool isSamePointer(IR::Value* a, IR::Value* b) {
-    if (a == b) return true;
+    return a == b;
+}
 
-    // 对于 GEP，递归比较基址和所有索引
-    auto* ia = dynamic_cast<IR::Instruction*>(a);
-    auto* ib = dynamic_cast<IR::Instruction*>(b);
-    if (ia && ib &&
-        ia->getOpcode() == IR::Instruction::Opcode::GETELEMENTPTR &&
-        ib->getOpcode() == IR::Instruction::Opcode::GETELEMENTPTR) {
-        if (ia->getNumOperands() != ib->getNumOperands()) return false;
-        for (unsigned i = 0; i < ia->getNumOperands(); ++i) {
-            if (!isSamePointer(ia->getOperand(i), ib->getOperand(i)))
-                return false;
-        }
-        return true;
+// 判断指针是否涉及全局变量（直接或通过 GEP 链）
+// 全局变量可能被其他函数修改，LOAD 消除不安全
+bool involvesGlobal(IR::Value* ptr) {
+    if (!ptr) return false;
+    if (dynamic_cast<IR::GlobalVariable*>(ptr)) return true;
+    auto* inst = dynamic_cast<IR::Instruction*>(ptr);
+    if (inst && inst->getOpcode() == IR::Instruction::Opcode::GETELEMENTPTR) {
+        return involvesGlobal(inst->getOperand(0));
     }
     return false;
 }
@@ -100,6 +98,11 @@ void loadElimOnFunction(IR::Function* func) {
                 IR::Value* val = ip->getOperand(0);
                 IR::Value* ptr = ip->getOperand(1);
 
+                // 跳过涉及全局变量的指针：全局变量可能被其他函数修改，
+                // 且 GlobalVariablePromotion 会创建 LOAD→STORE 链路，
+                // 这里的 LOAD 消除可能与提升后的代码产生错误交互
+                if (involvesGlobal(ptr)) continue;
+
                 // 更新/覆盖 lastStoreVal 中匹配的指针
                 bool found = false;
                 for (auto it = lastStoreVal.begin(); it != lastStoreVal.end(); ) {
@@ -122,6 +125,9 @@ void loadElimOnFunction(IR::Function* func) {
                 // 安全检查：若此 ALLOCA 在多个 BB 中被 STORE，跳过
                 if (volatileAllocas.count(ptr)) continue;
 
+                // 跳过涉及全局变量的指针
+                if (involvesGlobal(ptr)) continue;
+
                 // 查找是否有匹配的最近 STORE
                 for (auto& [storePtr, storedVal] : lastStoreVal) {
                     if (isSamePointer(storePtr, ptr)) {
@@ -138,9 +144,21 @@ void loadElimOnFunction(IR::Function* func) {
         }
     }
 
-    // 执行替换：将 LOAD 的所有 uses 替换为 STORE 的值
+    // 执行替换：仅当 LOAD 的所有 uses 都在同一 BB 内时才替换
+    // 避免跨 BB 替换导致 dominance 问题
     for (auto& [load, val] : replacements) {
-        load->replaceAllUsesWith(val);
+        auto* loadBB = load->getParent();
+        bool allUsesInSameBB = true;
+        for (auto& use : load->getUses()) {
+            auto* userInst = dynamic_cast<IR::Instruction*>(use.user);
+            if (userInst && userInst->getParent() != loadBB) {
+                allUsesInSameBB = false;
+                break;
+            }
+        }
+        if (allUsesInSameBB) {
+            load->replaceAllUsesWith(val);
+        }
     }
 
     // 删除变成死的 LOAD 指令（由后续 DCE 处理）

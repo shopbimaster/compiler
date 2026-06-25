@@ -12,6 +12,7 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -365,6 +366,8 @@ bool convertToNativeMul(IR::Function* func) {
     auto* entry = func->getEntryBlock();
     if (!entry) return false;
 
+    // 清空所有 BB 的指令，并删除非 entry 的 BB
+    // 避免后续 pass 遍历到空 BB（无 terminator）导致崩溃
     for (auto& bb : func->getBlocks()) {
         while (!bb->empty()) {
             auto it = bb->begin();
@@ -372,6 +375,14 @@ bool convertToNativeMul(IR::Function* func) {
             bb->erase(it);
         }
     }
+    // 移除所有非 entry 的 BB（它们现在是空的、无引用的）
+    auto& blocks = func->getBlocks();
+    blocks.erase(
+        std::remove_if(blocks.begin(), blocks.end(),
+            [entry](const std::unique_ptr<IR::BasicBlock>& bb) {
+                return bb.get() != entry;
+            }),
+        blocks.end());
 
     auto* i32 = IR::IntegerType::I32;
 
