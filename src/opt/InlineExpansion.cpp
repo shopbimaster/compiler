@@ -1,9 +1,8 @@
 // ================================================================
 // O2: 函数内联 —— 将小函数体复制到调用点，消除 call 开销
 // 策略：
-//   - 单 BB 函数：指令数 < 20，直接内联到调用点
-//   - 多 BB 函数（≤8 BBs，≤60 指令）：克隆基本块结构并重定向控制流，
-//     受益场景：read_bits 被 decode_fixed_huffman 循环调用 160000 次/迭代
+//   - 仅内联单 BB 叶子函数（指令数 < 20）
+//   - 多 BB 函数不内联（已知导致运行时死循环）
 // 注意：仅内联叶子函数（不再调用其他用户函数）
 // ================================================================
 
@@ -18,7 +17,9 @@ namespace {
 
 const unsigned MAX_INLINE_INSTS_SINGLE = 20;
 const unsigned MAX_INLINE_INSTS_MULTI = 60;
-const unsigned MAX_INLINE_BBS_MULTI = 8;
+// 多 BB 函数内联已知导致运行时死循环（如 03_sort1 radix 排序），
+// 且与项目规则一致：仅内联单 BB 小函数；多 BB 函数不内联
+const unsigned MAX_INLINE_BBS_MULTI = 0; // 禁用多 BB 内联
 
 bool isLeafCall(IR::Function* func) {
     if (func->isExternal()) return false;
@@ -501,10 +502,11 @@ bool inlineExpansion(IR::Module* mod) {
                         auto* calleeVal = inst->getOperand(0);
                         auto* calleeFunc = dynamic_cast<IR::Function*>(calleeVal);
                         if (calleeFunc && candidates.count(calleeFunc)) {
-                            tryInlineCall(inst, calleeFunc);
-                            changed = true;
-                            it = bb->begin(); // restart iteration
-                            break;
+                            if (tryInlineCall(inst, calleeFunc)) {
+                                changed = true;
+                                it = bb->begin(); // restart iteration
+                                break;
+                            }
                         }
                     }
                     ++it;
