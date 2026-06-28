@@ -71,6 +71,13 @@ add_library(sysy_opt STATIC
     src/opt/ConstantFolding.cpp
     src/opt/DeadCodeElimination.cpp
     src/opt/DeadStoreElimination.cpp
+    src/opt/ReadOnlyGlobal.cpp
+    src/opt/SCCP.cpp
+    src/opt/LoopFind.cpp
+    src/opt/SCEVAnalysis.cpp
+    src/opt/LoopStrengthReduce.cpp
+    src/opt/LoopFullUnroll.cpp
+    src/opt/GEPStrengthReduce.cpp
     src/opt/LoadElimination.cpp
     src/opt/Reassociate.cpp
     src/opt/TreeShaking.cpp

@@ -48,6 +48,12 @@ void runO2(IR::Module* mod) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
+    // SCCP: 稀疏条件常量传播，结合分支条件精确推导常量
+    // 在 simplifyCFG 之后运行，可以进一步发现被简化分支中的常量
+    if (sparseConditionalConstantPropagation(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
     if (copyPropagation(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
@@ -96,6 +102,21 @@ void runO3(IR::Module* mod) {
     if (loopInterchange(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
+    // 循环强度削弱：将 MUL 替换为累加（依赖 SCEV 分析）
+    if (loopStrengthReduce(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    // GEP 强度削弱：将数组地址计算的乘法替换为累加地址
+    if (gepStrengthReduce(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+    // 循环完全展开：基于 SCEV 确定迭代次数，完全展开小循环
+    if (loopFullUnroll(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
     if (loopUnrolling(mod)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);

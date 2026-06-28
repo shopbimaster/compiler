@@ -30,8 +30,45 @@ DomMap computePostDominators(IR::Function* func);
 bool strictlyDominates(IR::BasicBlock* a, IR::BasicBlock* b, const DomMap& dom);
 
 // ================================================================
-// O1 Pass
+// 共享分析
 // ================================================================
+std::unordered_set<IR::GlobalVariable*> readOnlyGlobalAnalysis(IR::Module* mod);
+bool sparseConditionalConstantPropagation(IR::Module* mod);
+
+// ================================================================
+// 自然循环森林 — 共享循环分析
+// ================================================================
+struct NaturalLoop {
+    IR::BasicBlock* header = nullptr;
+    IR::BasicBlock* latch = nullptr;
+    std::unordered_set<IR::BasicBlock*> body;
+    std::vector<NaturalLoop*> subLoops;
+    NaturalLoop* parent = nullptr;
+    int depth = 0;
+    std::vector<IR::BasicBlock*> exitBlocks;
+    std::vector<IR::BasicBlock*> exitingBlocks;
+};
+
+std::vector<NaturalLoop> findNaturalLoops(IR::Function* func);
+std::vector<NaturalLoop> getLoopsInnermostFirst(IR::Function* func);
+bool isBlockInLoop(IR::BasicBlock* bb, const NaturalLoop& loop);
+bool isInstInLoop(IR::Instruction* inst, const NaturalLoop& loop);
+bool isLoopInvariantSimple(IR::Instruction* inst, const NaturalLoop& loop);
+
+// ================================================================
+// SCEV 分析
+// ================================================================
+struct InductionInfo {
+    IR::Value* var = nullptr;      // 归纳变量（ALLOCA）
+    IR::Value* start = nullptr;    // 初始值
+    IR::Value* step = nullptr;     // 步长
+    IR::Value* end = nullptr;      // 上界
+    int64_t tripCount = -1;        // 迭代次数（-1 = 未知）
+    bool isSignedCmp = true;
+    std::string cmpKind;
+};
+
+InductionInfo analyzeLoopInduction(const NaturalLoop& loop, IR::Function* func);
 void constantFolding(IR::Module* mod);
 void deadCodeElimination(IR::Module* mod);
 std::string peepholeOptimize(const std::string& asmCode);
@@ -52,6 +89,9 @@ bool algebraicSimplification(IR::Module* mod);
 bool loopUnrolling(IR::Module* mod);
 bool loopInterchange(IR::Module* mod);
 bool tailRecursionElimination(IR::Module* mod);
+bool loopStrengthReduce(IR::Module* mod);
+bool loopFullUnroll(IR::Module* mod);
+bool gepStrengthReduce(IR::Module* mod);
 bool instructionScheduling(IR::Module* mod);
 void runO3(IR::Module* mod);
 

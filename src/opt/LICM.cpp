@@ -1,7 +1,8 @@
 // ================================================================
-// O2: 循环不变量外提（Loop Invariant Code Motion）
+// 循环不变量外提（Loop Invariant Code Motion）
 // 策略：构建支配树 → 检测自然循环（回边）→ 标记不变量 → 外提到前置块
 // 保守处理：跳过头块含 PHI 的循环，避免破坏 PHI 节点
+// 增强：使用全局只读分析，在循环含 CALL 时仍可提升只读全局变量的 LOAD
 // ================================================================
 
 #include "opt/Optimizer.h"
@@ -68,14 +69,13 @@ bool headerHasPhi(IR::BasicBlock* header) {
 }
 
 // ================================================================
-// 收集函数中所有被 STORE 的全局变量
+// 收集函数中所有被 STORE 的全局变量（仅当前函数内）
 // ================================================================
 std::unordered_set<IR::GlobalVariable*> collectStoredGlobals(IR::Function* func) {
     std::unordered_set<IR::GlobalVariable*> storedGlobals;
     for (auto& bb : func->getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
             if (inst->getOpcode() == IR::Instruction::Opcode::STORE) {
-                // STORE 的指针操作数是 operand(1)
                 auto* ptr = inst->getOperand(1);
                 if (auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr)) {
                     storedGlobals.insert(gv);
@@ -88,8 +88,6 @@ std::unordered_set<IR::GlobalVariable*> collectStoredGlobals(IR::Function* func)
 
 // ================================================================
 // 检查循环体中是否包含 CALL 指令
-// 如果包含，则被调用函数可能修改全局变量，
-// 因此 LOAD 全局变量不能视为循环不变量
 // ================================================================
 bool loopHasCalls(const Loop& loop) {
     for (auto* bb : loop.body) {
@@ -103,12 +101,15 @@ bool loopHasCalls(const Loop& loop) {
 
 // ================================================================
 // 不变量判定：所有操作数是常量 || 在循环外定义 || 已标不变量
+// 增强：使用模块级只读全局变量分析，允许在循环含 CALL 时仍提升
+//       只读全局变量的 LOAD（因为 CALL 不可能修改只读全局变量）
 // ================================================================
 bool isLoopInvariant(
     IR::Instruction* inst,
     const Loop& loop,
     const std::unordered_set<IR::Instruction*>& invariants,
     const std::unordered_set<IR::GlobalVariable*>& storedGlobals,
+    const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals,
     bool hasCalls) {
     auto op = inst->getOpcode();
     using Opc = IR::Instruction::Opcode;
@@ -118,12 +119,16 @@ bool isLoopInvariant(
         op == Opc::ALLOCA)
         return false;
 
-    // LOAD 指令：仅当加载自全局变量且该全局变量在函数中从未被 STORE 时，允许外提
-    // 但若循环体中有 CALL 指令，被调用函数可能修改全局变量，保守不提升
+    // LOAD 指令：加载自全局变量时，检查是否可外提
     if (op == Opc::LOAD) {
         auto* ptr = inst->getOperand(0);
         auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr);
-        if (!gv || storedGlobals.count(gv)) return false;
+        if (!gv) return false;
+        // 如果全局变量在函数内被 STORE 过，不能外提
+        if (storedGlobals.count(gv)) return false;
+        // 增强：如果全局变量在整个模块中都是只读的，即使循环有 CALL 也可以外提
+        if (moduleReadOnlyGlobals.count(gv)) return true;
+        // 否则，如果循环有 CALL，保守不提升
         if (hasCalls) return false;
         return true;
     }
@@ -149,9 +154,10 @@ bool isLoopInvariant(
 // ================================================================
 // 外提循环不变量到前置块
 // ================================================================
-bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
+bool hoistLoopInvariants(Loop& loop, IR::Function* func,
+                         const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals) {
     static int preheaderCounter = 0;
-    // 头块是入口块 → 跳过（入口块支配所有块，创建preheader会形成新的回边，导致无限循环）
+    // 头块是入口块 → 跳过
     if (loop.header == func->getEntryBlock()) return false;
     // 头块含 PHI → 保守跳过
     if (headerHasPhi(loop.header)) return false;
@@ -172,7 +178,8 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
     while (changed) {
         changed = false;
         for (auto* inst : loopInsts) {
-            if (!invariants.count(inst) && isLoopInvariant(inst, loop, invariants, storedGlobals, hasCalls)) {
+            if (!invariants.count(inst) &&
+                isLoopInvariant(inst, loop, invariants, storedGlobals, moduleReadOnlyGlobals, hasCalls)) {
                 invariants.insert(inst);
                 changed = true;
             }
@@ -188,7 +195,7 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
     }
     if (outsidePreds.empty()) return false;
 
-    // 4. 创建前置块（使用唯一名称防止重复符号，插入到header之前确保指令ID顺序正确）
+    // 4. 创建前置块
     std::string preName = loop.header->getName() + ".preheader." + std::to_string(++preheaderCounter);
     auto* preheader = func->insertBlock(preName, loop.header);
 
@@ -209,7 +216,7 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
     // 6. 前置块末尾添加无条件跳转到 header
     preheader->pushBack(IR::Instruction::createBr(loop.header));
 
-    // 7. 重定向循环外前驱：header 引用 → preheader 引用
+    // 7. 重定向循环外前驱
     for (auto* p : outsidePreds) {
         auto* term = p->getTerminator();
         if (!term) continue;
@@ -226,7 +233,8 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func) {
 // ================================================================
 // 单函数 LICM
 // ================================================================
-bool licmOnFunction(IR::Function* func) {
+bool licmOnFunction(IR::Function* func,
+                    const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals) {
     if (func->isExternal()) return false;
     if (func->getBlocks().empty()) return false;
 
@@ -237,7 +245,7 @@ bool licmOnFunction(IR::Function* func) {
     bool changed = false;
     for (auto& loop : loops) {
         if (loop.body.size() <= 1) continue;
-        if (hoistLoopInvariants(loop, func)) changed = true;
+        if (hoistLoopInvariants(loop, func, moduleReadOnlyGlobals)) changed = true;
     }
     return changed;
 }
@@ -245,18 +253,22 @@ bool licmOnFunction(IR::Function* func) {
 } // namespace
 
 bool loopInvariantCodeMotion(IR::Module* mod) {
+    // 计算模块级只读全局变量（一次分析，所有函数复用）
+    auto moduleReadOnlyGlobals = readOnlyGlobalAnalysis(mod);
+
     bool changed = true;
     bool anyChanged = false;
     int iter = 0;
     while (changed) {
         if (++iter > 10) {
-            // Safety limit: prevent infinite loops in LICM
-            // This can happen when hoisting creates new back edges
             break;
         }
         changed = false;
         for (auto& func : mod->getFunctions()) {
-            if (licmOnFunction(func.get())) { changed = true; anyChanged = true; }
+            if (licmOnFunction(func.get(), moduleReadOnlyGlobals)) {
+                changed = true;
+                anyChanged = true;
+            }
         }
     }
     return anyChanged;
