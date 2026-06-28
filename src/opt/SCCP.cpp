@@ -405,20 +405,56 @@ bool sccpOnFunction(IR::Function* func) {
     }
 
     // 删除不可达块
-    // 通过移除前驱中指向不可达块的引用，然后移除不可达块
+    // 修复前驱中指向死块的 COND_BR 引用，然后移除死块
     if (!deadBlocks.empty()) {
-        auto preds = buildPredecessors(func);
         for (auto& bb : blocks) {
             if (deadBlocks.count(bb.get())) continue;
             auto* term = bb->getTerminator();
             if (!term) continue;
-            for (unsigned i = 0; i < term->getNumOperands(); ++i) {
-                if (auto* targetBB = dynamic_cast<IR::BasicBlock*>(term->getOperand(i))) {
-                    if (deadBlocks.count(targetBB)) {
-                        // 将指向死块的引用设为 nullptr，后续 SimplifyCFG 会清理
-                        term->setOperand(i, nullptr);
-                        changed = true;
+
+            if (term->getOpcode() == IR::Instruction::Opcode::COND_BR) {
+                auto* thenBB = dynamic_cast<IR::BasicBlock*>(term->getOperand(1));
+                auto* elseBB = dynamic_cast<IR::BasicBlock*>(term->getOperand(2));
+                bool thenDead = thenBB && deadBlocks.count(thenBB);
+                bool elseDead = elseBB && deadBlocks.count(elseBB);
+
+                if (thenDead && !elseDead) {
+                    // 替换为无条件 BR 到 else
+                    auto* br = IR::Instruction::createBr(elseBB);
+                    term->dropAllUses();
+                    for (auto it2 = bb->begin(); it2 != bb->end(); ++it2) {
+                        if (it2->get() == term) {
+                            *it2 = std::unique_ptr<IR::Instruction>(br);
+                            changed = true;
+                            break;
+                        }
                     }
+                } else if (!thenDead && elseDead) {
+                    // 替换为无条件 BR 到 then
+                    auto* br = IR::Instruction::createBr(thenBB);
+                    term->dropAllUses();
+                    for (auto it2 = bb->begin(); it2 != bb->end(); ++it2) {
+                        if (it2->get() == term) {
+                            *it2 = std::unique_ptr<IR::Instruction>(br);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+                // 两个都死：不应该发生（此块本身也应是死的）
+            }
+        }
+
+        // 移除死块
+        for (auto* deadBB : deadBlocks) {
+            for (auto& inst : deadBB->getInstructions()) {
+                inst->dropAllUses();
+            }
+            auto& blks = func->getBlocks();
+            for (auto it = blks.begin(); it != blks.end(); ++it) {
+                if (it->get() == deadBB) {
+                    blks.erase(it);
+                    break;
                 }
             }
         }

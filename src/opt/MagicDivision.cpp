@@ -36,8 +36,8 @@ SignedMagic computeSignedMagic(int32_t d) {
     unsigned p = N - 1;
     uint32_t q1 = 0x80000000u / anc;
     uint32_t r1 = 0x80000000u - q1 * anc;
-    uint32_t q2 = 0x7FFFFFFFu / ad;
-    uint32_t r2 = 0x7FFFFFFFu - q2 * ad;
+    uint32_t q2 = 0x80000000u / ad;
+    uint32_t r2 = 0x80000000u - q2 * ad;
 
     uint32_t delta;
     do {
