@@ -1,72 +1,19 @@
 // ================================================================
 // 循环不变量外提（Loop Invariant Code Motion）
-// 策略：构建支配树 → 检测自然循环（回边）→ 标记不变量 → 外提到前置块
-// 保守处理：跳过头块含 PHI 的循环，避免破坏 PHI 节点
+// 策略：使用循环森林（NaturalLoop）检测循环 → 从最内层到最外层处理
+//       → 标记不变量 → 外提到前置块
 // 增强：使用全局只读分析，在循环含 CALL 时仍可提升只读全局变量的 LOAD
+// 安全：内联后 CFG 可能更复杂，添加多项安全检查防止段错误
 // ================================================================
 
 #include "opt/Optimizer.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <algorithm>
 
 namespace Opt {
 namespace {
-
-// ================================================================
-// 检测自然循环：回边 B→H 且 H strictly dominates B
-// （使用共享的 computeDominators / buildPredecessors / buildSuccessors）
-// ================================================================
-struct Loop {
-    IR::BasicBlock* header;
-    BBSet body;
-};
-
-std::vector<Loop> findLoops(IR::Function* func, const DomMap& dom) {
-    auto preds = buildPredecessors(func);
-    auto succs = buildSuccessors(func);
-    std::vector<Loop> loops;
-
-    for (auto& bb : func->getBlocks()) {
-        for (auto* succ : succs[bb.get()]) {
-            if (strictlyDominates(succ, bb.get(), dom)) {
-                Loop loop;
-                loop.header = succ;
-                loop.body.insert(succ);
-
-                std::vector<IR::BasicBlock*> worklist;
-                std::unordered_set<IR::BasicBlock*> visited;
-                worklist.push_back(bb.get());
-                visited.insert(bb.get());
-
-                while (!worklist.empty()) {
-                    auto* cur = worklist.back();
-                    worklist.pop_back();
-                    loop.body.insert(cur);
-                    for (auto* p : preds[cur]) {
-                        if (!visited.count(p) && !loop.body.count(p)) {
-                            visited.insert(p);
-                            worklist.push_back(p);
-                        }
-                    }
-                }
-                loops.push_back(std::move(loop));
-            }
-        }
-    }
-    return loops;
-}
-
-// ================================================================
-// 检查头块是否含 PHI 节点（安全起见跳过）
-// ================================================================
-bool headerHasPhi(IR::BasicBlock* header) {
-    for (auto& inst : header->getInstructions()) {
-        if (inst->getOpcode() == IR::Instruction::Opcode::PHI)
-            return true;
-    }
-    return false;
-}
 
 // ================================================================
 // 收集函数中所有被 STORE 的全局变量（仅当前函数内）
@@ -89,7 +36,7 @@ std::unordered_set<IR::GlobalVariable*> collectStoredGlobals(IR::Function* func)
 // ================================================================
 // 检查循环体中是否包含 CALL 指令
 // ================================================================
-bool loopHasCalls(const Loop& loop) {
+bool loopHasCalls(const NaturalLoop& loop) {
     for (auto* bb : loop.body) {
         for (auto& inst : bb->getInstructions()) {
             if (inst->getOpcode() == IR::Instruction::Opcode::CALL)
@@ -106,7 +53,7 @@ bool loopHasCalls(const Loop& loop) {
 // ================================================================
 bool isLoopInvariant(
     IR::Instruction* inst,
-    const Loop& loop,
+    const NaturalLoop& loop,
     const std::unordered_set<IR::Instruction*>& invariants,
     const std::unordered_set<IR::GlobalVariable*>& storedGlobals,
     const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals,
@@ -140,11 +87,12 @@ bool isLoopInvariant(
         if (dynamic_cast<IR::ConstantFloat*>(opVal)) continue;
         if (dynamic_cast<IR::GlobalVariable*>(opVal)) continue;
         if (dynamic_cast<IR::Function*>(opVal)) continue;
-
         if (auto* defInst = dynamic_cast<IR::Instruction*>(opVal)) {
             auto* defBB = defInst->getParent();
             if (defBB && loop.body.count(defBB)) {
-                if (!invariants.count(defInst)) return false;
+                if (!invariants.count(defInst)) {
+                    return false;
+                }
             }
         }
     }
@@ -152,15 +100,38 @@ bool isLoopInvariant(
 }
 
 // ================================================================
-// 外提循环不变量到前置块
+// 安全验证：检查循环的所有块是否仍在函数中
 // ================================================================
-bool hoistLoopInvariants(Loop& loop, IR::Function* func,
+bool isLoopValid(const NaturalLoop& loop, IR::Function* func) {
+    // 构建函数中所有块的快速查找集合
+    std::unordered_set<IR::BasicBlock*> funcBlocks;
+    for (auto& bb : func->getBlocks()) {
+        funcBlocks.insert(bb.get());
+    }
+    // 检查 header
+    if (!funcBlocks.count(loop.header)) return false;
+    // 检查 body 中的所有块
+    for (auto* bb : loop.body) {
+        if (!funcBlocks.count(bb)) return false;
+    }
+    return true;
+}
+
+// ================================================================
+// 外提循环不变量到前置块
+// 安全检查：
+//   1. 循环块必须仍在函数中（内联后可能重组）
+//   2. insertBlock 必须成功
+//   3. 前驱的 terminator 必须有效且确实引用 header
+// ================================================================
+bool hoistLoopInvariants(NaturalLoop& loop, IR::Function* func,
                          const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals) {
     static int preheaderCounter = 0;
     // 头块是入口块 → 跳过
     if (loop.header == func->getEntryBlock()) return false;
-    // 头块含 PHI → 保守跳过
-    if (headerHasPhi(loop.header)) return false;
+
+    // 安全检查：循环块是否仍在函数中
+    if (!isLoopValid(loop, func)) return false;
 
     // 1. 收集循环体内所有指令
     std::vector<IR::Instruction*> loopInsts;
@@ -187,6 +158,23 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func,
     }
     if (invariants.empty()) return false;
 
+    // 收敛性修复：检查是否有非 header 块的不变量可外提
+    // 如果所有不变量都在 header 中，无需创建 preheader（避免外层循环反复迭代）
+    {
+        bool hasNonHeaderInvariants = false;
+        for (auto* bb : loop.body) {
+            if (bb == loop.header) continue;
+            for (auto& inst : bb->getInstructions()) {
+                if (invariants.count(inst.get())) {
+                    hasNonHeaderInvariants = true;
+                    break;
+                }
+            }
+            if (hasNonHeaderInvariants) break;
+        }
+        if (!hasNonHeaderInvariants) return false;
+    }
+
     // 3. 区分循环外前驱
     auto preds = buildPredecessors(func);
     std::vector<IR::BasicBlock*> outsidePreds;
@@ -195,9 +183,24 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func,
     }
     if (outsidePreds.empty()) return false;
 
+    // 安全检查：验证所有外部前驱的 terminator 确实引用 header
+    for (auto* p : outsidePreds) {
+        auto* term = p->getTerminator();
+        if (!term) return false;  // 安全：前驱必须有 terminator
+        bool foundHeader = false;
+        for (unsigned i = 0; i < term->getNumOperands(); ++i) {
+            if (term->getOperand(i) == static_cast<IR::Value*>(loop.header)) {
+                foundHeader = true;
+                break;
+            }
+        }
+        if (!foundHeader) return false;  // 安全：前驱必须引用 header
+    }
+
     // 4. 创建前置块
     std::string preName = loop.header->getName() + ".preheader." + std::to_string(++preheaderCounter);
     auto* preheader = func->insertBlock(preName, loop.header);
+    if (!preheader) return false;  // 安全：insertBlock 必须成功
 
     // 5. 按原始顺序将不变指令移到前置块（仅从非头块外提）
     for (auto* bb : loop.body) {
@@ -231,21 +234,25 @@ bool hoistLoopInvariants(Loop& loop, IR::Function* func,
 }
 
 // ================================================================
-// 单函数 LICM
+// 单函数 LICM（从最内层循环开始处理，使用 NaturalLoop 森林）
 // ================================================================
 bool licmOnFunction(IR::Function* func,
                     const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals) {
     if (func->isExternal()) return false;
     if (func->getBlocks().empty()) return false;
 
-    auto dom = computeDominators(func);
-    auto loops = findLoops(func, dom);
+    // 使用循环森林，从最内层到最外层处理（getLoopsInnermostFirst 按 depth 降序排列）
+    auto loops = getLoopsInnermostFirst(func);
     if (loops.empty()) return false;
 
     bool changed = false;
     for (auto& loop : loops) {
         if (loop.body.size() <= 1) continue;
-        if (hoistLoopInvariants(loop, func, moduleReadOnlyGlobals)) changed = true;
+        // 安全检查：处理内层循环后，外层循环可能已被修改
+        if (!isLoopValid(loop, func)) continue;
+        if (hoistLoopInvariants(loop, func, moduleReadOnlyGlobals)) {
+            changed = true;
+        }
     }
     return changed;
 }

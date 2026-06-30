@@ -303,6 +303,7 @@ namespace IR {
         iterator end()   { return insts.end(); }
         iterator erase(iterator it) { return insts.erase(it); }
         iterator insert(iterator pos, Instruction* inst) {
+            inst->setParent(this);
             return insts.insert(pos, std::unique_ptr<Instruction>(inst));
         }
 

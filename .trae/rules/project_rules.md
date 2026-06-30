@@ -15,8 +15,8 @@ SysY2022 语言编译器，将 SysY 源码编译为 RISC-V 64 (RV64GC) 汇编。
 | `-O1`      | OALL     | O1 + O2 + O3 + P0                     | **测评服务器使用** |
 | `-O0`      | O0       | 无优化                                | 评测基准           |
 | `-o0`      | O0       | 无优化                                | 本地调试           |
-| `-o1`      | O1       | CF + DCE + CSE + LICM                 | 本地逐级调试       |
-| `-o2`      | O2       | O1 + 内联 + 额外CSE                   | 本地逐级调试       |
+| `-o1`      | O1       | CF + DCE + CSE                        | 本地逐级调试       |
+| `-o2`      | O2       | O1 + 内联 + LICM + 额外CSE            | 本地逐级调试       |
 | `-o3`      | O3       | O1+O2 + 代数化简/循环交换/展开/尾递归 | 本地逐级调试       |
 
 **不可违反的规则**：
@@ -90,35 +90,64 @@ compiler/
 
 ## 四、优化 Pass 详细说明
 
-### 4.1 Pass 调度顺序
+### 4.1 Pass 调度顺序（借鉴 Cpl3 分阶段调度策略）
+
+调度分为 6 个阶段，阶段 2/4 有迭代收敛（最多 2 次），阶段 4→2 有反馈通道。
+
+**核心设计原则（基于 Cpl3 分析 + 实测验证）**：
+
+1. **算术优化在值传播之前**：MagicDivision/AlgebraicSimplification 产生新常量后，SCCP 才能传播
+2. **LICM 在内联之后**：内联后循环体中有新不变量，此时外提收益最大
+3. **尾递归在内联之前**：借鉴 Cpl3 构造阶段策略，转循环后可被内联
+4. **从最内层到最外层处理循环**：避免内层循环变换影响外层循环结构
 
 ```cpp
-// O1: 基础优化
-CF → DCE → CSE → LICM → CF → DCE
+// O1: 基础优化（LICM 已移至 O2 阶段 5，在内联之后运行）
+CF → DCE → CSE → CF → DCE
 
-// O2: 内联 + 全局变量提升 + 寄存器压力优化 + 新Pass
+// O2: 中层优化管线（分阶段调度）
+// 阶段 1: 结构化变换
 treeShaking
 → bitOpPatternRecognition → CF → DCE
+→ tailRecursionElimination → CF → DCE  // 在函数内联之前！转循环后可被内联
 → inlineExpansion → CF → DCE
 → globalVariablePromotion → CF → DCE
-→ deadStoreElimination → CF → DCE
-→ instCombine → CF → DCE
-→ simplifyCFG → CF → DCE
-→ copyPropagation → CF → DCE
-→ magicDivision → CF → DCE
-→ loadElimination → CF → DCE
-→ reassociate → CF → DCE
-→ ifConversion → CF → DCE
-→ CSE → CF → DCE
+
+// 阶段 2: 指令级化简 + CFG 简化（迭代 2×）
+// InstCombine(含Store-to-Load前推) → DSE → SimplifyCFG → 循环
+iter ×2: instCombine → CF → DCE → deadStoreElimination → CF → DCE → simplifyCFG → CF → DCE
+
+// 阶段 3: 算术优化（在值传播之前！产生新常量为 SCCP 喂料）
+magicDivision → CF → DCE  // 常量除法→乘法+移位，产生新常量
+→ algebraicSimplification → CF → DCE  // 强度削减+恒等式，产生新常量
+→ reassociate → CF → DCE  // 表达式重结合，产生新常量
+→ loadElimination → CF → DCE  // 消除冗余LOAD，简化后续分析
+
+// 阶段 4: 值级别分析 + 传播（在算术优化之后！迭代 2×）
+// SCCP → SimplifyCFG(折叠新常量分支) → CopyPropagation → 循环
+iter ×2: SCCP → CF → DCE → simplifyCFG → CF → DCE → copyPropagation → CF → DCE
+
+// 阶段 4→2 反馈：值传播后再次运行指令级化简
+// SCCP 传播常量后，InstCombine 可能发现新的化简机会
+instCombine → CF → DCE → deadStoreElimination → CF → DCE → simplifyCFG → CF → DCE
+
+// 阶段 5: 循环优化（在结构稳定后、所有清理完成后运行）
+// LICM 重新启用！使用 NaturalLoop 森林 + innermost-first + 安全检查
+loopInvariantCodeMotion → CF → DCE
+→ CSE(第二次) → CF → DCE  // LICM 外提代码 + 所有前置变换可能创建公共子表达式
+
+// 阶段 6: 全局清理与最终优化
+ifConversion → CF → DCE
 → adce → CF → DCE
 → codeSink → CF → DCE
 → basicBlockReordering
 
-// O3: 高级循环/递归优化
-algebraicSimplification → CF → DCE
-→ loopInterchange → CF → DCE
+// O3: 循环特定变换（在 O2 通用优化之后运行）
+loopInterchange → CF → DCE
+→ loopStrengthReduce → CF → DCE
+→ gepStrengthReduce → CF → DCE
+→ loopFullUnroll → CF → DCE
 → loopUnrolling → CF → DCE
-→ tailRecursionElimination → CF → DCE
 
 // P0: 特殊模式识别
 recursiveMulToNative
@@ -135,12 +164,12 @@ instructionScheduling → CF → DCE
 | ConstantFolding          | O1    | 启用 | `sitofp` 折叠成 `ConstantFloat` 后，IR 打印和代码生成均需正确处理 `ConstantFloat`                                                                                                  |
 | DeadCodeElimination      | O1    | 启用 | 无已知问题                                                                                                                                                                         |
 | CSE                      | O1/O2 | 启用 | 使用 `replaceAllUsesWith` 后 `erase`，安全                                                                                                                                         |
-| LICM                     | O1    | 启用 | 仅 O1 运行一次；O2 不再次运行（避免与内联修改的 CFG 交互导致段错误）                                                                                                               |
+| LICM                     | O2    | 启用 | 在内联之后运行以捕获更多不变量；使用 NaturalLoop 森林 + innermost-first 处理 + 多项安全检查（isLoopValid、terminator 引用验证）；从 O1 移入 O2 阶段 5                              |
 | InlineExpansion          | O2    | 启用 | 单 BB 小函数（指令数 <20）和多 BB 函数（≤8 BB、≤60 指令）均可内联；多 BB 函数在同一 caller 中被调用超过 2 次跳过内联，避免代码膨胀导致性能下降                                     |
-| AlgebraicSimplification  | O3    | 启用 | 强度削减：`sdiv/srem` 除以 2 的幂需要检查左操作数非负才能替换为 `ashr`/`and`                                                                                                       |
+| AlgebraicSimplification  | O2    | 启用 | 强度削减：`sdiv/srem` 除以 2 的幂需要检查左操作数非负才能替换为 `ashr`/`and`；从 O3 移入 O2 阶段 3，在值传播之前运行以产生新常量                                                   |
 | LoopInterchange          | O3    | 启用 | **三项安全检查缺一不可**：`icmpUsesVar`、`isUsedOutsideBBSet`、`sameLoopBounds`；**外加 `hasOtherLoop` 检查**（外层循环体不能有除当前内层外其他循环）                              |
 | LoopUnrolling            | O3    | 启用 | 仅展开迭代次数 ≤64 的简单 while 循环；`cloneNonTermInst` 中 STORE 指针操作数必须通过 `lookup` 查找                                                                                 |
-| TailRecursionElimination | O3    | 启用 | `findBodyBlock` 将 entry block 拆分为 init 和 body；**幂等设计**：拆分后再次调用直接返回 BR 目标                                                                                   |
+| TailRecursionElimination | O2    | 启用 | 在函数内联之前运行，将尾递归转为循环后可被内联；`findBodyBlock` 将 entry block 拆分为 init 和 body；**幂等设计**：拆分后再次调用直接返回 BR 目标                                   |
 | BitOpPatternRecognition  | P0/O2 | 启用 | 模式匹配位运算优化；O2 中提前运行以消除自定义位运算函数，使 read_bits 等函数可被内联                                                                                               |
 | GlobalVariablePromotion  | O2    | 启用 | 将标量全局变量提升为局部 ALLOCA；**跳过 const 全局变量**（.rodata 只读段）；**在遍历 BB 前先收集 RET 指令**，避免插入时迭代器失效；init 指令插入到 entry block 开头（ALLOCA 之后） |
 | RecursiveMulToNative     | P0    | 启用 | 将递归乘法转换为原生 MUL 指令；**修复**：转换后清除空的非 entry BB，避免 CFG 中出现空 BB 导致段错误                                                                                |
@@ -160,8 +189,11 @@ instructionScheduling → CF → DCE
 
 ### 4.3 关键设计决策
 
-**为什么 O2 不二次运行 LICM？**
-内联 Expansion 会修改 CFG（合并被调用函数的 BB），二次 LICM 会与修改后的 CFG 交互导致段错误。
+**为什么 LICM 在 O2 阶段 5（内联之后）而非 O1？**
+内联后循环体中出现新的不变量（来自被内联函数），此时外提收益最大。修复：使用 NaturalLoop 森林替代 ad-hoc 回边检测，从最内层到最外层处理循环，添加 isLoopValid 和 terminator 引用验证等安全检查防止段错误。
+
+**为什么算术优化（阶段 3）在值传播（阶段 4）之前？**
+MagicDivision 产生魔数常量、AlgebraicSimplification 产生移位常量、Reassociate 产生合并常量——这些新常量必须在 SCCP 运行之前产生，SCCP 才能将其传播到分支条件（使 SimplifyCFG 折叠更多分支）和使用点（使 InstCombine 进一步化简）。如果顺序颠倒，SCCP 会错过这些常量。
 
 **为什么 LoopInterchange 需要 `hasOtherLoop` 检查？**
 row_reduce（conv2d）的 r 循环体中有两个 c 循环，交换后仅处理第一个内层循环，第二个仍使用原变量导致语义错误。
