@@ -29,6 +29,15 @@ DomMap computeDominators(IR::Function* func);
 DomMap computePostDominators(IR::Function* func);
 bool strictlyDominates(IR::BasicBlock* a, IR::BasicBlock* b, const DomMap& dom);
 
+// 计算立即支配者（idom）：每个块在支配树中的直接父节点
+std::unordered_map<IR::BasicBlock*, IR::BasicBlock*> computeImmediateDominators(IR::Function* func, const DomMap& dom);
+
+// 计算支配边界（Dominance Frontier）：DF[B] = 所有 B 支配其前驱但不严格支配的节点集合
+// 这是 SSA 构造中 PHI 节点放置的关键分析
+using DFMap = std::unordered_map<IR::BasicBlock*, BBSet>;
+DFMap computeDominanceFrontier(IR::Function* func, const DomMap& dom,
+    const std::unordered_map<IR::BasicBlock*, IR::BasicBlock*>& idom);
+
 // ================================================================
 // 共享分析
 // ================================================================
@@ -119,5 +128,17 @@ bool copyPropagation(IR::Module* mod);
 bool magicDivision(IR::Module* mod);
 bool basicBlockReordering(IR::Module* mod);
 void runP0(IR::Module* mod);
+
+// ================================================================
+// SSA 构造 — Mem2Reg（alloca/load/store → PHI + 寄存器 SSA）
+// 借鉴 Cpl2/Cpl3 的完整 SSA 构造，是 GVN/MemorySSA 等高级优化的前提
+// ================================================================
+bool mem2reg(IR::Module* mod);
+
+// ================================================================
+// SSA 降级 — PhiLowering（PHI → ALLOCA + STORE + LOAD）
+// 在代码生成前将 PHI 指令降级为普通指令，与 Mem2Reg 配对使用
+// ================================================================
+bool phiLowering(IR::Module* mod);
 
 } // namespace Opt

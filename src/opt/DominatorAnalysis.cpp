@@ -87,6 +87,75 @@ bool strictlyDominates(IR::BasicBlock* a, IR::BasicBlock* b, const DomMap& dom) 
 }
 
 // ================================================================
+// 计算立即支配者（idom）
+// idom(B) = 严格支配 B 的节点中，离 B 最近的那个（支配集最大者）
+// ================================================================
+std::unordered_map<IR::BasicBlock*, IR::BasicBlock*> computeImmediateDominators(
+    IR::Function* func, const DomMap& dom) {
+    std::unordered_map<IR::BasicBlock*, IR::BasicBlock*> idom;
+    auto* entry = func->getEntryBlock();
+    if (!entry) return idom;
+
+    for (auto& bb : func->getBlocks()) {
+        auto* b = bb.get();
+        if (b == entry) {
+            idom[b] = nullptr;  // entry 没有 idom
+            continue;
+        }
+        // 在严格支配者中找支配集最大的（即离 b 最近）
+        auto it = dom.find(b);
+        if (it == dom.end()) continue;
+        IR::BasicBlock* best = nullptr;
+        size_t bestSize = 0;
+        for (auto* d : it->second) {
+            if (d == b) continue;  // 跳过自身
+            auto dit = dom.find(d);
+            if (dit != dom.end() && dit->second.size() > bestSize) {
+                bestSize = dit->second.size();
+                best = d;
+            }
+        }
+        idom[b] = best;
+    }
+    return idom;
+}
+
+// ================================================================
+// 计算支配边界（Dominance Frontier）
+// 标准算法：对于每个汇合点 B（前驱≥2），对每个前驱 A，
+// 沿支配树向上遍历直到 idom(B)，将 B 加入沿途节点的 DF
+// ================================================================
+DFMap computeDominanceFrontier(
+    IR::Function* func,
+    const DomMap& dom,
+    const std::unordered_map<IR::BasicBlock*, IR::BasicBlock*>& idom) {
+    DFMap df;
+    auto preds = buildPredecessors(func);
+
+    // 初始化空 DF
+    for (auto& bb : func->getBlocks()) {
+        df[bb.get()];
+    }
+
+    for (auto& bb : func->getBlocks()) {
+        auto* b = bb.get();
+        auto& predList = preds[b];
+        if (predList.size() < 2) continue;  // 只有汇合点才需要计算 DF
+
+        for (auto* p : predList) {
+            auto* runner = p;
+            auto* idomB = idom.find(b) != idom.end() ? idom.at(b) : nullptr;
+            while (runner && runner != idomB) {
+                df[runner].insert(b);
+                auto rit = idom.find(runner);
+                runner = (rit != idom.end()) ? rit->second : nullptr;
+            }
+        }
+    }
+    return df;
+}
+
+// ================================================================
 // 后支配树（PostDominatorTree）— 用于 ADCE
 // 后支配：d 后支配 n 当且仅当从 n 到函数出口的所有路径都经过 d
 // 通过反转 CFG（前驱↔后继）并计算支配树得到

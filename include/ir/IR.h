@@ -151,6 +151,8 @@ namespace IR {
 
     class User : public Value {
     public:
+        virtual ~User() { dropAllUses(); }
+
         unsigned getNumOperands() const { return static_cast<unsigned>(operands.size()); }
         Value*   getOperand(unsigned i) const;
 

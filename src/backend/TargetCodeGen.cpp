@@ -639,6 +639,10 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
     case Opc::SELECT:
         emitSelect(inst);
         break;
+    case Opc::PHI:
+        // PHI 指令不生成任何代码，由 PhiLowering pass 在代码生成前处理
+        // （将 PHI 转换为前驱块中的并行拷贝）
+        break;
     default:
         emitter.emitText("  # unknown opcode " + std::to_string(static_cast<int>(inst.getOpcode())));
         break;
@@ -1502,7 +1506,15 @@ void TargetCodeGen::promoteAllocasInFunction(IR::Function& func) {
         "fs8", "fs9", "fs10", "fs11"
     };
 
-    int intIdx = 0, floatIdx = 0;
+    // 收集所有可提升的 ALLOCA，按使用次数降序排序
+    // 这样高频使用的变量（如循环计数器、累加器）优先获得寄存器，
+    // 低频使用的变量（如一次性中间值）留在栈上
+    struct AllocaCandidate {
+        IR::Instruction* alloca;
+        size_t useCount;
+        bool isFloat;
+    };
+    std::vector<AllocaCandidate> candidates;
 
     for (auto& bb : func.getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
@@ -1513,28 +1525,40 @@ void TargetCodeGen::promoteAllocasInFunction(IR::Function& func) {
             auto* pointee = ptrTy->getPointeeType();
             bool isFloat = pointee->isFloat();
 
-            std::string reg;
-            if (isFloat) {
-                while (floatIdx < static_cast<int>(floatRegPool.size()) &&
-                       regAlloc.isRegReserved(floatRegPool[floatIdx])) {
-                    floatIdx++;
-                }
-                if (floatIdx < static_cast<int>(floatRegPool.size())) {
-                    reg = floatRegPool[floatIdx++];
-                }
-            } else {
-                while (intIdx < static_cast<int>(intRegPool.size()) &&
-                       regAlloc.isRegReserved(intRegPool[intIdx])) {
-                    intIdx++;
-                }
-                if (intIdx < static_cast<int>(intRegPool.size())) {
-                    reg = intRegPool[intIdx++];
-                }
-            }
+            candidates.push_back({inst.get(), inst->getUses().size(), isFloat});
+        }
+    }
 
-            if (!reg.empty()) {
-                promotedAllocas[inst.get()] = reg;
+    // 按使用次数降序排序（稳定排序保证相同 useCount 时保持 IR 顺序）
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const AllocaCandidate& a, const AllocaCandidate& b) {
+            return a.useCount > b.useCount;
+        });
+
+    int intIdx = 0, floatIdx = 0;
+
+    for (auto& cand : candidates) {
+        std::string reg;
+        if (cand.isFloat) {
+            while (floatIdx < static_cast<int>(floatRegPool.size()) &&
+                   regAlloc.isRegReserved(floatRegPool[floatIdx])) {
+                floatIdx++;
             }
+            if (floatIdx < static_cast<int>(floatRegPool.size())) {
+                reg = floatRegPool[floatIdx++];
+            }
+        } else {
+            while (intIdx < static_cast<int>(intRegPool.size()) &&
+                   regAlloc.isRegReserved(intRegPool[intIdx])) {
+                intIdx++;
+            }
+            if (intIdx < static_cast<int>(intRegPool.size())) {
+                reg = intRegPool[intIdx++];
+            }
+        }
+
+        if (!reg.empty()) {
+            promotedAllocas[cand.alloca] = reg;
         }
     }
 }
@@ -1561,13 +1585,10 @@ void TargetCodeGen::collectGlobalAddresses(IR::Function& func) {
         }
     }
 
-    // 收集已使用的寄存器（promotedAllocas 已分配）
-    std::set<std::string> usedRegs;
-    for (auto& [alloca, reg] : promotedAllocas) {
-        usedRegs.insert(reg);
-    }
-
-    // 为每个全局变量分配 callee-saved 寄存器（跳过已使用的）
+    // 为每个数组全局变量分配 callee-saved 寄存器缓存其地址
+    // 注意：此时 promotedAllocas 尚未填充（emitFunction 中 collectGlobalAddresses
+    // 在 promoteAllocasInFunction 之前调用），所以无需检查 promotedAllocas。
+    // 实际的寄存器冲突解决在 promoteAllocasInFunction 中通过 regAlloc.isRegReserved() 完成。
     static const std::vector<std::string> intRegPool = {
         "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
         "s8", "s9", "s10", "s11"
@@ -1575,10 +1596,6 @@ void TargetCodeGen::collectGlobalAddresses(IR::Function& func) {
 
     int regIdx = 0;
     for (auto* gv : usedGlobals) {
-        while (regIdx < static_cast<int>(intRegPool.size()) &&
-               usedRegs.count(intRegPool[regIdx])) {
-            regIdx++;
-        }
         if (regIdx < static_cast<int>(intRegPool.size())) {
             std::string reg = intRegPool[regIdx++];
             globalAddrCache[gv] = reg;

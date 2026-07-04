@@ -1,0 +1,823 @@
+declare i32 @getint()
+
+declare i32 @getch()
+
+declare i32 @getarray(i32* %arg0)
+
+declare float @getfloat()
+
+declare i32 @getfarray(float* %arg0)
+
+declare void @putint(i32 %arg0)
+
+declare void @putch(i32 %arg0)
+
+declare void @putarray(i32 %arg0, i32* %arg1)
+
+declare void @putfloat(float %arg0)
+
+declare void @putfarray(i32 %arg0, float* %arg1)
+
+declare void @_sysy_starttime(i32 %arg0)
+
+declare void @_sysy_stoptime(i32 %arg0)
+
+define i32 @MAX(i32 %arg0, i32 %arg1) {
+entry:
+  %eq = icmp i1 %arg0, %arg1
+  br i1 %eq, label %then_0, label %else_1
+else_1:
+  %sgt = icmp i1 %arg0, %arg1
+  br i1 %sgt, label %then_3, label %else_4
+else_4:
+  ret i32 %arg1
+then_3:
+  ret i32 %arg0
+then_0:
+  ret i32 %arg0
+}
+
+define i32 @max_sum_nonadjacent(i32* %arg0, i32 %arg1) {
+entry:
+  %temp = alloca [16 x i32]
+  %%%i.phi.while_cond_6.phi.ptr = alloca i32
+  %t7 = getelementptr i32* %temp, 0, 0
+  store i32 0, i32* %t7
+  %t8 = getelementptr i32* %temp, 0, 1
+  store i32 0, i32* %t8
+  %t9 = getelementptr i32* %temp, 0, 2
+  store i32 0, i32* %t9
+  %t10 = getelementptr i32* %temp, 0, 3
+  store i32 0, i32* %t10
+  %t11 = getelementptr i32* %temp, 0, 4
+  store i32 0, i32* %t11
+  %t12 = getelementptr i32* %temp, 0, 5
+  store i32 0, i32* %t12
+  %t13 = getelementptr i32* %temp, 0, 6
+  store i32 0, i32* %t13
+  %t14 = getelementptr i32* %temp, 0, 7
+  store i32 0, i32* %t14
+  %t15 = getelementptr i32* %temp, 0, 8
+  store i32 0, i32* %t15
+  %t16 = getelementptr i32* %temp, 0, 9
+  store i32 0, i32* %t16
+  %t17 = getelementptr i32* %temp, 0, 10
+  store i32 0, i32* %t17
+  %t18 = getelementptr i32* %temp, 0, 11
+  store i32 0, i32* %t18
+  %t19 = getelementptr i32* %temp, 0, 12
+  store i32 0, i32* %t19
+  %t20 = getelementptr i32* %temp, 0, 13
+  store i32 0, i32* %t20
+  %t21 = getelementptr i32* %temp, 0, 14
+  store i32 0, i32* %t21
+  %t22 = getelementptr i32* %temp, 0, 15
+  store i32 0, i32* %t22
+  %t25 = getelementptr i32* %arg0, 0
+  %t26 = load i32, i32* %t25
+  %t23 = getelementptr i32* %temp, 0, 0
+  store i32 %t26, i32* %t23
+  %t27 = getelementptr i32* %temp, 0, 1
+  %t29 = getelementptr i32* %arg0, 0
+  %t30 = load i32, i32* %t29
+  %t32 = getelementptr i32* %arg0, 1
+  %t33 = load i32, i32* %t32
+  %inline_ret_1 = alloca i32
+  br label %inline_MAX_entry_1
+inline_MAX_entry_1:
+  %eq = icmp i1 %t30, %t33
+  br i1 %eq, label %inline_MAX_then_0_1, label %inline_MAX_else_1_1
+inline_MAX_else_1_1:
+  %sgt = icmp i1 %t30, %t33
+  br i1 %sgt, label %inline_MAX_then_3_1, label %inline_MAX_else_4_1
+inline_MAX_else_4_1:
+  store i32 %t33, i32* %inline_ret_1
+  br label %inline_cont_MAX_1
+inline_MAX_then_3_1:
+  store i32 %t30, i32* %inline_ret_1
+  br label %inline_cont_MAX_1
+inline_MAX_then_0_1:
+  store i32 %t30, i32* %inline_ret_1
+  br label %inline_cont_MAX_1
+inline_cont_MAX_1:
+  %inline_ret_val_1 = load i32, i32* %inline_ret_1
+  store i32 %inline_ret_val_1, i32* %t27
+  store i32 2, i32* %%%i.phi.while_cond_6.phi.ptr
+  br label %while_cond_6
+while_cond_6:
+  %%%i.phi.while_cond_6 = load i32, i32* %%%i.phi.while_cond_6.phi.ptr
+  %slt = icmp i1 %%%i.phi.while_cond_6, %arg1
+  br i1 %slt, label %while_body_7, label %while_end_8
+while_body_7:
+  %t38 = getelementptr i32* %temp, 0, %%%i.phi.while_cond_6
+  %t40 = sub i32 %%%i.phi.while_cond_6, 2
+  %t41 = getelementptr i32* %temp, 0, %t40
+  %t42 = load i32, i32* %t41
+  %t45 = getelementptr i32* %arg0, %%%i.phi.while_cond_6
+  %t46 = load i32, i32* %t45
+  %t47 = add i32 %t42, %t46
+  %t49 = sub i32 %%%i.phi.while_cond_6, 1
+  %t50 = getelementptr i32* %temp, 0, %t49
+  %t51 = load i32, i32* %t50
+  %inline_ret_2 = alloca i32
+  br label %inline_MAX_entry_2
+inline_MAX_entry_2:
+  %eq = icmp i1 %t47, %t51
+  br i1 %eq, label %inline_MAX_then_0_2, label %inline_MAX_else_1_2
+inline_MAX_else_1_2:
+  %sgt = icmp i1 %t47, %t51
+  br i1 %sgt, label %inline_MAX_then_3_2, label %inline_MAX_else_4_2
+inline_MAX_else_4_2:
+  store i32 %t51, i32* %inline_ret_2
+  br label %inline_cont_MAX_2
+inline_MAX_then_3_2:
+  store i32 %t47, i32* %inline_ret_2
+  br label %inline_cont_MAX_2
+inline_MAX_then_0_2:
+  store i32 %t47, i32* %inline_ret_2
+  br label %inline_cont_MAX_2
+inline_cont_MAX_2:
+  %inline_ret_val_2 = load i32, i32* %inline_ret_2
+  store i32 %inline_ret_val_2, i32* %t38
+  %t54 = add i32 1, %%%i.phi.while_cond_6
+  store i32 %t54, i32* %%%i.phi.while_cond_6.phi.ptr
+  br label %while_cond_6
+while_end_8:
+  %t56 = sub i32 %arg1, 1
+  %t57 = getelementptr i32* %temp, 0, %t56
+  %t58 = load i32, i32* %t57
+  ret i32 %t58
+}
+
+define i32 @longest_common_subseq(i32* %arg0, i32 %arg1, i32* %arg2, i32 %arg3) {
+entry:
+  %p = alloca [16 x [16 x i32]]
+  %%%i.phi.while_cond_9.phi.ptr = alloca i32
+  %%%j.phi.while_cond_9.phi.ptr = alloca i32
+  %%%j.phi.while_cond_12.phi.ptr = alloca i32
+  %t59 = getelementptr i32* %p, 0, 0, 0
+  store i32 0, i32* %t59
+  %t60 = getelementptr i32* %p, 0, 0, 1
+  store i32 0, i32* %t60
+  %t61 = getelementptr i32* %p, 0, 0, 2
+  store i32 0, i32* %t61
+  %t62 = getelementptr i32* %p, 0, 0, 3
+  store i32 0, i32* %t62
+  %t63 = getelementptr i32* %p, 0, 0, 4
+  store i32 0, i32* %t63
+  %t64 = getelementptr i32* %p, 0, 0, 5
+  store i32 0, i32* %t64
+  %t65 = getelementptr i32* %p, 0, 0, 6
+  store i32 0, i32* %t65
+  %t66 = getelementptr i32* %p, 0, 0, 7
+  store i32 0, i32* %t66
+  %t67 = getelementptr i32* %p, 0, 0, 8
+  store i32 0, i32* %t67
+  %t68 = getelementptr i32* %p, 0, 0, 9
+  store i32 0, i32* %t68
+  %t69 = getelementptr i32* %p, 0, 0, 10
+  store i32 0, i32* %t69
+  %t70 = getelementptr i32* %p, 0, 0, 11
+  store i32 0, i32* %t70
+  %t71 = getelementptr i32* %p, 0, 0, 12
+  store i32 0, i32* %t71
+  %t72 = getelementptr i32* %p, 0, 0, 13
+  store i32 0, i32* %t72
+  %t73 = getelementptr i32* %p, 0, 0, 14
+  store i32 0, i32* %t73
+  %t74 = getelementptr i32* %p, 0, 0, 15
+  store i32 0, i32* %t74
+  %t75 = getelementptr i32* %p, 0, 1, 0
+  store i32 0, i32* %t75
+  %t76 = getelementptr i32* %p, 0, 1, 1
+  store i32 0, i32* %t76
+  %t77 = getelementptr i32* %p, 0, 1, 2
+  store i32 0, i32* %t77
+  %t78 = getelementptr i32* %p, 0, 1, 3
+  store i32 0, i32* %t78
+  %t79 = getelementptr i32* %p, 0, 1, 4
+  store i32 0, i32* %t79
+  %t80 = getelementptr i32* %p, 0, 1, 5
+  store i32 0, i32* %t80
+  %t81 = getelementptr i32* %p, 0, 1, 6
+  store i32 0, i32* %t81
+  %t82 = getelementptr i32* %p, 0, 1, 7
+  store i32 0, i32* %t82
+  %t83 = getelementptr i32* %p, 0, 1, 8
+  store i32 0, i32* %t83
+  %t84 = getelementptr i32* %p, 0, 1, 9
+  store i32 0, i32* %t84
+  %t85 = getelementptr i32* %p, 0, 1, 10
+  store i32 0, i32* %t85
+  %t86 = getelementptr i32* %p, 0, 1, 11
+  store i32 0, i32* %t86
+  %t87 = getelementptr i32* %p, 0, 1, 12
+  store i32 0, i32* %t87
+  %t88 = getelementptr i32* %p, 0, 1, 13
+  store i32 0, i32* %t88
+  %t89 = getelementptr i32* %p, 0, 1, 14
+  store i32 0, i32* %t89
+  %t90 = getelementptr i32* %p, 0, 1, 15
+  store i32 0, i32* %t90
+  %t91 = getelementptr i32* %p, 0, 2, 0
+  store i32 0, i32* %t91
+  %t92 = getelementptr i32* %p, 0, 2, 1
+  store i32 0, i32* %t92
+  %t93 = getelementptr i32* %p, 0, 2, 2
+  store i32 0, i32* %t93
+  %t94 = getelementptr i32* %p, 0, 2, 3
+  store i32 0, i32* %t94
+  %t95 = getelementptr i32* %p, 0, 2, 4
+  store i32 0, i32* %t95
+  %t96 = getelementptr i32* %p, 0, 2, 5
+  store i32 0, i32* %t96
+  %t97 = getelementptr i32* %p, 0, 2, 6
+  store i32 0, i32* %t97
+  %t98 = getelementptr i32* %p, 0, 2, 7
+  store i32 0, i32* %t98
+  %t99 = getelementptr i32* %p, 0, 2, 8
+  store i32 0, i32* %t99
+  %t100 = getelementptr i32* %p, 0, 2, 9
+  store i32 0, i32* %t100
+  %t101 = getelementptr i32* %p, 0, 2, 10
+  store i32 0, i32* %t101
+  %t102 = getelementptr i32* %p, 0, 2, 11
+  store i32 0, i32* %t102
+  %t103 = getelementptr i32* %p, 0, 2, 12
+  store i32 0, i32* %t103
+  %t104 = getelementptr i32* %p, 0, 2, 13
+  store i32 0, i32* %t104
+  %t105 = getelementptr i32* %p, 0, 2, 14
+  store i32 0, i32* %t105
+  %t106 = getelementptr i32* %p, 0, 2, 15
+  store i32 0, i32* %t106
+  %t107 = getelementptr i32* %p, 0, 3, 0
+  store i32 0, i32* %t107
+  %t108 = getelementptr i32* %p, 0, 3, 1
+  store i32 0, i32* %t108
+  %t109 = getelementptr i32* %p, 0, 3, 2
+  store i32 0, i32* %t109
+  %t110 = getelementptr i32* %p, 0, 3, 3
+  store i32 0, i32* %t110
+  %t111 = getelementptr i32* %p, 0, 3, 4
+  store i32 0, i32* %t111
+  %t112 = getelementptr i32* %p, 0, 3, 5
+  store i32 0, i32* %t112
+  %t113 = getelementptr i32* %p, 0, 3, 6
+  store i32 0, i32* %t113
+  %t114 = getelementptr i32* %p, 0, 3, 7
+  store i32 0, i32* %t114
+  %t115 = getelementptr i32* %p, 0, 3, 8
+  store i32 0, i32* %t115
+  %t116 = getelementptr i32* %p, 0, 3, 9
+  store i32 0, i32* %t116
+  %t117 = getelementptr i32* %p, 0, 3, 10
+  store i32 0, i32* %t117
+  %t118 = getelementptr i32* %p, 0, 3, 11
+  store i32 0, i32* %t118
+  %t119 = getelementptr i32* %p, 0, 3, 12
+  store i32 0, i32* %t119
+  %t120 = getelementptr i32* %p, 0, 3, 13
+  store i32 0, i32* %t120
+  %t121 = getelementptr i32* %p, 0, 3, 14
+  store i32 0, i32* %t121
+  %t122 = getelementptr i32* %p, 0, 3, 15
+  store i32 0, i32* %t122
+  %t123 = getelementptr i32* %p, 0, 4, 0
+  store i32 0, i32* %t123
+  %t124 = getelementptr i32* %p, 0, 4, 1
+  store i32 0, i32* %t124
+  %t125 = getelementptr i32* %p, 0, 4, 2
+  store i32 0, i32* %t125
+  %t126 = getelementptr i32* %p, 0, 4, 3
+  store i32 0, i32* %t126
+  %t127 = getelementptr i32* %p, 0, 4, 4
+  store i32 0, i32* %t127
+  %t128 = getelementptr i32* %p, 0, 4, 5
+  store i32 0, i32* %t128
+  %t129 = getelementptr i32* %p, 0, 4, 6
+  store i32 0, i32* %t129
+  %t130 = getelementptr i32* %p, 0, 4, 7
+  store i32 0, i32* %t130
+  %t131 = getelementptr i32* %p, 0, 4, 8
+  store i32 0, i32* %t131
+  %t132 = getelementptr i32* %p, 0, 4, 9
+  store i32 0, i32* %t132
+  %t133 = getelementptr i32* %p, 0, 4, 10
+  store i32 0, i32* %t133
+  %t134 = getelementptr i32* %p, 0, 4, 11
+  store i32 0, i32* %t134
+  %t135 = getelementptr i32* %p, 0, 4, 12
+  store i32 0, i32* %t135
+  %t136 = getelementptr i32* %p, 0, 4, 13
+  store i32 0, i32* %t136
+  %t137 = getelementptr i32* %p, 0, 4, 14
+  store i32 0, i32* %t137
+  %t138 = getelementptr i32* %p, 0, 4, 15
+  store i32 0, i32* %t138
+  %t139 = getelementptr i32* %p, 0, 5, 0
+  store i32 0, i32* %t139
+  %t140 = getelementptr i32* %p, 0, 5, 1
+  store i32 0, i32* %t140
+  %t141 = getelementptr i32* %p, 0, 5, 2
+  store i32 0, i32* %t141
+  %t142 = getelementptr i32* %p, 0, 5, 3
+  store i32 0, i32* %t142
+  %t143 = getelementptr i32* %p, 0, 5, 4
+  store i32 0, i32* %t143
+  %t144 = getelementptr i32* %p, 0, 5, 5
+  store i32 0, i32* %t144
+  %t145 = getelementptr i32* %p, 0, 5, 6
+  store i32 0, i32* %t145
+  %t146 = getelementptr i32* %p, 0, 5, 7
+  store i32 0, i32* %t146
+  %t147 = getelementptr i32* %p, 0, 5, 8
+  store i32 0, i32* %t147
+  %t148 = getelementptr i32* %p, 0, 5, 9
+  store i32 0, i32* %t148
+  %t149 = getelementptr i32* %p, 0, 5, 10
+  store i32 0, i32* %t149
+  %t150 = getelementptr i32* %p, 0, 5, 11
+  store i32 0, i32* %t150
+  %t151 = getelementptr i32* %p, 0, 5, 12
+  store i32 0, i32* %t151
+  %t152 = getelementptr i32* %p, 0, 5, 13
+  store i32 0, i32* %t152
+  %t153 = getelementptr i32* %p, 0, 5, 14
+  store i32 0, i32* %t153
+  %t154 = getelementptr i32* %p, 0, 5, 15
+  store i32 0, i32* %t154
+  %t155 = getelementptr i32* %p, 0, 6, 0
+  store i32 0, i32* %t155
+  %t156 = getelementptr i32* %p, 0, 6, 1
+  store i32 0, i32* %t156
+  %t157 = getelementptr i32* %p, 0, 6, 2
+  store i32 0, i32* %t157
+  %t158 = getelementptr i32* %p, 0, 6, 3
+  store i32 0, i32* %t158
+  %t159 = getelementptr i32* %p, 0, 6, 4
+  store i32 0, i32* %t159
+  %t160 = getelementptr i32* %p, 0, 6, 5
+  store i32 0, i32* %t160
+  %t161 = getelementptr i32* %p, 0, 6, 6
+  store i32 0, i32* %t161
+  %t162 = getelementptr i32* %p, 0, 6, 7
+  store i32 0, i32* %t162
+  %t163 = getelementptr i32* %p, 0, 6, 8
+  store i32 0, i32* %t163
+  %t164 = getelementptr i32* %p, 0, 6, 9
+  store i32 0, i32* %t164
+  %t165 = getelementptr i32* %p, 0, 6, 10
+  store i32 0, i32* %t165
+  %t166 = getelementptr i32* %p, 0, 6, 11
+  store i32 0, i32* %t166
+  %t167 = getelementptr i32* %p, 0, 6, 12
+  store i32 0, i32* %t167
+  %t168 = getelementptr i32* %p, 0, 6, 13
+  store i32 0, i32* %t168
+  %t169 = getelementptr i32* %p, 0, 6, 14
+  store i32 0, i32* %t169
+  %t170 = getelementptr i32* %p, 0, 6, 15
+  store i32 0, i32* %t170
+  %t171 = getelementptr i32* %p, 0, 7, 0
+  store i32 0, i32* %t171
+  %t172 = getelementptr i32* %p, 0, 7, 1
+  store i32 0, i32* %t172
+  %t173 = getelementptr i32* %p, 0, 7, 2
+  store i32 0, i32* %t173
+  %t174 = getelementptr i32* %p, 0, 7, 3
+  store i32 0, i32* %t174
+  %t175 = getelementptr i32* %p, 0, 7, 4
+  store i32 0, i32* %t175
+  %t176 = getelementptr i32* %p, 0, 7, 5
+  store i32 0, i32* %t176
+  %t177 = getelementptr i32* %p, 0, 7, 6
+  store i32 0, i32* %t177
+  %t178 = getelementptr i32* %p, 0, 7, 7
+  store i32 0, i32* %t178
+  %t179 = getelementptr i32* %p, 0, 7, 8
+  store i32 0, i32* %t179
+  %t180 = getelementptr i32* %p, 0, 7, 9
+  store i32 0, i32* %t180
+  %t181 = getelementptr i32* %p, 0, 7, 10
+  store i32 0, i32* %t181
+  %t182 = getelementptr i32* %p, 0, 7, 11
+  store i32 0, i32* %t182
+  %t183 = getelementptr i32* %p, 0, 7, 12
+  store i32 0, i32* %t183
+  %t184 = getelementptr i32* %p, 0, 7, 13
+  store i32 0, i32* %t184
+  %t185 = getelementptr i32* %p, 0, 7, 14
+  store i32 0, i32* %t185
+  %t186 = getelementptr i32* %p, 0, 7, 15
+  store i32 0, i32* %t186
+  %t187 = getelementptr i32* %p, 0, 8, 0
+  store i32 0, i32* %t187
+  %t188 = getelementptr i32* %p, 0, 8, 1
+  store i32 0, i32* %t188
+  %t189 = getelementptr i32* %p, 0, 8, 2
+  store i32 0, i32* %t189
+  %t190 = getelementptr i32* %p, 0, 8, 3
+  store i32 0, i32* %t190
+  %t191 = getelementptr i32* %p, 0, 8, 4
+  store i32 0, i32* %t191
+  %t192 = getelementptr i32* %p, 0, 8, 5
+  store i32 0, i32* %t192
+  %t193 = getelementptr i32* %p, 0, 8, 6
+  store i32 0, i32* %t193
+  %t194 = getelementptr i32* %p, 0, 8, 7
+  store i32 0, i32* %t194
+  %t195 = getelementptr i32* %p, 0, 8, 8
+  store i32 0, i32* %t195
+  %t196 = getelementptr i32* %p, 0, 8, 9
+  store i32 0, i32* %t196
+  %t197 = getelementptr i32* %p, 0, 8, 10
+  store i32 0, i32* %t197
+  %t198 = getelementptr i32* %p, 0, 8, 11
+  store i32 0, i32* %t198
+  %t199 = getelementptr i32* %p, 0, 8, 12
+  store i32 0, i32* %t199
+  %t200 = getelementptr i32* %p, 0, 8, 13
+  store i32 0, i32* %t200
+  %t201 = getelementptr i32* %p, 0, 8, 14
+  store i32 0, i32* %t201
+  %t202 = getelementptr i32* %p, 0, 8, 15
+  store i32 0, i32* %t202
+  %t203 = getelementptr i32* %p, 0, 9, 0
+  store i32 0, i32* %t203
+  %t204 = getelementptr i32* %p, 0, 9, 1
+  store i32 0, i32* %t204
+  %t205 = getelementptr i32* %p, 0, 9, 2
+  store i32 0, i32* %t205
+  %t206 = getelementptr i32* %p, 0, 9, 3
+  store i32 0, i32* %t206
+  %t207 = getelementptr i32* %p, 0, 9, 4
+  store i32 0, i32* %t207
+  %t208 = getelementptr i32* %p, 0, 9, 5
+  store i32 0, i32* %t208
+  %t209 = getelementptr i32* %p, 0, 9, 6
+  store i32 0, i32* %t209
+  %t210 = getelementptr i32* %p, 0, 9, 7
+  store i32 0, i32* %t210
+  %t211 = getelementptr i32* %p, 0, 9, 8
+  store i32 0, i32* %t211
+  %t212 = getelementptr i32* %p, 0, 9, 9
+  store i32 0, i32* %t212
+  %t213 = getelementptr i32* %p, 0, 9, 10
+  store i32 0, i32* %t213
+  %t214 = getelementptr i32* %p, 0, 9, 11
+  store i32 0, i32* %t214
+  %t215 = getelementptr i32* %p, 0, 9, 12
+  store i32 0, i32* %t215
+  %t216 = getelementptr i32* %p, 0, 9, 13
+  store i32 0, i32* %t216
+  %t217 = getelementptr i32* %p, 0, 9, 14
+  store i32 0, i32* %t217
+  %t218 = getelementptr i32* %p, 0, 9, 15
+  store i32 0, i32* %t218
+  %t219 = getelementptr i32* %p, 0, 10, 0
+  store i32 0, i32* %t219
+  %t220 = getelementptr i32* %p, 0, 10, 1
+  store i32 0, i32* %t220
+  %t221 = getelementptr i32* %p, 0, 10, 2
+  store i32 0, i32* %t221
+  %t222 = getelementptr i32* %p, 0, 10, 3
+  store i32 0, i32* %t222
+  %t223 = getelementptr i32* %p, 0, 10, 4
+  store i32 0, i32* %t223
+  %t224 = getelementptr i32* %p, 0, 10, 5
+  store i32 0, i32* %t224
+  %t225 = getelementptr i32* %p, 0, 10, 6
+  store i32 0, i32* %t225
+  %t226 = getelementptr i32* %p, 0, 10, 7
+  store i32 0, i32* %t226
+  %t227 = getelementptr i32* %p, 0, 10, 8
+  store i32 0, i32* %t227
+  %t228 = getelementptr i32* %p, 0, 10, 9
+  store i32 0, i32* %t228
+  %t229 = getelementptr i32* %p, 0, 10, 10
+  store i32 0, i32* %t229
+  %t230 = getelementptr i32* %p, 0, 10, 11
+  store i32 0, i32* %t230
+  %t231 = getelementptr i32* %p, 0, 10, 12
+  store i32 0, i32* %t231
+  %t232 = getelementptr i32* %p, 0, 10, 13
+  store i32 0, i32* %t232
+  %t233 = getelementptr i32* %p, 0, 10, 14
+  store i32 0, i32* %t233
+  %t234 = getelementptr i32* %p, 0, 10, 15
+  store i32 0, i32* %t234
+  %t235 = getelementptr i32* %p, 0, 11, 0
+  store i32 0, i32* %t235
+  %t236 = getelementptr i32* %p, 0, 11, 1
+  store i32 0, i32* %t236
+  %t237 = getelementptr i32* %p, 0, 11, 2
+  store i32 0, i32* %t237
+  %t238 = getelementptr i32* %p, 0, 11, 3
+  store i32 0, i32* %t238
+  %t239 = getelementptr i32* %p, 0, 11, 4
+  store i32 0, i32* %t239
+  %t240 = getelementptr i32* %p, 0, 11, 5
+  store i32 0, i32* %t240
+  %t241 = getelementptr i32* %p, 0, 11, 6
+  store i32 0, i32* %t241
+  %t242 = getelementptr i32* %p, 0, 11, 7
+  store i32 0, i32* %t242
+  %t243 = getelementptr i32* %p, 0, 11, 8
+  store i32 0, i32* %t243
+  %t244 = getelementptr i32* %p, 0, 11, 9
+  store i32 0, i32* %t244
+  %t245 = getelementptr i32* %p, 0, 11, 10
+  store i32 0, i32* %t245
+  %t246 = getelementptr i32* %p, 0, 11, 11
+  store i32 0, i32* %t246
+  %t247 = getelementptr i32* %p, 0, 11, 12
+  store i32 0, i32* %t247
+  %t248 = getelementptr i32* %p, 0, 11, 13
+  store i32 0, i32* %t248
+  %t249 = getelementptr i32* %p, 0, 11, 14
+  store i32 0, i32* %t249
+  %t250 = getelementptr i32* %p, 0, 11, 15
+  store i32 0, i32* %t250
+  %t251 = getelementptr i32* %p, 0, 12, 0
+  store i32 0, i32* %t251
+  %t252 = getelementptr i32* %p, 0, 12, 1
+  store i32 0, i32* %t252
+  %t253 = getelementptr i32* %p, 0, 12, 2
+  store i32 0, i32* %t253
+  %t254 = getelementptr i32* %p, 0, 12, 3
+  store i32 0, i32* %t254
+  %t255 = getelementptr i32* %p, 0, 12, 4
+  store i32 0, i32* %t255
+  %t256 = getelementptr i32* %p, 0, 12, 5
+  store i32 0, i32* %t256
+  %t257 = getelementptr i32* %p, 0, 12, 6
+  store i32 0, i32* %t257
+  %t258 = getelementptr i32* %p, 0, 12, 7
+  store i32 0, i32* %t258
+  %t259 = getelementptr i32* %p, 0, 12, 8
+  store i32 0, i32* %t259
+  %t260 = getelementptr i32* %p, 0, 12, 9
+  store i32 0, i32* %t260
+  %t261 = getelementptr i32* %p, 0, 12, 10
+  store i32 0, i32* %t261
+  %t262 = getelementptr i32* %p, 0, 12, 11
+  store i32 0, i32* %t262
+  %t263 = getelementptr i32* %p, 0, 12, 12
+  store i32 0, i32* %t263
+  %t264 = getelementptr i32* %p, 0, 12, 13
+  store i32 0, i32* %t264
+  %t265 = getelementptr i32* %p, 0, 12, 14
+  store i32 0, i32* %t265
+  %t266 = getelementptr i32* %p, 0, 12, 15
+  store i32 0, i32* %t266
+  %t267 = getelementptr i32* %p, 0, 13, 0
+  store i32 0, i32* %t267
+  %t268 = getelementptr i32* %p, 0, 13, 1
+  store i32 0, i32* %t268
+  %t269 = getelementptr i32* %p, 0, 13, 2
+  store i32 0, i32* %t269
+  %t270 = getelementptr i32* %p, 0, 13, 3
+  store i32 0, i32* %t270
+  %t271 = getelementptr i32* %p, 0, 13, 4
+  store i32 0, i32* %t271
+  %t272 = getelementptr i32* %p, 0, 13, 5
+  store i32 0, i32* %t272
+  %t273 = getelementptr i32* %p, 0, 13, 6
+  store i32 0, i32* %t273
+  %t274 = getelementptr i32* %p, 0, 13, 7
+  store i32 0, i32* %t274
+  %t275 = getelementptr i32* %p, 0, 13, 8
+  store i32 0, i32* %t275
+  %t276 = getelementptr i32* %p, 0, 13, 9
+  store i32 0, i32* %t276
+  %t277 = getelementptr i32* %p, 0, 13, 10
+  store i32 0, i32* %t277
+  %t278 = getelementptr i32* %p, 0, 13, 11
+  store i32 0, i32* %t278
+  %t279 = getelementptr i32* %p, 0, 13, 12
+  store i32 0, i32* %t279
+  %t280 = getelementptr i32* %p, 0, 13, 13
+  store i32 0, i32* %t280
+  %t281 = getelementptr i32* %p, 0, 13, 14
+  store i32 0, i32* %t281
+  %t282 = getelementptr i32* %p, 0, 13, 15
+  store i32 0, i32* %t282
+  %t283 = getelementptr i32* %p, 0, 14, 0
+  store i32 0, i32* %t283
+  %t284 = getelementptr i32* %p, 0, 14, 1
+  store i32 0, i32* %t284
+  %t285 = getelementptr i32* %p, 0, 14, 2
+  store i32 0, i32* %t285
+  %t286 = getelementptr i32* %p, 0, 14, 3
+  store i32 0, i32* %t286
+  %t287 = getelementptr i32* %p, 0, 14, 4
+  store i32 0, i32* %t287
+  %t288 = getelementptr i32* %p, 0, 14, 5
+  store i32 0, i32* %t288
+  %t289 = getelementptr i32* %p, 0, 14, 6
+  store i32 0, i32* %t289
+  %t290 = getelementptr i32* %p, 0, 14, 7
+  store i32 0, i32* %t290
+  %t291 = getelementptr i32* %p, 0, 14, 8
+  store i32 0, i32* %t291
+  %t292 = getelementptr i32* %p, 0, 14, 9
+  store i32 0, i32* %t292
+  %t293 = getelementptr i32* %p, 0, 14, 10
+  store i32 0, i32* %t293
+  %t294 = getelementptr i32* %p, 0, 14, 11
+  store i32 0, i32* %t294
+  %t295 = getelementptr i32* %p, 0, 14, 12
+  store i32 0, i32* %t295
+  %t296 = getelementptr i32* %p, 0, 14, 13
+  store i32 0, i32* %t296
+  %t297 = getelementptr i32* %p, 0, 14, 14
+  store i32 0, i32* %t297
+  %t298 = getelementptr i32* %p, 0, 14, 15
+  store i32 0, i32* %t298
+  %t299 = getelementptr i32* %p, 0, 15, 0
+  store i32 0, i32* %t299
+  %t300 = getelementptr i32* %p, 0, 15, 1
+  store i32 0, i32* %t300
+  %t301 = getelementptr i32* %p, 0, 15, 2
+  store i32 0, i32* %t301
+  %t302 = getelementptr i32* %p, 0, 15, 3
+  store i32 0, i32* %t302
+  %t303 = getelementptr i32* %p, 0, 15, 4
+  store i32 0, i32* %t303
+  %t304 = getelementptr i32* %p, 0, 15, 5
+  store i32 0, i32* %t304
+  %t305 = getelementptr i32* %p, 0, 15, 6
+  store i32 0, i32* %t305
+  %t306 = getelementptr i32* %p, 0, 15, 7
+  store i32 0, i32* %t306
+  %t307 = getelementptr i32* %p, 0, 15, 8
+  store i32 0, i32* %t307
+  %t308 = getelementptr i32* %p, 0, 15, 9
+  store i32 0, i32* %t308
+  %t309 = getelementptr i32* %p, 0, 15, 10
+  store i32 0, i32* %t309
+  %t310 = getelementptr i32* %p, 0, 15, 11
+  store i32 0, i32* %t310
+  %t311 = getelementptr i32* %p, 0, 15, 12
+  store i32 0, i32* %t311
+  %t312 = getelementptr i32* %p, 0, 15, 13
+  store i32 0, i32* %t312
+  %t313 = getelementptr i32* %p, 0, 15, 14
+  store i32 0, i32* %t313
+  %t314 = getelementptr i32* %p, 0, 15, 15
+  store i32 0, i32* %t314
+  store i32 1, i32* %%%i.phi.while_cond_9.phi.ptr
+  store i32 0, i32* %%%j.phi.while_cond_9.phi.ptr
+  br label %while_cond_9
+while_cond_9:
+  %%%i.phi.while_cond_9 = load i32, i32* %%%i.phi.while_cond_9.phi.ptr
+  %sle = icmp i1 %%%i.phi.while_cond_9, %arg1
+  br i1 %sle, label %while_body_10, label %while_end_11
+while_body_10:
+  store i32 1, i32* %%%j.phi.while_cond_12.phi.ptr
+  br label %while_cond_12.preheader.1
+while_cond_12.preheader.1:
+  %t330 = getelementptr [16 x i32]* %p, 0, %%%i.phi.while_cond_9
+  %t334 = sub i32 %%%i.phi.while_cond_9, 1
+  %t335 = getelementptr [16 x i32]* %p, 0, %t334
+  %t342 = getelementptr [16 x i32]* %p, 0, %%%i.phi.while_cond_9
+  %t347 = getelementptr [16 x i32]* %p, 0, %t334
+  %t352 = getelementptr [16 x i32]* %p, 0, %%%i.phi.while_cond_9
+  %t322 = getelementptr i32* %arg0, %t334
+  br label %while_cond_12
+while_cond_12:
+  %%%j.phi.while_cond_12 = load i32, i32* %%%j.phi.while_cond_12.phi.ptr
+  %sle = icmp i1 %%%j.phi.while_cond_12, %arg3
+  br i1 %sle, label %while_body_13, label %while_end_14
+while_body_13:
+  %t323 = load i32, i32* %t322
+  %t326 = sub i32 %%%j.phi.while_cond_12, 1
+  %t327 = getelementptr i32* %arg2, %t326
+  %t328 = load i32, i32* %t327
+  %eq = icmp i1 %t323, %t328
+  br i1 %eq, label %then_15, label %else_16
+else_16:
+  %t344 = getelementptr i32* %t342, 0, %%%j.phi.while_cond_12
+  %t349 = getelementptr i32* %t347, 0, %%%j.phi.while_cond_12
+  %t350 = load i32, i32* %t349
+  %t354 = sub i32 %%%j.phi.while_cond_12, 1
+  %t355 = getelementptr i32* %t352, 0, %t354
+  %t356 = load i32, i32* %t355
+  %inline_ret_3 = alloca i32
+  br label %inline_MAX_entry_3
+inline_MAX_entry_3:
+  %eq = icmp i1 %t350, %t356
+  br i1 %eq, label %inline_MAX_then_0_3, label %inline_MAX_else_1_3
+inline_MAX_else_1_3:
+  %sgt = icmp i1 %t350, %t356
+  br i1 %sgt, label %inline_MAX_then_3_3, label %inline_MAX_else_4_3
+inline_MAX_else_4_3:
+  store i32 %t356, i32* %inline_ret_3
+  br label %inline_cont_MAX_3
+inline_MAX_then_3_3:
+  store i32 %t350, i32* %inline_ret_3
+  br label %inline_cont_MAX_3
+inline_MAX_then_0_3:
+  store i32 %t350, i32* %inline_ret_3
+  br label %inline_cont_MAX_3
+inline_cont_MAX_3:
+  %inline_ret_val_3 = load i32, i32* %inline_ret_3
+  store i32 %inline_ret_val_3, i32* %t344
+  br label %merge_17
+then_15:
+  %t337 = sub i32 %%%j.phi.while_cond_12, 1
+  %t338 = getelementptr i32* %t335, 0, %t337
+  %t339 = load i32, i32* %t338
+  %t340 = add i32 1, %t339
+  %t332 = getelementptr i32* %t330, 0, %%%j.phi.while_cond_12
+  store i32 %t340, i32* %t332
+  br label %merge_17
+merge_17:
+  %t359 = add i32 1, %%%j.phi.while_cond_12
+  store i32 %t359, i32* %%%j.phi.while_cond_12.phi.ptr
+  br label %while_cond_12
+while_end_14:
+  %t361 = add i32 1, %%%i.phi.while_cond_9
+  store i32 %t361, i32* %%%i.phi.while_cond_9.phi.ptr
+  store i32 %%%j.phi.while_cond_12, i32* %%%j.phi.while_cond_9.phi.ptr
+  br label %while_cond_9
+while_end_11:
+  %t363 = getelementptr [16 x i32]* %p, 0, %arg1
+  %t365 = getelementptr i32* %t363, 0, %arg3
+  %t366 = load i32, i32* %t365
+  ret i32 %t366
+}
+
+define i32 @main() {
+entry:
+  %A = alloca [15 x i32]
+  %t367 = getelementptr i32* %A, 0, 0
+  store i32 8, i32* %t367
+  %t368 = getelementptr i32* %A, 0, 1
+  store i32 7, i32* %t368
+  %t369 = getelementptr i32* %A, 0, 2
+  store i32 4, i32* %t369
+  %t370 = getelementptr i32* %A, 0, 3
+  store i32 1, i32* %t370
+  %t371 = getelementptr i32* %A, 0, 4
+  store i32 2, i32* %t371
+  %t372 = getelementptr i32* %A, 0, 5
+  store i32 7, i32* %t372
+  %t373 = getelementptr i32* %A, 0, 6
+  store i32 0, i32* %t373
+  %t374 = getelementptr i32* %A, 0, 7
+  store i32 1, i32* %t374
+  %t375 = getelementptr i32* %A, 0, 8
+  store i32 9, i32* %t375
+  %t376 = getelementptr i32* %A, 0, 9
+  store i32 3, i32* %t376
+  %t377 = getelementptr i32* %A, 0, 10
+  store i32 4, i32* %t377
+  %t378 = getelementptr i32* %A, 0, 11
+  store i32 8, i32* %t378
+  %t379 = getelementptr i32* %A, 0, 12
+  store i32 3, i32* %t379
+  %t380 = getelementptr i32* %A, 0, 13
+  store i32 7, i32* %t380
+  %t381 = getelementptr i32* %A, 0, 14
+  store i32 0, i32* %t381
+  %B = alloca [13 x i32]
+  %t382 = getelementptr i32* %B, 0, 0
+  store i32 3, i32* %t382
+  %t383 = getelementptr i32* %B, 0, 1
+  store i32 9, i32* %t383
+  %t384 = getelementptr i32* %B, 0, 2
+  store i32 7, i32* %t384
+  %t385 = getelementptr i32* %B, 0, 3
+  store i32 1, i32* %t385
+  %t386 = getelementptr i32* %B, 0, 4
+  store i32 4, i32* %t386
+  %t387 = getelementptr i32* %B, 0, 5
+  store i32 2, i32* %t387
+  %t388 = getelementptr i32* %B, 0, 6
+  store i32 4, i32* %t388
+  %t389 = getelementptr i32* %B, 0, 7
+  store i32 3, i32* %t389
+  %t390 = getelementptr i32* %B, 0, 8
+  store i32 6, i32* %t390
+  %t391 = getelementptr i32* %B, 0, 9
+  store i32 8, i32* %t391
+  %t392 = getelementptr i32* %B, 0, 10
+  store i32 0, i32* %t392
+  %t393 = getelementptr i32* %B, 0, 11
+  store i32 1, i32* %t393
+  %t394 = getelementptr i32* %B, 0, 12
+  store i32 5, i32* %t394
+  %t395 = getelementptr i32* %A, 0, 0
+  %t396 = call i32 %max_sum_nonadjacent(i32* %t395, i32 15)
+  call void %putint(i32 %t396)
+  call void %putch(i32 10)
+  %t397 = getelementptr i32* %A, 0, 0
+  %t398 = getelementptr i32* %B, 0, 0
+  %t399 = call i32 %longest_common_subseq(i32* %t397, i32 15, i32* %t398, i32 13)
+  call void %putint(i32 %t399)
+  call void %putch(i32 10)
+  ret i32 0
+}
+

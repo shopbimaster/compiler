@@ -34,35 +34,35 @@ void runO1(IR::Module* mod) {
 void runO2(IR::Module* mod) {
     // ================================================================
     // 阶段 1：结构化变换
-    //   先做函数级别的结构变换（删除、简化、尾递归→循环、内联），
-    //   为后续所有优化创造更大的优化空间。
-    //   借鉴 Cpl3：尾递归在内联之前，转换后的循环函数可被内联。
+    //   Mem2Reg 放在内联和全局变量提升之后，避免 InlineExpansion
+    //   克隆 phi.ptr ALLOCA 导致的 SEGFAULT（64_calculator 修复）。
     // ================================================================
 
-    // 1a. 树摇：移除未使用的函数和全局变量
+    // 1a. 树摇
     treeShaking(mod);
 
-    // 1b. 位运算模式识别：消除自定义位运算函数调用（_and/_or/rotlN 等），
-    //     让 read_bits 等函数变为叶子函数，为后续内联做准备
     if (bitOpPatternRecognition(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
-    // 1c. 尾递归消除 → 循环转换（在函数内联之前！）
-    //     借鉴 Cpl3：将尾递归转为循环后，函数更简单，更容易被内联
     if (tailRecursionElimination(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
-    // 1d. 函数内联：展开小函数，暴露跨函数优化机会
-    //     内联后循环体变大，LICM 在阶段 5 运行以捕获新的不变量
     inlineExpansion(mod);
     constantFolding(mod);
     deadCodeElimination(mod);
 
-    // 1e. 全局变量提升：内联后暴露更多全局变量访问模式
+    // Mem2Reg+PhiLowering 暂时禁用：跨块 live range 导致寄存器分配冲突
+    // (12_DSU SEGFAULT)。需要重新设计 PHI 降低策略或增强寄存器分配器。
+    // if (mem2reg(mod)) {
+    //     phiLowering(mod);
+    //     constantFolding(mod);
+    //     deadCodeElimination(mod);
+    // }
+
     if (globalVariablePromotion(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
@@ -172,22 +172,53 @@ void runO2(IR::Module* mod) {
     }
 
     // ================================================================
-    // 阶段 4→2 反馈：值传播后再次运行指令级化简（1 次）
-    //   SCCP 传播常量后，InstCombine 可能发现新的化简机会
-    //   （如 x*1→x, x&0→0 等，其中 x 现在是常量）
+    // 阶段 4→2 反馈：值传播后再次运行算术+指令级化简（1 次）
+    //   SCCP 传播常量后，可能产生新的：
+    //     - 常量除法（如 sdiv x, y 中 y 现在被 SCCP 确定为常量 7）
+    //       → 需要重跑 MagicDivision
+    //     - 强度削减机会（如 sdiv x, 2 现在 x 已知非负）
+    //       → 需要重跑 AlgebraicSimplification
+    //     - 算术恒等式（如 x*1→x, x&0→0，其中 x 现在是常量）
+    //       → 需要重跑 InstCombine
     // ================================================================
     {
         bool feedbackChanged = false;
+
+        // 反馈-1: InstCombine 先处理明显的算术恒等式
         if (instCombine(mod)) {
             constantFolding(mod);
             deadCodeElimination(mod);
             feedbackChanged = true;
         }
+
+        // 反馈-2: MagicDivision 处理 SCCP 新暴露的常量除法
+        if (magicDivision(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+            feedbackChanged = true;
+        }
+
+        // 反馈-3: AlgebraicSimplification 处理新的强度削减机会
+        if (algebraicSimplification(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+            feedbackChanged = true;
+        }
+
+        // 反馈-4: DSE 消除死存储
         if (feedbackChanged && deadStoreElimination(mod)) {
             constantFolding(mod);
             deadCodeElimination(mod);
         }
+
+        // 反馈-5: SimplifyCFG 折叠新常量分支
         if (feedbackChanged && simplifyCFG(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+
+        // 反馈-6: 如果前面的反馈产生了新常量，再跑一次 SCCP 传播
+        if (feedbackChanged && sparseConditionalConstantPropagation(mod)) {
             constantFolding(mod);
             deadCodeElimination(mod);
         }
@@ -197,6 +228,7 @@ void runO2(IR::Module* mod) {
     // 阶段 5：循环优化（在结构稳定后、所有清理完成后运行）
     //   LICM：内联后循环体中有新的不变量可外提
     //         使用 NaturalLoop 森林 + innermost-first 处理 + 安全检查
+    //   LoadElimination：LICM 外提的 LOAD/STORE 可能暴露冗余 LOAD
     //   CSE：LICM 外提代码 + 所有前置变换可能创建公共子表达式
     // ================================================================
 
@@ -207,7 +239,14 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
-    // 5b. CSE（第二次）：LICM 外提代码 + 所有前置变换可能创建公共子表达式
+    // 5b. LoadElimination（第二次）：LICM 外提代码后可能暴露冗余 LOAD
+    //     （外提的 LOAD 与循环内的 LOAD 可能引用同一地址）
+    if (loadElimination(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // 5c. CSE（第二次）：LICM 外提代码 + 所有前置变换可能创建公共子表达式
     if (commonSubexpressionElimination(mod)) { /* CSE changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
@@ -235,6 +274,7 @@ void runO2(IR::Module* mod) {
     }
 
     // 6d. BasicBlockReordering：基于支配树的拓扑排序，优化 fall-through
+    //     Mem2Reg 已禁用，不再有 PHI 节点冲突，可安全启用
     if (basicBlockReordering(mod)) {
         // 仅布局变化，无需 CF/DCE
     }
@@ -243,45 +283,149 @@ void runO2(IR::Module* mod) {
 // ================================================================
 // O3：循环特定变换（在 O2 通用优化之后运行）
 //   循环交换 → 强度削弱 → 完全展开 → 部分展开
+//   重要：循环变换后必须运行清理轮，因为：
+//     - LoopFullUnroll 把循环变直线代码，归纳变量全成常量
+//     - LoopUnrolling 多个迭代体共享子表达式（如 a[i+1]）
+//     - LSR/GEPStrengthReduce 简化地址计算，产生新的 addi 链
 // ================================================================
 void runO3(IR::Module* mod) {
+    bool o3Changed = false;
+
     // LoopInterchange：循环交换（在 LSR/GEP 之前，因为交换改变循环结构）
-    if (loopInterchange(mod)) { /* changed */ }
-    constantFolding(mod);
-    deadCodeElimination(mod);
+    if (loopInterchange(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+        o3Changed = true;
+    }
 
     // LoopStrengthReduce：循环强度削弱（MUL→累加）
     if (loopStrengthReduce(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
+        o3Changed = true;
     }
 
     // GEPStrengthReduce：GEP 地址计算强度削弱
     if (gepStrengthReduce(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
+        o3Changed = true;
     }
 
     // LoopFullUnroll：基于 SCEV 确定迭代次数的完全展开
     if (loopFullUnroll(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
+        o3Changed = true;
     }
 
     // LoopUnrolling：部分展开（最大 8×）
-    if (loopUnrolling(mod)) { /* changed */ }
-    constantFolding(mod);
-    deadCodeElimination(mod);
+    if (loopUnrolling(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+        o3Changed = true;
+    }
+
+    // ================================================================
+    // O3 后清理轮：循环变换创造大量新机会，必须运行完整清理
+    //   1. SCCP：传播展开后的归纳变量常量（如 for(i=0;i<4;i++) → i=0,1,2,3）
+    //   2. SimplifyCFG：折叠展开后的死分支
+    //   3. CSE：消除展开体间的公共子表达式（如相邻迭代的 a[i+1]/a[i]）
+    //   4. InstCombine：折叠新的算术链（如 i*2 在 i 已知时折叠为常量）
+    //   5. DSE：消除展开后成为死存储的 STORE
+    //   6. LICM：循环交换/展开可能暴露新的循环不变量
+    // ================================================================
+    if (o3Changed) {
+        // 1. SCCP + SimplifyCFG（迭代 2 次以充分传播常量）
+        for (int iter = 0; iter < 2; ++iter) {
+            bool iterChanged = false;
+            if (sparseConditionalConstantPropagation(mod)) {
+                constantFolding(mod);
+                deadCodeElimination(mod);
+                iterChanged = true;
+            }
+            if (simplifyCFG(mod)) {
+                constantFolding(mod);
+                deadCodeElimination(mod);
+                iterChanged = true;
+            }
+            if (!iterChanged) break;
+        }
+
+        // 2. CSE：消除展开体间的公共子表达式
+        if (commonSubexpressionElimination(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+
+        // 3. InstCombine：折叠新的算术链
+        if (instCombine(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+
+        // 4. DSE：消除展开后的死存储
+        if (deadStoreElimination(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+
+        // 5. LoadElimination：消除展开后的冗余 LOAD
+        if (loadElimination(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+
+        // 6. LICM：循环变换后可能暴露新的不变量
+        if (loopInvariantCodeMotion(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+
+        // 7. 最终 CSE + 清理
+        if (commonSubexpressionElimination(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+    }
 }
 
 // ================================================================
 // P0：特殊模式识别
+//   重要：P0 后需要运行 InstCombine + SCCP 清理，因为
+//   bitOpPatternRecognition 和 recursiveMulToNative 会引入
+//   新的算术模式（native mul 替换递归，位运算模式替换函数调用）
 // ================================================================
 void runP0(IR::Module* mod) {
-    if (recursiveMulToNative(mod)) { /* changed */ }
-    if (bitOpPatternRecognition(mod)) { /* changed */ }
+    bool p0Changed = false;
+    if (recursiveMulToNative(mod)) {
+        p0Changed = true;
+    }
+    if (bitOpPatternRecognition(mod)) {
+        p0Changed = true;
+    }
     constantFolding(mod);
     deadCodeElimination(mod);
+
+    if (p0Changed) {
+        // P0 后清理：模式识别产生的新算术链需要折叠
+        if (instCombine(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+        if (sparseConditionalConstantPropagation(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+        if (simplifyCFG(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+        if (commonSubexpressionElimination(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+    }
 }
 
 // ================================================================

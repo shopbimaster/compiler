@@ -26,7 +26,7 @@ static void runOptPasses(Module* mod, OptLevel opt) {
         Opt::runO2(mod);
         Opt::runO3(mod);
         Opt::runP0(mod);
-        Opt::runP3(mod);
+        // Opt::runP3(mod);  // TODO: 与Mem2Reg+PhiLowering交互导致SEGFAULT，待修复
         break;
     case OptLevel::O0:
     default:
@@ -58,6 +58,8 @@ void Compiler::emitIRToFile(const std::string& sourcePath, const std::string& ou
 void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out, OptLevel opt) {
     auto mod = compile(sourcePath);
     runOptPasses(mod.get(), opt);
+    // 在代码生成前降级 PHI 指令（如果 Mem2Reg 引入了 PHI）
+    Opt::phiLowering(mod.get());
     Backend::TargetCodeGen cg;
     std::string asmCode = cg.generate(*mod);
     out << Opt::peepholeOptimize(asmCode);
@@ -66,6 +68,8 @@ void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out, OptLeve
 void Compiler::emitAsmToFile(const std::string& sourcePath, const std::string& outputPath, OptLevel opt) {
     auto mod = compile(sourcePath);
     runOptPasses(mod.get(), opt);
+    // 在代码生成前降级 PHI 指令（如果 Mem2Reg 引入了 PHI）
+    Opt::phiLowering(mod.get());
     Backend::TargetCodeGen cg;
     std::ofstream ofs(outputPath);
     if (!ofs.is_open()) {

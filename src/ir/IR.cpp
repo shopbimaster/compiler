@@ -451,9 +451,33 @@ namespace IR {
                     } else if (op == Instruction::Opcode::BR) {
                         oss << "br label %" << inst->getOperand(0)->getName();
                     } else if (op == Instruction::Opcode::COND_BR) {
-                        oss << "br i1 %" << inst->getOperand(0)->getName()
-                            << ", label %" << inst->getOperand(1)->getName()
+                        auto* condVal = inst->getOperand(0);
+                        oss << "br i1 ";
+                        if (auto* ci = dynamic_cast<ConstantInt*>(condVal))
+                            oss << ci->getValue();
+                        else if (auto* cf = dynamic_cast<ConstantFloat*>(condVal))
+                            oss << cf->getValue();
+                        else
+                            oss << "%" << condVal->getName();
+                        oss << ", label %" << inst->getOperand(1)->getName()
                             << ", label %" << inst->getOperand(2)->getName();
+                    } else if (op == Instruction::Opcode::PHI) {
+                        oss << "%" << inst->getName() << " = phi " << inst->getType()->toString() << " ";
+                        for (unsigned i = 0; i < inst->getNumOperands(); i += 2) {
+                            if (i > 0) oss << ", ";
+                            auto* val = inst->getOperand(i);
+                            auto* label = inst->getOperand(i + 1);
+                            oss << "[ ";
+                            if (auto* ci = dynamic_cast<ConstantInt*>(val))
+                                oss << ci->getValue();
+                            else if (auto* cf = dynamic_cast<ConstantFloat*>(val))
+                                oss << cf->getValue();
+                            else
+                                oss << "%" << (val ? val->getName() : "null");
+                            oss << ", %" << (label ? label->getName() : "null") << " ]";
+                        }
+                        oss << "\n";
+                        continue;
                     } else {
                         if (!inst->getName().empty())
                             oss << "%" << inst->getName() << " = ";

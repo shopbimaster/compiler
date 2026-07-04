@@ -6,6 +6,7 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
+#include <climits>
 #include <cstdint>
 #include <vector>
 
@@ -133,6 +134,81 @@ bool trySimplify(IR::Instruction* inst) {
                     if (it->get() == inst) { bb->erase(it); break; }
                 }
                 return true;
+            }
+        }
+
+        // SREM x, 1 → 0  (x % 1 恒为 0)
+        if (op == Opc::SREM && rv == 1) {
+            auto* zero = IR::ConstantInt::get(
+                dynamic_cast<IR::IntegerType*>(inst->getType()), 0);
+            inst->replaceAllUsesWith(zero);
+            inst->dropAllUses();
+            for (auto it = bb->begin(); it != bb->end(); ++it) {
+                if (it->get() == inst) { bb->erase(it); break; }
+            }
+            return true;
+        }
+
+        // ================================================================
+        // 特殊除法/取模恒等式：除以 -1
+        //   x / -1  →  -x    (即 SUB 0, x；INT_MIN/-1 是 UB，可忽略)
+        //   x % -1  →  0     (对所有非 INT_MIN 值成立)
+        // 这些情况下 MagicDivision 会跳过（返回无效），AlgebraicSimplification 必须处理
+        // ================================================================
+        if (rv == -1) {
+            auto* i32 = dynamic_cast<IR::IntegerType*>(rc->getType());
+            if (i32) {
+                if (op == Opc::SDIV) {
+                    // x / -1 → 0 - x
+                    auto* zero = IR::ConstantInt::get(i32, 0);
+                    auto* repl = IR::Instruction::createBinOp(
+                        Opc::SUB, inst->getType(), inst->getName() + ".neg", zero, l);
+                    for (auto it = bb->begin(); it != bb->end(); ++it) {
+                        if (it->get() == inst) {
+                            replaceWithNewInst(it, inst, repl);
+                            return true;
+                        }
+                    }
+                }
+                if (op == Opc::SREM) {
+                    // x % -1 → 0
+                    auto* zero = IR::ConstantInt::get(i32, 0);
+                    inst->replaceAllUsesWith(zero);
+                    inst->dropAllUses();
+                    for (auto it = bb->begin(); it != bb->end(); ++it) {
+                        if (it->get() == inst) { bb->erase(it); break; }
+                    }
+                    return true;
+                }
+            }
+        }
+
+        // ================================================================
+        // 除以 INT32_MIN 优化：x / INT32_MIN → 0 (除 x=INT32_MIN 外，那是 UB)
+        // x % INT32_MIN → x (对 |x| < |INT32_MIN| 的所有 x 成立)
+        // ================================================================
+        if (rv == INT32_MIN) {
+            auto* i32 = dynamic_cast<IR::IntegerType*>(rc->getType());
+            if (i32) {
+                if (op == Opc::SDIV) {
+                    // x / INT32_MIN → 0
+                    auto* zero = IR::ConstantInt::get(i32, 0);
+                    inst->replaceAllUsesWith(zero);
+                    inst->dropAllUses();
+                    for (auto it = bb->begin(); it != bb->end(); ++it) {
+                        if (it->get() == inst) { bb->erase(it); break; }
+                    }
+                    return true;
+                }
+                if (op == Opc::SREM) {
+                    // x % INT32_MIN → x
+                    inst->replaceAllUsesWith(l);
+                    inst->dropAllUses();
+                    for (auto it = bb->begin(); it != bb->end(); ++it) {
+                        if (it->get() == inst) { bb->erase(it); break; }
+                    }
+                    return true;
+                }
             }
         }
 

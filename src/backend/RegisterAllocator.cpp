@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <set>
+#include <unordered_set>
 
 namespace Backend {
 
@@ -66,6 +67,8 @@ int RegisterAllocator::assignInstructionIds(IR::Function& func) {
 void RegisterAllocator::buildIntervals(IR::Function& func) {
     std::unordered_map<IR::Value*, int> firstSeen;
     std::unordered_map<IR::Value*, int> lastSeen;
+    // Track all blocks where a value is used (for loop-aware liveness extension)
+    std::unordered_map<IR::Value*, std::unordered_set<IR::BasicBlock*>> useBlocks;
 
     // Build instId → block mapping and block → max instId mapping
     std::unordered_map<int, IR::BasicBlock*> idToBlock;
@@ -130,6 +133,7 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
                     // firstSeen 中，这是正确的——它们不需要寄存器。
                 }
                 lastSeen[opVal] = curId;
+                useBlocks[opVal].insert(bb.get());
 
                 auto* opTy = opVal->getType();
                 if (opTy && opTy->isFloat()) {
@@ -199,7 +203,6 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
         for (auto it = firstSeen.begin(); it != firstSeen.end(); ++it) {
             auto* val = it->first;
             int startId = it->second;
-            int endId = lastSeen[val];
 
             // Check if definition is outside the loop body
             auto defBlockIt = idToBlock.find(startId);
@@ -208,9 +211,14 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
 
             // Check if any use is inside the loop body
             bool usedInLoop = false;
-            auto endBlockIt = idToBlock.find(endId);
-            if (endBlockIt != idToBlock.end() && loop.body.count(endBlockIt->second)) {
-                usedInLoop = true;
+            auto ubIt = useBlocks.find(val);
+            if (ubIt != useBlocks.end()) {
+                for (auto* useBB : ubIt->second) {
+                    if (loop.body.count(useBB)) {
+                        usedInLoop = true;
+                        break;
+                    }
+                }
             }
 
             if (usedInLoop) {
