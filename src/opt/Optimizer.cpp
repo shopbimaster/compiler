@@ -55,13 +55,16 @@ void runO2(IR::Module* mod) {
     constantFolding(mod);
     deadCodeElimination(mod);
 
-    // Mem2Reg+PhiLowering 暂时禁用：跨块 live range 导致寄存器分配冲突
-    // (12_DSU SEGFAULT)。需要重新设计 PHI 降低策略或增强寄存器分配器。
-    // if (mem2reg(mod)) {
-    //     phiLowering(mod);
-    //     constantFolding(mod);
-    //     deadCodeElimination(mod);
-    // }
+    // Mem2Reg+PhiLowering：将 alloca/load/store 提升为 SSA（PHI）形式，
+    // 让后续优化（SCCP/GVN/CSE 等）能在 SSA 上运行，然后降低 PHI 为
+    // alloca/load/store（代码生成前）。
+    // 安全性：PhiLowering 产生的 ALLOCA 命名为 "%X.phi.ptr"，
+    // isAllocaPromotable 会跳过这些 ALLOCA，避免消耗 callee-saved 寄存器
+    // 导致 12_DSU SEGFAULT。
+    if (mem2reg(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
 
     if (globalVariablePromotion(mod)) {
         constantFolding(mod);
@@ -274,7 +277,6 @@ void runO2(IR::Module* mod) {
     }
 
     // 6d. BasicBlockReordering：基于支配树的拓扑排序，优化 fall-through
-    //     Mem2Reg 已禁用，不再有 PHI 节点冲突，可安全启用
     if (basicBlockReordering(mod)) {
         // 仅布局变化，无需 CF/DCE
     }

@@ -198,31 +198,51 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
         }
     }
 
-    // Extend intervals for values defined outside a loop but used inside
+    // Extend intervals for values used inside a loop to cover the entire
+    // loop body. This is necessary because the linear instruction-ID ordering
+    // does not match the execution order for loops with back-edges. A value
+    // defined in the loop header (e.g., a PHI) and used in a block that
+    // appears earlier in the linear order (but is executed later in the
+    // control flow) must be live across the entire loop body, including
+    // blocks that come after its last use in the linear order.
+    //
+    // Example (56_sort_test2):
+    //   Block layout: while_cond_0 → while_body_1 → ... → while_end_5 → and_rhs_6
+    //   Control flow: while_cond_3 → and_rhs_6 → and_merge_7 → ... → while_end_5
+    //   %i.phi is defined in while_cond_0 (ID 5), last used in while_end_5 (ID 30).
+    //   Without extension, %slt (defined in and_rhs_6, ID 33) would reuse %i.phi's
+    //   register, corrupting %i.phi before it's used in while_end_5.
     for (auto& loop : loops) {
         for (auto it = firstSeen.begin(); it != firstSeen.end(); ++it) {
             auto* val = it->first;
             int startId = it->second;
 
-            // Check if definition is outside the loop body
+            // Verify the definition block exists
             auto defBlockIt = idToBlock.find(startId);
             if (defBlockIt == idToBlock.end()) continue;
-            if (loop.body.count(defBlockIt->second)) continue; // defined inside loop, skip
 
-            // Check if any use is inside the loop body
-            bool usedInLoop = false;
+            // Count how many distinct blocks within the loop body use this value.
+            // Only extend if the value is used in more than one block within the
+            // loop, OR if it's defined outside the loop but used inside (the
+            // original case). Values used in only one block within the loop
+            // don't need extension because their live range is local to that
+            // block and won't conflict with blocks at different linear positions.
+            int useBlockCountInLoop = 0;
             auto ubIt = useBlocks.find(val);
             if (ubIt != useBlocks.end()) {
                 for (auto* useBB : ubIt->second) {
                     if (loop.body.count(useBB)) {
-                        usedInLoop = true;
-                        break;
+                        useBlockCountInLoop++;
                     }
                 }
             }
 
-            if (usedInLoop) {
-                // Extend the interval to cover the entire loop body
+            bool definedOutsideLoop = !loop.body.count(defBlockIt->second);
+            bool needsExtension = (useBlockCountInLoop > 0 && definedOutsideLoop)
+                               || (useBlockCountInLoop > 1);
+
+            if (needsExtension) {
+                // Extend the interval to cover the entire loop body.
                 lastSeen[val] = std::max(lastSeen[val], loop.maxLoopId);
             }
         }

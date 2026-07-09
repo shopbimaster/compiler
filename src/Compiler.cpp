@@ -26,7 +26,7 @@ static void runOptPasses(Module* mod, OptLevel opt) {
         Opt::runO2(mod);
         Opt::runO3(mod);
         Opt::runP0(mod);
-        // Opt::runP3(mod);  // TODO: 与Mem2Reg+PhiLowering交互导致SEGFAULT，待修复
+        Opt::runP3(mod);  // 指令调度（scheduleBB 的 vector::insert 迭代器失效已修复）
         break;
     case OptLevel::O0:
     default:

@@ -145,7 +145,7 @@ IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId,
     if (op == Opc::ICMP || op == Opc::FCMP) {
         auto* lhs = lookup(src->getOperand(0));
         auto* rhs = lookup(src->getOperand(1));
-        return IR::Instruction::createCmp(op, lhs, rhs, src->getName());
+        return IR::Instruction::createCmp(op, lhs, rhs, newName);
     }
 
     if (src->getNumOperands() >= 2) {
@@ -163,6 +163,11 @@ IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId,
 }
 
 // ---- 对单个循环做展开（最大 8×，按因子 8/6/4/3/2 优先级） ----
+// ★ 支持 Mem2Reg 引入的 PHI 归纳变量：
+//   1. 识别 header 中每个 PHI 从 latch（bodyBB）来的 back-edge 值
+//   2. 第 u 轮克隆时，将 PHI 映射为"当前归纳变量值"（即上一轮的 back-edge 值）
+//   3. 每轮克隆后，更新映射为该轮克隆产生的新 back-edge 值
+//   4. 全部克隆完成后，更新 PHI 的 back-edge operand 为最后一次克隆的值
 bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     // 仅处理单 BB 循环体
     if (loop.body.size() > 2) return false; // header + body
@@ -206,14 +211,57 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     }
     if (toClone.empty()) return false;
 
+    // ★ 收集 header PHI → back-edge 值（从 bodyBB 来的值）的映射
+    // 例如：%k = phi [0, entry], [%t4, body] → phiToBackEdge[%k] = %t4
+    std::unordered_map<IR::Value*, IR::Value*> phiToBackEdge;
+    for (auto& inst : loop.header->getInstructions()) {
+        if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
+        for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+            auto* predBB = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+            if (predBB == bodyBB) {
+                IR::Value* backEdgeVal = inst->getOperand(i);
+                phiToBackEdge[inst.get()] = backEdgeVal;
+                // 安全检查：若 back-edge 值是 body 中的指令但不在 toClone 中（如 CALL），
+                // 跳过展开（无法正确克隆 back-edge 计算指令）
+                if (auto* beInst = dynamic_cast<IR::Instruction*>(backEdgeVal)) {
+                    if (beInst->getParent() == bodyBB) {
+                        bool found = false;
+                        for (auto* tc_inst : toClone) {
+                            if (tc_inst == beInst) { found = true; break; }
+                        }
+                        if (!found) return false;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     std::unordered_map<IR::Value*, IR::Value*> valueMap;
     std::vector<IR::Instruction*> clonedInsts;
     for (unsigned u = 1; u < factor; ++u) {
+        // ★ 在本轮克隆前，将 PHI 映射为"当前归纳变量值"
+        // 第 u=1 轮：PHI → 原 back-edge 值（即第 1 次迭代后的值）
+        // 第 u=2 轮：PHI → 第 1 轮克隆的 back-edge 值（即第 2 次迭代后的值）
+        for (auto& [phi, backEdge] : phiToBackEdge) {
+            valueMap[phi] = backEdge;
+        }
+
         for (auto* src : toClone) {
             auto* cloned = cloneNonTermInst(src, u, valueMap);
             if (cloned) {
                 valueMap[src] = cloned;
                 clonedInsts.push_back(cloned);
+            }
+        }
+
+        // ★ 本轮克隆后，更新 phiToBackEdge 指向最新克隆的 back-edge 值
+        // 例如：原 back-edge 是 %t4，本轮克隆产生 %t4.u1
+        // 下轮克隆时 PHI 应映射为 %t4.u1
+        for (auto& [phi, backEdge] : phiToBackEdge) {
+            auto it = valueMap.find(backEdge);
+            if (it != valueMap.end()) {
+                phiToBackEdge[phi] = it->second;
             }
         }
     }
@@ -223,6 +271,22 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
         auto termIt = bodyBB->end();
         --termIt;
         bodyBB->insert(termIt, cloned);
+    }
+
+    // ★ 全部克隆完成后，更新 PHI 的 back-edge operand 为最后一次克隆的值
+    // 例如：原 PHI 的 back-edge 是 %t4，2× 展开后应改为 %t4.u1
+    for (auto& inst : loop.header->getInstructions()) {
+        if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
+        auto it = phiToBackEdge.find(inst.get());
+        if (it == phiToBackEdge.end()) continue;
+        IR::Value* finalBackEdge = it->second;
+        for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+            auto* predBB = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+            if (predBB == bodyBB) {
+                inst->setOperand(i, finalBackEdge);
+                break;
+            }
+        }
     }
 
     return true;

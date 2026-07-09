@@ -59,7 +59,10 @@ bool isPromotableAlloca(IR::Instruction* alloca) {
 std::unordered_set<IR::BasicBlock*> computeIteratedDominanceFrontier(
     const std::unordered_set<IR::BasicBlock*>& defBlocks,
     const DFMap& df) {
-    std::unordered_set<IR::BasicBlock*> idf = defBlocks;
+    // 标准 Cytron 算法：IDF 从空集开始，仅包含 defBlocks 的迭代支配边界。
+    // 注意：defBlock 如果同时也在其他 defBlock 的支配边界中，它会被加入 IDF
+    // 并需要 PHI 来合并来自不同前驱的值（如 h-9-03 的 merge_23）。
+    std::unordered_set<IR::BasicBlock*> idf;
     std::vector<IR::BasicBlock*> workList(defBlocks.begin(), defBlocks.end());
 
     while (!workList.empty()) {
@@ -74,11 +77,6 @@ std::unordered_set<IR::BasicBlock*> computeIteratedDominanceFrontier(
                 workList.push_back(frontierBB);
             }
         }
-    }
-
-    // 移除 defBlocks 自身（它们已经有定义了，不需要 PHI）
-    for (auto* db : defBlocks) {
-        idf.erase(db);
     }
 
     return idf;
@@ -182,14 +180,20 @@ bool mem2regOnFunction(IR::Function* func) {
         // 3b. 计算 PHI 放置位置（迭代支配边界）
         auto phiBlocks = computeIteratedDominanceFrontier(defBlocks, df);
 
+        // ★ 获取 ALLOCA 的 pointee 类型，用于类型一致性检查
+        // 当 STORE 的值类型与 ALLOCA 的 pointee 类型不匹配时（如 i1→i32，
+        // 常见于 && / || 表达式将比较结果存入 int 变量），需要插入 zext
+        // 进行类型转换，否则 PHI 节点会出现类型不匹配，导致 PhiLowering
+        // 生成错误的 store i1, i32* 指令，代码生成器可能用 sb 存储
+        // 而 lw 读取，读到垃圾值→无限循环（56_sort_test2 TIMEOUT 根因）。
+        auto* allocaPtrTy = dynamic_cast<IR::PointerType*>(alloca->getType());
+        auto* phiTy = allocaPtrTy ? allocaPtrTy->getPointeeType() : IR::IntegerType::I32;
+
         // 3c. 插入 PHI 节点
         std::unordered_map<IR::BasicBlock*, IR::Instruction*> phiMap;
         for (auto* phiBB : phiBlocks) {
             auto& predList = preds[phiBB];
             if (predList.empty()) continue;
-
-            auto* allocaPtrTy = dynamic_cast<IR::PointerType*>(alloca->getType());
-            auto* phiTy = allocaPtrTy ? allocaPtrTy->getPointeeType() : IR::IntegerType::I32;
 
             // ★ 确保 PHI 名称唯一：不同 ALLOCA 可能同名（不同作用域），
             //   导致 PHI 名称冲突，进而 PhiLowering 创建同名 ALLOCA，
@@ -260,7 +264,17 @@ bool mem2regOnFunction(IR::Function* func) {
                 // STORE: 推入新值（覆盖当前值）
                 if (inst->getOpcode() == IR::Instruction::Opcode::STORE &&
                     inst->getOperand(1) == alloca) {
-                    valueStack.push(inst->getOperand(0));
+                    IR::Value* storedVal = inst->getOperand(0);
+                    // ★ 类型一致性说明：
+                    //   当存储值的类型与 ALLOCA 的 pointee 类型不匹配时
+                    //   （如 i1→i32，常见于 && / || 表达式将比较结果存入
+                    //   int 变量），在 RISC-V 上 i1 比较结果已经是 32 位
+                    //   0/1，可以直接作为 i32 存储/加载，无需 zext。
+                    //   插入 zext 会导致寄存器分配器为 zext 结果分配
+                    //   寄存器，可能覆盖仍活跃的变量（如循环归纳变量），
+                    //   因为寄存器分配器不做跨基本块活跃性分析。
+                    //   因此这里不插入 zext，直接使用原值。
+                    valueStack.push(storedVal);
                     it = bb->erase(it);
                     erased = true;
                 }

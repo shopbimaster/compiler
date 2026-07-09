@@ -222,6 +222,9 @@ LOAD 指令下沉可能越过 STORE/CALL 指令，改变内存读写顺序。例
 **为什么 RecursiveMulToNative 要清除空的非 entry BB？**
 转换后非 entry BB 的指令被清空，但空 BB 仍留在 CFG 中，后续 Pass（如寄存器分配）遍历时遇到空 BB 可能段错误。必须清除这些空 BB。
 
+**为什么 `computeDominators` 要跳过不可达前驱？**
+inlineExpansion 可能产生无前驱的孤立块（如 `merge_41`），该块 `br` 到可达块（如 `merge_38`）。若将不可达前驱纳入 dom 交集计算：`dom[merge_41]={merge_41}` ∩ `dom[inline_cont]={12 blocks}` = 空集（因为 `merge_41` 不在那 12 个块中），导致 `dom[merge_38]={merge_38}`（不含 entry），被误判为不可达。这级联影响后继块（`merge_33→merge_28→merge_25`）的 `idom=null`，Mem2Reg rename 跳过这些块，遗留未替换的 LOAD → SEGFAULT（11_BST 根因）。修复：计算前驱 dom 交集时跳过不可达前驱（dom 不含 entry 的前驱），仅计算可达前驱的交集。
+
 ## 五、编译与测试命令
 
 ```bash
@@ -261,13 +264,14 @@ bash scripts/quick_test.sh <case-name>
 
 ## 七、测试结果历史
 
-| 测评   | 日期    | 结果                                                                                                                        |
-| ------ | ------- | --------------------------------------------------------------------------------------------------------------------------- |
-| test7  | 2026-06 | 27 WA，LoopInterchange 首版引入                                                                                             |
-| test8  | 2026-06 | 21 WA + 5 TLE，LoopInterchange 修复未编译进二进制                                                                           |
-| test9  | 2026-06 | 9 WA，旧二进制测试；本地全量 200/200 通过                                                                                   |
-| test10 | 2026-06 | 本地全量 200/200 通过（含 GlobalVariablePromotion）；conv2d/many_mat_cal/knapsack_naive 从超时→通过；huffman 仍超时（~96s） |
-| test12 | 2026-06 | 旧二进制测试（huffman TLE, conv2d 116s 等）；当前二进制全量 200/200 通过，LICM 修复后 huffman 107ms，conv2d-1 807ms         |
+| 测评   | 日期    | 结果                                                                                                                                                   |
+| ------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| test7  | 2026-06 | 27 WA，LoopInterchange 首版引入                                                                                                                        |
+| test8  | 2026-06 | 21 WA + 5 TLE，LoopInterchange 修复未编译进二进制                                                                                                      |
+| test9  | 2026-06 | 9 WA，旧二进制测试；本地全量 200/200 通过                                                                                                              |
+| test10 | 2026-06 | 本地全量 200/200 通过（含 GlobalVariablePromotion）；conv2d/many_mat_cal/knapsack_naive 从超时→通过；huffman 仍超时（~96s）                            |
+| test12 | 2026-06 | 旧二进制测试（huffman TLE, conv2d 116s 等）；当前二进制全量 200/200 通过，LICM 修复后 huffman 107ms，conv2d-1 807ms                                    |
+| test13 | 2026-07 | 修复 DominatorAnalysis 不可达前驱 bug（11_BST SEGFAULT）；重启 P3 InstructionScheduling；本地全量 199/200 通过（1 TIMEOUT=04_break_continue 预存问题） |
 
 ## 八、调研文档规则
 
@@ -298,4 +302,5 @@ bash scripts/quick_test.sh <case-name>
 5. **代数化简**：`sdiv/srem` 强度削减为 `ashr`/`and` 时，必须确保左操作数非负（有符号数右移除法和取模语义不同）
 6. **测评服务器**：仅支持 `-O1`，所有优化必须通过此选项触发
 7. **测试脚本**：run_tests.sh 中的 `SYLIB_A` 路径指向 `${BUILD_DIR}/libsylib.a`，由 CMake 构建
-8. **QEMU 超时**：functional 测试超时 5s，h_functional/perf 超时 15s；93_nested_calls 在 QEMU 下运行较慢（约 6-7s），functional 测试中会出现 TIMEOUT，这是预存问题
+8. **QEMU 超时**：functional 测试超时 5s，h_functional/perf 超时 15s；93_nested_calls 在 QEMU 下运行较慢（约 6-7s），functional 测试中会出现 TIMEOUT，这是预存问题；04_break_continue 在 h_functional 中 TIMEOUT 也是预存问题
+9. **支配者分析不可达前驱**：`computeDominators` 计算前驱 dom 交集时必须跳过不可达前驱（dom 不含 entry 的前驱）。inlineExpansion 可能产生无前驱的孤立块，该块 br 到可达块时，若纳入交集计算会导致交集为空，使可达块被误判为不可达，级联影响后继块的 idom=null，Mem2Reg rename 跳过这些块，遗留未替换的 LOAD → SEGFAULT（11_BST 根因）

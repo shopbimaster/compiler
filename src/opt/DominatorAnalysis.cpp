@@ -63,12 +63,46 @@ DomMap computeDominators(IR::Function* func) {
         changed = false;
         for (auto* bb : allBBs) {
             if (bb == entry) continue;
+            // 不可达块（无前驱）的 dom 集合应为 {bb}，不是 allSet。
+            // 如果初始化为 allSet，会导致所有不可达块互相支配，
+            // 在 computeImmediateDominators 中形成 idom 循环，
+            // 进而在 computeDominanceFrontier 中无限循环。
+            auto& predList = preds[bb];
+            if (predList.empty()) {
+                BBSet selfOnly = {bb};
+                if (selfOnly != dom[bb]) {
+                    dom[bb] = std::move(selfOnly);
+                    changed = true;
+                }
+                continue;
+            }
+            // 计算所有可达前驱的 dom 交集。
+            // ★ 关键修复：跳过不可达前驱（dom 不含 entry 的前驱）。
+            //   场景：inlineExpansion 可能产生无前驱的孤立块（如 merge_41），
+            //   该块 br 到 merge_38。如果将 merge_41 纳入交集计算，
+            //   dom[merge_41]={merge_41} 与 dom[inline_cont]={12 blocks} 交集为空，
+            //   导致 dom[merge_38]={merge_38}（不含 entry），被误判为不可达。
+            //   这会级联影响 merge_38 的所有后继（merge_33→merge_28→merge_25），
+            //   使 Mem2Reg rename 跳过这些块，遗留未替换的 LOAD → SEGFAULT（11_BST）。
             BBSet inter = allSet;
-            for (auto* p : preds[bb]) {
+            bool hasReachablePred = false;
+            for (auto* p : predList) {
+                // 跳过不可达前驱（其 dom 不含 entry）
+                if (!dom[p].count(entry)) continue;
+                hasReachablePred = true;
                 BBSet temp;
                 for (auto* d : inter)
                     if (dom[p].count(d)) temp.insert(d);
                 inter = std::move(temp);
+            }
+            if (!hasReachablePred) {
+                // 所有前驱都不可达 → 此块也不可达
+                BBSet selfOnly = {bb};
+                if (selfOnly != dom[bb]) {
+                    dom[bb] = std::move(selfOnly);
+                    changed = true;
+                }
+                continue;
             }
             inter.insert(bb);
             if (inter != dom[bb]) {
@@ -105,6 +139,13 @@ std::unordered_map<IR::BasicBlock*, IR::BasicBlock*> computeImmediateDominators(
         // 在严格支配者中找支配集最大的（即离 b 最近）
         auto it = dom.find(b);
         if (it == dom.end()) continue;
+        // 不可达块（不被 entry 支配）的 dom 集合是 allSet，会导致 idom 形成循环
+        // （所有不可达块互相支配），在 computeDominanceFrontier 中沿 idom 链向上
+        // 遍历时会无限循环。跳过这些块，设 idom 为 nullptr。
+        if (!it->second.count(entry)) {
+            idom[b] = nullptr;
+            continue;
+        }
         IR::BasicBlock* best = nullptr;
         size_t bestSize = 0;
         for (auto* d : it->second) {
@@ -142,9 +183,14 @@ DFMap computeDominanceFrontier(
         auto& predList = preds[b];
         if (predList.size() < 2) continue;  // 只有汇合点才需要计算 DF
 
+        auto idomIt = idom.find(b);
+        auto* idomB = (idomIt != idom.end()) ? idomIt->second : nullptr;
+        // 不可达块的 idom 为 nullptr，跳过（避免在 while 循环中
+        // 沿 idom 链遍历时遇到不可达块的 idom 循环）
+        if (!idomB && b != func->getEntryBlock()) continue;
+
         for (auto* p : predList) {
             auto* runner = p;
-            auto* idomB = idom.find(b) != idom.end() ? idom.at(b) : nullptr;
             while (runner && runner != idomB) {
                 df[runner].insert(b);
                 auto rit = idom.find(runner);

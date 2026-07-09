@@ -495,6 +495,19 @@ void TargetCodeGen::collectFoldedGeps(IR::Function& func) {
                     continue;
             }
 
+            // ★ 跨基本块融合安全检查：
+            // 当 GEP 和它的 LOAD/STORE 使用者位于不同基本块时（典型场景：
+            // LICM 把 GEP 外提到循环前置块，LOAD 在循环体内），融合会让
+            // 代码生成在 LOAD/STORE 处使用 GEP 的操作数（如索引值）来内联
+            // 计算地址。但寄存器分配器的活跃性分析只看到 LOAD 使用 GEP
+            // 的结果（一个虚拟寄存器），看不到 LOAD 隐式使用了 GEP 的
+            // 操作数。这导致 GEP 操作数（如循环不变量 i-1）的活跃范围被
+            // 错误地提前结束，寄存器被复用，下一轮迭代读到错误值（77_substr
+            // SEGFAULT 根因）。
+            // 修复：仅融合同基本块的 GEP+LOAD/STORE。
+            if (user->getParent() != inst->getParent())
+                continue;
+
             foldedGeps.insert(inst.get());
         }
     }
@@ -620,6 +633,8 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
         break;
     case Opc::ZEXT:
     case Opc::SEXT:
+    case Opc::TRUNC:
+        emitCast(inst);
         break;
     case Opc::SITOFP:
         emitSitofp(inst);
@@ -1410,9 +1425,42 @@ void TargetCodeGen::emitFptosi(IR::Instruction& inst) {
     emitter.emitText(code);
 }
 
+void TargetCodeGen::emitCast(IR::Instruction& inst) {
+    // ZEXT/SEXT/TRUNC：在 RISC-V 上，i1 比较结果已经是 32 位 0/1，
+    // zext/sext i1→i32 等价于 mv；trunc i32→i1 也只需传递低 32 位值
+    // （后续 icmp != 0 会正确解释）。直接将源值复制到目标即可。
+    std::string code;
+
+    std::string rs = getValueReg(inst.getOperand(0));
+    std::string rd = getValueReg(&inst);
+
+    bool opInReg = !rs.empty();
+    bool rdInReg = !rd.empty();
+
+    std::string src = opInReg ? rs : "t0";
+    std::string dest = rdInReg ? rd : "t0";
+
+    if (!opInReg) code += loadToReg(inst.getOperand(0), "t0");
+    if (src != dest) {
+        code += "  mv      " + dest + ", " + src + "\n";
+    }
+    if (!rdInReg) {
+        code += storeFromReg(&inst, dest);
+    }
+    emitter.emitText(code);
+}
+
 void TargetCodeGen::emitSelect(IR::Instruction& inst) {
     // SELECT %cond, %trueVal, %falseVal -> %result
-    // RISC-V has no native select; use branch pattern
+    // RISC-V has no native select; use branch pattern.
+    //
+    // IMPORTANT: Only t0 may be used as scratch because t0 is NOT in the
+    // register allocator's pool (INT_REGS = s0-s11, t3-t6). Using t3/t4/t5
+    // as scratch would clobber values allocated to those registers.
+    //
+    // To avoid needing multiple scratch registers, operands are loaded
+    // lazily — each operand is loaded into t0 immediately before use,
+    // and cond is dead after the beqz, allowing t0 reuse.
     static int selectLabelCounter = 0;
     int labelId = selectLabelCounter++;
     std::string labelFalse = ".Lselect_false_" + std::to_string(labelId);
@@ -1424,41 +1472,56 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
     std::string falseReg = getValueReg(inst.getOperand(2));
     std::string rd = getValueReg(&inst);
 
-    std::string cond = condReg;
-    if (cond.empty()) {
-        code += loadToReg(inst.getOperand(0), "t3");
-        cond = "t3";
-    }
-    std::string tv = trueReg;
-    if (tv.empty()) {
-        code += loadToReg(inst.getOperand(1), "t4");
-        tv = "t4";
-    }
-    std::string fv = falseReg;
-    if (fv.empty()) {
-        code += loadToReg(inst.getOperand(2), "t5");
-        fv = "t5";
-    }
-
+    // Result register: use rd if allocated, else t0 (then store to stack)
     std::string dest = rd.empty() ? "t0" : rd;
 
     bool isFloat = inst.getType()->isFloat();
 
-    if (isFloat) {
-        code += "  beqz    " + cond + ", " + labelFalse + "\n";
-        code += "  fmv.s   " + dest + ", " + tv + "\n";
-        code += "  j       " + labelEnd + "\n";
-        code += labelFalse + ":\n";
-        code += "  fmv.s   " + dest + ", " + fv + "\n";
-        code += labelEnd + ":\n";
-    } else {
-        code += "  beqz    " + cond + ", " + labelFalse + "\n";
-        code += "  mv      " + dest + ", " + tv + "\n";
-        code += "  j       " + labelEnd + "\n";
-        code += labelFalse + ":\n";
-        code += "  mv      " + dest + ", " + fv + "\n";
-        code += labelEnd + ":\n";
+    // 1. Load cond into its register or t0
+    std::string cond = condReg;
+    if (cond.empty()) {
+        code += loadToReg(inst.getOperand(0), "t0");
+        cond = "t0";
     }
+
+    // 2. beqz cond, false_label  (cond is dead after this)
+    code += "  beqz    " + cond + ", " + labelFalse + "\n";
+
+    // 3. True path: load trueVal and move to dest
+    //    cond is dead, so t0 is free for reuse (if cond was in t0)
+    std::string tv = trueReg;
+    if (tv.empty()) {
+        // trueVal has no register (constant); load into t0
+        // Safe: cond is dead, t0 is free
+        code += loadToReg(inst.getOperand(1), "t0");
+        tv = "t0";
+    }
+    if (dest != tv) {
+        if (isFloat) {
+            code += "  fmv.s   " + dest + ", " + tv + "\n";
+        } else {
+            code += "  mv      " + dest + ", " + tv + "\n";
+        }
+    }
+    code += "  j       " + labelEnd + "\n";
+
+    // 4. False path: load falseVal and move to dest
+    code += labelFalse + ":\n";
+    std::string fv = falseReg;
+    if (fv.empty()) {
+        // falseVal has no register (constant); load into t0
+        // Safe: trueVal is dead (we're on false path), t0 is free
+        code += loadToReg(inst.getOperand(2), "t0");
+        fv = "t0";
+    }
+    if (dest != fv) {
+        if (isFloat) {
+            code += "  fmv.s   " + dest + ", " + fv + "\n";
+        } else {
+            code += "  mv      " + dest + ", " + fv + "\n";
+        }
+    }
+    code += labelEnd + ":\n";
 
     if (rd.empty()) {
         code += storeFromReg(&inst, dest);
@@ -1475,6 +1538,15 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
 
 bool TargetCodeGen::isAllocaPromotable(IR::Instruction* alloca) const {
     if (alloca->getOpcode() != IR::Instruction::Opcode::ALLOCA) return false;
+
+    // 不提升 PHI 降低产生的 ALLOCA：这些 ALLOCA 数量可能很多（每个 PHI 一个），
+    // 提升它们会消耗所有 callee-saved 寄存器（s0-s11），导致寄存器分配冲突
+    // (12_DSU SEGFAULT 根因)。PHI 值通过栈内存传递是安全的。
+    // SSA 优化已在 PHI 形式上运行完毕，此处只是降低步骤，性能影响有限。
+    const std::string& allocaName = alloca->getName();
+    if (allocaName.find(".phi.ptr") != std::string::npos) {
+        return false;
+    }
 
     // 只提升标量类型（int/float），不提升数组或指针
     auto* ptrTy = dynamic_cast<IR::PointerType*>(alloca->getType());
