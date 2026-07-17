@@ -160,6 +160,35 @@ namespace IR {
         void addOperand(Value* v);
         void dropAllUses();
 
+        // 移除 PHI 节点中 null 的 (value, block) 操作数对
+        // nullifyPhiEntriesForBlock/Predecessor 会将已删除块的 PHI 条目置 null，
+        // 这些 null 条目必须被移除，否则会导致代码生成阶段崩溃。
+        // ★ 必须重建 use-list：compact 后非 null 操作数的索引会变化，
+        //   旧 use-list 条目中的 operandNo 会失效，导致后续 removeUse 找不到条目。
+        void removeNullPhiPairs() {
+            // 先移除所有非 null 操作数的 use-list 条目
+            // （null 操作数的 use-list 条目已在 setOperand(i, nullptr) 时移除）
+            for (size_t i = 0; i < operands.size(); ++i) {
+                if (operands[i]) {
+                    operands[i]->removeUse(this, static_cast<unsigned>(i));
+                }
+            }
+            // 构建新的操作数向量，仅保留非 null 对
+            std::vector<Value*> kept;
+            kept.reserve(operands.size());
+            for (size_t i = 0; i + 1 < operands.size(); i += 2) {
+                if (operands[i] != nullptr && operands[i + 1] != nullptr) {
+                    kept.push_back(operands[i]);
+                    kept.push_back(operands[i + 1]);
+                }
+            }
+            // 重新赋值并按新索引重建 use-list
+            operands = std::move(kept);
+            for (size_t i = 0; i < operands.size(); ++i) {
+                operands[i]->addUse(this, static_cast<unsigned>(i));
+            }
+        }
+
         using op_iterator = std::vector<Value*>::iterator;
         op_iterator op_begin() { return operands.begin(); }
         op_iterator op_end()   { return operands.end(); }
@@ -378,6 +407,12 @@ namespace IR {
     class Module {
     public:
         Module() = default;
+        // ★ 必须显式定义析构函数：在 functions 向量销毁之前清空所有指令的操作数。
+        // CALL 指令引用 Function 对象（callee），BR/COND_BR/PHI 引用 BasicBlock 对象。
+        // 当 functions 向量按逆序销毁时，先释放的 Function 的 use-list 被访问 →
+        // heap-use-after-free（82_long_func 根因）。
+        // 通过预先清空所有操作数，后续析构时 dropAllUses() 只会看到 null 操作数。
+        ~Module();
 
         Function* createFunction(FunctionType* ft, const std::string& name, bool external = false);
 
@@ -410,8 +445,13 @@ namespace IR {
         std::string dump() const;
 
     private:
-        std::vector<std::unique_ptr<Function>>       functions;
+        // ★ 声明顺序至关重要：globals 必须在 functions 之前声明
+        // C++ 成员按声明逆序析构，因此 functions 会先析构（Instructions 的
+        // dropAllUses 能安全访问 globals 的 use list），然后 globals 才析构。
+        // 若顺序相反，globals 先析构后 functions 中的 Instruction 析构时
+        // 访问已释放的 GlobalVariable → heap-use-after-free
         std::vector<std::unique_ptr<GlobalVariable>> globals;
+        std::vector<std::unique_ptr<Function>>       functions;
     };
 
 } // namespace IR

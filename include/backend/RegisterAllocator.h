@@ -16,6 +16,8 @@ struct LiveInterval {
     bool isFloat;
     std::string reg;
     int spillSlot;
+    int useCount;     // number of times this value is used as an operand
+    int loopDepth;    // maximum loop nesting depth (0 = outside all loops)
 };
 
 class RegisterAllocator {
@@ -23,6 +25,9 @@ public:
     RegisterAllocator();
 
     void allocate(IR::Function& func);
+    // K1+K2: 重建 usedCalleeSaved，移除 coalescePhis 释放的寄存器 (K1)
+    //        和被代码生成器折叠的 GEP/ICMP 指令的寄存器 (K2)
+    void pruneUnusedCalleeSaved(const std::set<IR::Instruction*>& deadInsts);
 
     void reserveReg(const std::string& reg);
     void clearReservedRegs();
@@ -35,6 +40,11 @@ public:
     bool isFloatValue(IR::Value* val) const;
     const std::vector<std::string>& getUsedCalleeSaved() const;
     int getTotalSpillSize() const;
+    // Returns registers holding values live across the given call instruction.
+    // Only values whose live interval spans the call (defined before, used after)
+    // are included. This avoids saving/restoring caller-saved registers that
+    // aren't actually live at this call site.
+    std::vector<std::string> getRegsLiveAtCall(IR::Instruction* callInst) const;
 
 private:
     int assignInstructionIds(IR::Function& func);
@@ -42,6 +52,7 @@ private:
     void linearScan();
     void expireOldIntervals(int pos, std::vector<LiveInterval*>& active);
     void spillAtInterval(LiveInterval& current, std::vector<LiveInterval*>& active);
+    void coalescePhis(IR::Function& func);
 
     std::vector<LiveInterval> intervals;
     std::unordered_map<IR::Instruction*, int> instId;

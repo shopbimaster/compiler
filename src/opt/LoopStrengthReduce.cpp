@@ -13,6 +13,9 @@
 namespace Opt {
 namespace {
 
+// LSR 唯一命名计数器，避免多个循环的 LSR 指令同名（SSA 冲突）
+static int lsrCounter = 0;
+
 // ================================================================
 // 判断一条指令是否是 MUL，且其中一个操作数是循环归纳变量
 // 返回：(MUL指令, 归纳变量操作数, 常量操作数)
@@ -98,7 +101,8 @@ bool strengthReduceLoop(const NaturalLoop& loop, IR::Function* func) {
     }
 
     auto* initConst = IR::ConstantInt::get(IR::IntegerType::get(32), initialVal);
-    auto* alloca = IR::Instruction::createAlloca(IR::IntegerType::get(32), "lsr.accum");
+    std::string suffix = std::to_string(lsrCounter++);
+    auto* alloca = IR::Instruction::createAlloca(IR::IntegerType::get(32), "lsr.accum." + suffix);
 
     // 插入到 entry block 的 ALLOCA 之后
     auto* entry = func->getEntryBlock();
@@ -113,7 +117,7 @@ bool strengthReduceLoop(const NaturalLoop& loop, IR::Function* func) {
     entry->insert(entryIt, initStore);
 
     // 2. 在循环头中 LOAD 累加器
-    auto* loadAccum = IR::Instruction::createLoad(IR::IntegerType::get(32), alloca, "lsr.load");
+    auto* loadAccum = IR::Instruction::createLoad(IR::IntegerType::get(32), alloca, "lsr.load." + suffix);
     // 插入到 header 的第一个非 ALLOCA 指令之前
     auto headerIt = loop.header->begin();
     while (headerIt != loop.header->end() && (*headerIt)->getOpcode() == IR::Instruction::Opcode::ALLOCA) {
@@ -127,7 +131,7 @@ bool strengthReduceLoop(const NaturalLoop& loop, IR::Function* func) {
     // 4. 在循环体末尾（STORE 归纳变量之后）累加 accumStep
     auto* stepConst = IR::ConstantInt::get(IR::IntegerType::get(32), accumStep);
     auto* addInst = IR::Instruction::createBinOp(
-        IR::Instruction::Opcode::ADD, IR::IntegerType::get(32), "lsr.add",
+        IR::Instruction::Opcode::ADD, IR::IntegerType::get(32), "lsr.add." + suffix,
         loadAccum, stepConst);
 
     // 找到 STORE 到归纳变量的位置，在其后插入

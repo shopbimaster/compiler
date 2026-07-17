@@ -61,12 +61,59 @@ void runO2(IR::Module* mod) {
     // 安全性：PhiLowering 产生的 ALLOCA 命名为 "%X.phi.ptr"，
     // isAllocaPromotable 会跳过这些 ALLOCA，避免消耗 callee-saved 寄存器
     // 导致 12_DSU SEGFAULT。
+    // ★ 暂时禁用用于诊断 SEGFAULT
     if (mem2reg(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
+    // 1b. 二次内联：mem2reg 将 alloca/load/store 提升为 SSA 后，原本因
+    //     参数 ALLOCA/STORE/LOAD 显得过大而无法内联的函数（如含循环的
+    //     叶子函数 getNumPos）现在指令数大幅减少，可被内联。
+    //     ★ 依赖 InlineExpansion 的 PHI 克隆支持（mem2reg 引入 PHI 节点）
+    //     内联后再次 CF+DCE 清理，并重跑 mem2reg 消除内联引入的临时 ALLOCA
+    if (inlineExpansion(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // 1c. 二次 mem2reg：内联引入的 retAlloca（用于返回值）和其他临时 ALLOCA
+    //     应被提升为 SSA，使后续优化（SCCP/CSE/InstCombine 等）更有效
+    if (mem2reg(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // 1d. 二次树摇：内联后被内联函数的 useCount 降为 0，成为死函数。
+    //     ★ 已禁用：实测表明删除死函数会改变代码布局，导致 shuffle1 回归 +300ms。
+    //     死函数在汇编中作为"填充"使热点函数恰好对齐 cache line，删除后热点函数
+    //     跨 cache line 边界，icache miss 增加。正确做法是添加函数对齐而非保留死代码。
+    //     保留代码以备未来添加函数对齐后重新启用。
+    if (false) treeShaking(mod);
+
     if (globalVariablePromotion(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // ★ 关键优化：在 GVP 之后运行局部 mem2reg，将 GVP 创建的"单 BB STORE"ALLOCA
+    //   提升为直接值引用。GVP 将标量全局变量提升为局部 ALLOCA，但 TargetCodeGen
+    //   的 ALLOCA 提升可能因全局数组地址缓存耗尽 callee-saved 寄存器而无法生效。
+    //   mem2regLocal 只处理所有 STORE 都在同一个 BB（通常是 entry）中的 ALLOCA，
+    //   不创建 PHI 节点，安全且无 PHI 爆炸风险。
+    //   效果：如 hashmod.local0（在 entry 中 STORE 两次，循环中 LOAD）→ 直接使用
+    //   最后一个 STORE 的值，消除循环中的栈 LOAD
+    // ★ 暂时禁用用于诊断 SEGFAULT
+    if (mem2regLocal(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // 全局常量传播：将未被 STORE 且有常量初始值的全局变量 LOAD 替换为常量。
+    // 在 GVP 之后运行，使后续 SCCP 能传播这些常量到函数参数和循环边界，
+    // 触发循环完全展开等优化。
+    // ★ 暂时禁用用于诊断 SEGFAULT
+    if (globalConstantPropagation(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -103,7 +150,6 @@ void runO2(IR::Module* mod) {
 
         if (!phase2Changed) break;
     }
-
     // ================================================================
     // 阶段 3：算术优化（在值传播之前！）
     //   关键设计决策：算术优化产生新常量，SCCP 需要在这些常量产生后
@@ -137,7 +183,6 @@ void runO2(IR::Module* mod) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
-
     // ================================================================
     // 阶段 4：值级别分析 + 传播（在算术优化之后！迭代 2 次收敛）
     //   此时算术优化已产生大量新常量，SCCP 可以传播这些常量到：
@@ -173,7 +218,6 @@ void runO2(IR::Module* mod) {
 
         if (!phase4Changed) break;
     }
-
     // ================================================================
     // 阶段 4→2 反馈：值传播后再次运行算术+指令级化简（1 次）
     //   SCCP 传播常量后，可能产生新的：
@@ -226,7 +270,6 @@ void runO2(IR::Module* mod) {
             deadCodeElimination(mod);
         }
     }
-
     // ================================================================
     // 阶段 5：循环优化（在结构稳定后、所有清理完成后运行）
     //   LICM：内联后循环体中有新的不变量可外提
@@ -260,26 +303,47 @@ void runO2(IR::Module* mod) {
 
     // 6a. IfConversion：条件转换
     if (ifConversion(mod)) {
+        simplifyCFG(mod);  // 清理 IfConversion 产生的同目标 COND_BR
         constantFolding(mod);
         deadCodeElimination(mod);
     }
-
     // 6b. ADCE：激进死代码消除
     if (adce(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
-
     // 6c. CodeSink：代码下沉，减少寄存器压力
     if (codeSink(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
-
     // 6d. BasicBlockReordering：基于支配树的拓扑排序，优化 fall-through
     if (basicBlockReordering(mod)) {
         // 仅布局变化，无需 CF/DCE
     }
+
+    // 6e. 最终 CSE：SimplifyCFG/IfConversion/CodeSink/BBReordering 可能合并 BB
+    //     或移动指令，产生新的公共子表达式（尤其是 LICM 外提的 GEP）。
+    //     必须在所有结构变换之后运行一次 CSE 来清理冗余。
+    if (commonSubexpressionElimination(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // 6f. GVN：基于支配树的跨 BB CSE
+    // ★ 禁用：即使限制为仅合并直接支配者的 GEP，跨 BB 合并仍会延长活跃区间，
+    //   增加寄存器压力，导致净性能回退（+1319ms / 60 perf tests）。
+    //   同 BB CSE 已在 6e 中运行，可覆盖大部分冗余。
+    //   根本原因：寄存器分配器对长活跃区间处理不佳，需要改进寄存器分配器
+    //   才能安全启用 GVN。
+    // if (globalValueNumbering(mod)) {
+    //     constantFolding(mod);
+    //     deadCodeElimination(mod);
+    //     if (commonSubexpressionElimination(mod)) {
+    //         constantFolding(mod);
+    //         deadCodeElimination(mod);
+    //     }
+    // }
 }
 
 // ================================================================
@@ -307,13 +371,6 @@ void runO3(IR::Module* mod) {
         o3Changed = true;
     }
 
-    // GEPStrengthReduce：GEP 地址计算强度削弱
-    if (gepStrengthReduce(mod)) {
-        constantFolding(mod);
-        deadCodeElimination(mod);
-        o3Changed = true;
-    }
-
     // LoopFullUnroll：基于 SCEV 确定迭代次数的完全展开
     if (loopFullUnroll(mod)) {
         constantFolding(mod);
@@ -323,6 +380,21 @@ void runO3(IR::Module* mod) {
 
     // LoopUnrolling：部分展开（最大 8×）
     if (loopUnrolling(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+        o3Changed = true;
+    }
+
+    // GEPStrengthReduce：GEP 地址计算强度削弱
+    // ★ 必须在循环展开之后运行！
+    //   原因：LSR 创建的 lsr.ptr PHI 和 lsr.init 值与循环展开交互复杂。
+    //   如果在展开前运行，展开器需要解析 LSR PHI 的多个 incoming value，
+    //   处理不当会导致 SEGFAULT（19_search 根因：main 中的初始化双重循环
+    //   被部分展开后，LSR PHI 的活跃区间与展开体冲突）。
+    //   在展开后运行：被完全展开的循环已成为直线代码（无需 LSR），
+    //   只有存活下来的循环才会被 LSR 优化，避免 PHI/展开交互。
+    // ★ 暂时禁用用于诊断
+    if (gepStrengthReduce(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
         o3Changed = true;
@@ -387,6 +459,14 @@ void runO3(IR::Module* mod) {
         // 7. 最终 CSE + 清理
         if (commonSubexpressionElimination(mod)) {
             constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+
+        // 8. BasicBlockReordering：循环展开后 BB 顺序混乱
+        //    必须重新排列以使指令 ID 反映执行顺序，
+        //    否则寄存器分配器的活跃区间分析会出错
+        //    （如 04_break_continue：临时变量和 PHI 被分配同一寄存器）
+        if (basicBlockReordering(mod)) {
             deadCodeElimination(mod);
         }
     }

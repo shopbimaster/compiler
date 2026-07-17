@@ -76,20 +76,28 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
         // LOAD 模式：循环变量存储在 ALLOCA 中
         info.var = ivInst->getOperand(0);  // ALLOCA 指针
 
-        // 在循环体中找 STORE 到同一 ALLOCA 的 ADD 指令
+        // 在循环体中找 STORE 到同一 ALLOCA 的 ADD/SUB 指令
         for (auto* bb : loop.body) {
             for (auto& inst : bb->getInstructions()) {
                 if (inst->getOpcode() == IR::Instruction::Opcode::STORE) {
                     auto* storePtr = inst->getOperand(1);
                     if (storePtr == info.var) {
                         auto* storeVal = inst->getOperand(0);
-                        if (auto* addInst = dynamic_cast<IR::Instruction*>(storeVal)) {
-                            if (addInst->getOpcode() == IR::Instruction::Opcode::ADD) {
-                                // 找到步长：ADD 的另一个操作数
-                                auto* op0 = addInst->getOperand(0);
-                                auto* op1 = addInst->getOperand(1);
+                        if (auto* arithInst = dynamic_cast<IR::Instruction*>(storeVal)) {
+                            if (arithInst->getOpcode() == IR::Instruction::Opcode::ADD) {
+                                auto* op0 = arithInst->getOperand(0);
+                                auto* op1 = arithInst->getOperand(1);
                                 if (op0 == ivVal) info.step = op1;
                                 else if (op1 == ivVal) info.step = op0;
+                            } else if (arithInst->getOpcode() == IR::Instruction::Opcode::SUB) {
+                                auto* op0 = arithInst->getOperand(0);
+                                auto* op1 = arithInst->getOperand(1);
+                                if (op0 == ivVal) {
+                                    if (auto* ci = dynamic_cast<IR::ConstantInt*>(op1)) {
+                                        info.step = IR::ConstantInt::get(
+                                            IR::IntegerType::I32, -ci->getValue());
+                                    }
+                                }
                             }
                         }
                     }
@@ -105,25 +113,37 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
                 }
             }
         }
-    } else if (ivInst->getOpcode() == IR::Instruction::Opcode::ADD) {
-        // ADD 模式：循环变量是 ADD 的结果
+    } else if (ivInst->getOpcode() == IR::Instruction::Opcode::ADD
+               || ivInst->getOpcode() == IR::Instruction::Opcode::SUB) {
+        // ADD/SUB 模式：循环变量是 ADD/SUB 的结果
         // 追踪到 LOAD
-        auto* addOp0 = ivInst->getOperand(0);
-        auto* addOp1 = ivInst->getOperand(1);
+        bool isSub = (ivInst->getOpcode() == IR::Instruction::Opcode::SUB);
+        auto* op0 = ivInst->getOperand(0);
+        auto* op1 = ivInst->getOperand(1);
         IR::Value* loadSrc = nullptr;
-        if (auto* op0Inst = dynamic_cast<IR::Instruction*>(addOp0)) {
+        if (auto* op0Inst = dynamic_cast<IR::Instruction*>(op0)) {
             if (op0Inst->getOpcode() == IR::Instruction::Opcode::LOAD) {
                 info.var = op0Inst->getOperand(0);
-                loadSrc = addOp0;
-                info.step = addOp1;
+                loadSrc = op0;
+                if (isSub) {
+                    // sub(load, C) → step = -C
+                    if (auto* ci = dynamic_cast<IR::ConstantInt*>(op1)) {
+                        info.step = IR::ConstantInt::get(
+                            IR::IntegerType::I32, -ci->getValue());
+                    }
+                } else {
+                    info.step = op1;
+                }
             }
         }
-        if (!loadSrc && dynamic_cast<IR::Instruction*>(addOp1)) {
-            auto* op1Inst = dynamic_cast<IR::Instruction*>(addOp1);
+        if (!loadSrc && !isSub && dynamic_cast<IR::Instruction*>(op1)) {
+            // ADD 模式：add(C, load) → step = C
+            // SUB 模式：sub(C, load) 不合法（不是归纳变量）
+            auto* op1Inst = dynamic_cast<IR::Instruction*>(op1);
             if (op1Inst->getOpcode() == IR::Instruction::Opcode::LOAD) {
                 info.var = op1Inst->getOperand(0);
-                loadSrc = addOp1;
-                info.step = addOp0;
+                loadSrc = op1;
+                info.step = op0;
             }
         }
         if (!info.var) return info;
@@ -133,6 +153,47 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
             if (inst->getOpcode() == IR::Instruction::Opcode::STORE) {
                 if (inst->getOperand(1) == info.var) {
                     info.start = inst->getOperand(0);
+                }
+            }
+        }
+    } else if (ivInst->getOpcode() == IR::Instruction::Opcode::PHI) {
+        // PHI 模式：循环变量是 PHI 节点（Mem2Reg 后的形式）
+        auto* phi = ivInst;
+        if (phi->getParent() != header) return info;  // PHI 必须在 header 中
+
+        info.var = phi;
+
+        // 遍历 PHI 的 incoming values
+        for (unsigned i = 0; i + 1 < phi->getNumOperands(); i += 2) {
+            auto* val = phi->getOperand(i);
+            auto* predBB = dynamic_cast<IR::BasicBlock*>(phi->getOperand(i + 1));
+            if (!predBB) continue;
+
+            bool isOutsidePred = !loop.body.count(predBB);
+
+            if (isOutsidePred) {
+                // 初始值
+                info.start = val;
+            } else {
+                // back-edge value：应该是 ADD(PHI, step) 或 SUB(PHI, step) 形式
+                if (auto* arithInst = dynamic_cast<IR::Instruction*>(val)) {
+                    if (arithInst->getOpcode() == IR::Instruction::Opcode::ADD) {
+                        auto* op0 = arithInst->getOperand(0);
+                        auto* op1 = arithInst->getOperand(1);
+                        if (op0 == phi) info.step = op1;
+                        else if (op1 == phi) info.step = op0;
+                    } else if (arithInst->getOpcode() == IR::Instruction::Opcode::SUB) {
+                        // SUB 模式：i = i - C → 有效步长 = -C
+                        // 仅支持 sub(phi, C)，不支持 sub(C, phi)
+                        auto* op0 = arithInst->getOperand(0);
+                        auto* op1 = arithInst->getOperand(1);
+                        if (op0 == phi) {
+                            if (auto* ci = dynamic_cast<IR::ConstantInt*>(op1)) {
+                                info.step = IR::ConstantInt::get(
+                                    IR::IntegerType::I32, -ci->getValue());
+                            }
+                        }
+                    }
                 }
             }
         }

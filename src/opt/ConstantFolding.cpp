@@ -120,6 +120,29 @@ bool tryFold(IR::Instruction* inst) {
         return false;
     }
 
+    // ---- LOAD const 全局变量 ----
+    // const int KSIZE = 5; load i32, i32* @KSIZE → ConstantInt(5)
+    // 这是极其重要的优化：const 全局变量值在编译时已知，所有 LOAD 都应被替换为常量。
+    // 不处理此情况会导致循环中每次访问 KSIZE 都生成 la+lw 指令，阻塞 LICM/CSE/常量传播。
+    if (op == Opc::LOAD && inst->getNumOperands() >= 1) {
+        auto* ptr = inst->getOperand(0);
+        if (auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr)) {
+            if (gv->isConstant()) {
+                auto* init = gv->getInitializer();
+                if (auto* ci = dynamic_cast<IR::ConstantInt*>(init)) {
+                    inst->replaceAllUsesWith(ci);
+                    inst->dropAllUses();
+                    return true;
+                }
+                if (auto* cf = dynamic_cast<IR::ConstantFloat*>(init)) {
+                    inst->replaceAllUsesWith(cf);
+                    inst->dropAllUses();
+                    return true;
+                }
+            }
+        }
+    }
+
     // ---- Cast 运算 ----
     if ((op == Opc::ZEXT || op == Opc::SEXT || op == Opc::TRUNC) &&
         inst->getNumOperands() >= 1) {

@@ -170,7 +170,31 @@ IR::Value* simplifyCmp(IR::Instruction* inst) {
     return nullptr;
 }
 
+// ---- 获取指针的基地址（剥离 GEP）----
+IR::Value* getBasePointer(IR::Value* v) {
+    if (auto* inst = dynamic_cast<IR::Instruction*>(v)) {
+        if (inst->getOpcode() == Opc::GETELEMENTPTR) {
+            return getBasePointer(inst->getOperand(0));
+        }
+    }
+    return v;
+}
+
+// ---- 判断两个指针是否可能别名 ----
+// 同一基址的 GEP 可能别名（索引可能相同），不同基址绝不别名
+bool mayAlias(IR::Value* a, IR::Value* b) {
+    if (a == b) return true;
+    IR::Value* baseA = getBasePointer(a);
+    IR::Value* baseB = getBasePointer(b);
+    return baseA == baseB;
+}
+
 // ---- Store-to-Load 前推：同 BB 内，store 后紧跟的 load 可直接替换 ----
+// 安全检查：
+//   1. 遇到 CALL → 停止（可能修改任意内存）
+//   2. 遇到 STORE 到同一指针 → 前推
+//   3. 遇到 STORE 到可能别名的指针 → 停止（可能覆盖 LOAD 值）
+//   4. 遇到 STORE 到绝不别名的指针 → 继续
 IR::Value* forwardStoreToLoad(IR::Instruction* loadInst) {
     if (loadInst->getOpcode() != Opc::LOAD) return nullptr;
 
@@ -189,18 +213,16 @@ IR::Value* forwardStoreToLoad(IR::Instruction* loadInst) {
                 // 如果遇到 CALL，保守停止（可能修改任意内存）
                 if (inst->getOpcode() == Opc::CALL) return nullptr;
 
-                // 如果遇到 STORE 到同一指针
+                // 如果遇到 STORE
                 if (inst->getOpcode() == Opc::STORE) {
                     auto* storePtr = inst->getOperand(1);
                     if (storePtr == loadPtr) {
                         return inst->getOperand(0); // store 的值
                     }
-                    // 如果 STORE 到不同指针，继续（可能别名但不是同一指针）
+                    // STORE 到可能别名的指针 → 停止（可能覆盖 LOAD 值）
+                    if (mayAlias(storePtr, loadPtr)) return nullptr;
+                    // STORE 到绝不别名的指针 → 继续
                 }
-
-                // 如果遇到 LOAD，检查是否可能别名
-                // 保守：不跨过其他 LOAD（因为可能有 store 在中间）
-                // 实际上我们只关心找到最近的同一指针的 store
             }
             break;
         }
@@ -218,19 +240,19 @@ bool instCombineOnFunction(IR::Function* func) {
     for (auto& bb : func->getBlocks()) {
         for (auto it = bb->begin(); it != bb->end(); ++it) {
             auto* inst = it->get();
-            if (!canCombine(inst)) continue;
 
             IR::Value* simplified = nullptr;
 
-            // 尝试二元运算化简
-            simplified = simplifyBinaryOp(inst);
-            if (!simplified) {
-                // 尝试比较运算化简
-                simplified = simplifyCmp(inst);
-            }
-            if (!simplified) {
-                // 尝试 Store-to-Load 前推
+            if (inst->getOpcode() == Opc::LOAD) {
+                // ★ Store-to-Load 前推：同 BB 内 store 后的 load 可直接替换
                 simplified = forwardStoreToLoad(inst);
+            } else if (canCombine(inst)) {
+                // 尝试二元运算化简
+                simplified = simplifyBinaryOp(inst);
+                if (!simplified) {
+                    // 尝试比较运算化简
+                    simplified = simplifyCmp(inst);
+                }
             }
 
             if (simplified && simplified != inst) {

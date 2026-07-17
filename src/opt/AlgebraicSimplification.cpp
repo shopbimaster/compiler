@@ -268,6 +268,44 @@ bool trySimplify(IR::Instruction* inst) {
                 }
             }
         }
+
+        // ================================================================
+        // 强度削弱：x * (2^n ± 1) → shift + add/sub
+        //   ★ 已禁用：在 BOOM 乱序超标量核心上，mul 是单周期全流水线指令，
+        //     shift+add 是 2 条有数据依赖的指令，反而更慢且增加寄存器压力。
+        //     该优化仅对无硬件 mul 的简单微控制器有益。
+        //   保留代码以备未来在无 mul 目标上启用。
+        // ================================================================
+        if (false && op == Opc::MUL) {
+            auto* i32 = dynamic_cast<IR::IntegerType*>(rc->getType());
+            if (i32) {
+                int shiftAmt = -1;
+                bool isPlusOne = false;
+                for (int n = 1; n <= 4; ++n) {
+                    int64_t plusVal = (1LL << n) + 1;
+                    int64_t minusVal = (1LL << n) - 1;
+                    if (rv == plusVal) { shiftAmt = n; isPlusOne = true; break; }
+                    if (n >= 2 && rv == minusVal) { shiftAmt = n; isPlusOne = false; break; }
+                }
+                if (shiftAmt >= 0) {
+                    auto* shiftConst = IR::ConstantInt::get(i32, shiftAmt);
+                    auto* shlInst = IR::Instruction::createBinOp(
+                        Opc::SHL, inst->getType(),
+                        inst->getName() + ".shl", l, shiftConst);
+                    auto* addSubInst = IR::Instruction::createBinOp(
+                        isPlusOne ? Opc::ADD : Opc::SUB,
+                        inst->getType(),
+                        inst->getName() + ".sr", shlInst, l);
+                    for (auto it = bb->begin(); it != bb->end(); ++it) {
+                        if (it->get() == inst) {
+                            bb->insert(it, shlInst);
+                            replaceWithNewInst(it, inst, addSubInst);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ================================================================
@@ -301,6 +339,47 @@ bool trySimplify(IR::Instruction* inst) {
                     if (it->get() == inst) { bb->erase(it); break; }
                 }
                 return true;
+            }
+
+            // 左常量 MUL 强度削弱：C * x → (x << n) ± x
+            //   ★ 已禁用：同右常量版本，BOOM 核心上 mul 更快
+            if (false && op == Opc::MUL) {
+                auto* i32 = dynamic_cast<IR::IntegerType*>(lc->getType());
+                if (i32) {
+                    int shiftAmt = -1;
+                    bool isPlusOne = false;
+                    for (int n = 1; n <= 4; ++n) {
+                        int64_t plusVal = (1LL << n) + 1;
+                        int64_t minusVal = (1LL << n) - 1;
+                        if (lv == plusVal) {
+                            shiftAmt = n;
+                            isPlusOne = true;
+                            break;
+                        }
+                        if (n >= 2 && lv == minusVal) {
+                            shiftAmt = n;
+                            isPlusOne = false;
+                            break;
+                        }
+                    }
+                    if (shiftAmt >= 0) {
+                        auto* shiftConst = IR::ConstantInt::get(i32, shiftAmt);
+                        auto* shlInst = IR::Instruction::createBinOp(
+                            Opc::SHL, inst->getType(),
+                            inst->getName() + ".shl", r, shiftConst);
+                        auto* addSubInst = IR::Instruction::createBinOp(
+                            isPlusOne ? Opc::ADD : Opc::SUB,
+                            inst->getType(),
+                            inst->getName() + ".sr", shlInst, r);
+                        for (auto it = bb->begin(); it != bb->end(); ++it) {
+                            if (it->get() == inst) {
+                                bb->insert(it, shlInst);
+                                replaceWithNewInst(it, inst, addSubInst);
+                                return true;
+                            }
+                        }
+                    }
+                }
             }
             if (op == Opc::AND && lv == 0) {
                 inst->replaceAllUsesWith(lc);

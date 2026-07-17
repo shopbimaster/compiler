@@ -383,6 +383,33 @@ namespace IR {
     // Module
     // ================================================================
 
+    Module::~Module() {
+        // ★ 在 functions 向量销毁之前，清空所有函数中所有指令的操作数。
+        //
+        // 跨函数引用问题：CALL 指令引用 Function 对象（callee）。
+        // 当 functions 向量按逆序销毁时，先释放的 Function 的 use-list 被访问 →
+        // heap-use-after-free。
+        //
+        // 函数内引用问题：BR/COND_BR/PHI 引用 BasicBlock 对象。
+        // 当 blocks 向量按逆序销毁时，先释放的 BB 的 use-list 被访问 →
+        // heap-use-after-free。
+        //
+        // 通过预先清空所有操作数（setOperand(i, nullptr) 会从被引用者的 use-list
+        // 中移除条目），后续析构时 dropAllUses() 只会看到 null 操作数，
+        // 不会访问任何已释放的内存。
+        for (auto& func : functions) {
+            for (auto& bb : func->getBlocks()) {
+                for (auto& inst : bb->getInstructions()) {
+                    for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
+                        if (inst->getOperand(i)) {
+                            inst->setOperand(i, nullptr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Function* Module::createFunction(FunctionType* ft, const std::string& name, bool external) {
         for (auto& f : functions) {
             if (f->getName() == name) return f.get();

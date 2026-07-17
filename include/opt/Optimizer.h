@@ -115,6 +115,7 @@ void runP3(IR::Module* mod);
 bool recursiveMulToNative(IR::Module* mod);
 bool bitOpPatternRecognition(IR::Module* mod);
 bool globalVariablePromotion(IR::Module* mod);
+bool globalConstantPropagation(IR::Module* mod);
 bool deadStoreElimination(IR::Module* mod);
 bool loadElimination(IR::Module* mod);
 bool reassociate(IR::Module* mod);
@@ -134,6 +135,14 @@ void runP0(IR::Module* mod);
 // 借鉴 Cpl2/Cpl3 的完整 SSA 构造，是 GVN/MemorySSA 等高级优化的前提
 // ================================================================
 bool mem2reg(IR::Module* mod);
+
+// 局部 mem2reg：只提升所有 STORE 都在同一个 BB 中的 ALLOCA
+// 不创建 PHI 节点，安全且无 PHI 爆炸风险
+bool mem2regLocal(IR::Module* mod);
+
+// GVN — 全局值编号（基于支配树的跨 BB CSE）
+// 消除跨 BB 的冗余 GEP 和算术运算
+bool globalValueNumbering(IR::Module* mod);
 
 // ================================================================
 // SSA 降级 — PhiLowering（PHI → ALLOCA + STORE + LOAD）

@@ -72,13 +72,38 @@ std::vector<NaturalLoop> findNaturalLoops(IR::Function* func) {
         result.push_back(std::move(loop));
     }
 
-    // 3. 按 body 大小排序（最小 → 最大，即最内层优先）
+    // 3. 合并具有相同 header 的自然循环
+    //    多条回边指向同一 header 时，每条回边产生一个独立 NaturalLoop，
+    //    body 仅包含从该 latch 可达的块。合并后 body 取并集，
+    //    使 LICM 等后续 Pass 看到完整的循环体，避免将其他回边的 latch
+    //    误判为"循环外前驱"而错误重定向（19_search 无限循环根因）。
+    {
+        std::unordered_map<IR::BasicBlock*, size_t> headerToLoop;
+        std::vector<NaturalLoop> merged;
+        for (auto& loop : result) {
+            auto it = headerToLoop.find(loop.header);
+            if (it == headerToLoop.end()) {
+                headerToLoop[loop.header] = merged.size();
+                merged.push_back(std::move(loop));
+            } else {
+                auto& existing = merged[it->second];
+                for (auto* bb : loop.body) {
+                    existing.body.insert(bb);
+                }
+                // 合并 latch：保留第一个，多 latch 信息通过 body 隐含
+                // （LICM 不依赖 latch 字段做安全性判断）
+            }
+        }
+        result = std::move(merged);
+    }
+
+    // 4. 按 body 大小排序（最小 → 最大，即最内层优先）
     std::sort(result.begin(), result.end(),
         [](const NaturalLoop& a, const NaturalLoop& b) {
             return a.body.size() < b.body.size();
         });
 
-    // 4. 构建嵌套关系
+    // 5. 构建嵌套关系
     for (size_t i = 0; i < result.size(); ++i) {
         for (size_t j = i + 1; j < result.size(); ++j) {
             // 如果 i 的 header 在 j 的 body 中，则 i 嵌套在 j 中
@@ -91,7 +116,7 @@ std::vector<NaturalLoop> findNaturalLoops(IR::Function* func) {
         }
     }
 
-    // 5. 计算退出块和退出边界
+    // 6. 计算退出块和退出边界
     for (auto& loop : result) {
         for (auto* bb : loop.body) {
             for (auto* succ : succs[bb]) {
@@ -105,7 +130,7 @@ std::vector<NaturalLoop> findNaturalLoops(IR::Function* func) {
         }
     }
 
-    // 6. 去重 exitingBlocks
+    // 7. 去重 exitingBlocks
     for (auto& loop : result) {
         std::sort(loop.exitingBlocks.begin(), loop.exitingBlocks.end());
         loop.exitingBlocks.erase(

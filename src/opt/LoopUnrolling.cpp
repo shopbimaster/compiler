@@ -62,6 +62,10 @@ std::vector<LoopInfo> detectLoops(IR::Function* func) {
 }
 
 // ---- 从 header 的 ICMP 推导迭代次数 ----
+// ★ 必须考虑 PHI 的初始值！
+//   while (i = 1; i < 16; i++) 的 tripCount = 16 - 1 = 15，不是 16。
+//   如果忽略初始值，会导致 factor 选择错误（16%8==0 但 15%8!=0），
+//   进而导致循环展开后越界访问或无限循环。
 int inferTripCount(IR::BasicBlock* header) {
     for (auto& inst : header->getInstructions()) {
         if (inst->getOpcode() != IR::Instruction::Opcode::ICMP) continue;
@@ -72,14 +76,46 @@ int inferTripCount(IR::BasicBlock* header) {
         if (!rc) rc = dynamic_cast<IR::ConstantInt*>(inst->getOperand(0));
         if (!rc) continue;
 
-        int64_t val = rc->getValue();
-        // 仅处理 slt（有符号小于）：i < N  → tripCount = N
-        if (inst->getName() == "slt" && val > 0 && val <= 64) {
-            return static_cast<int>(val);
+        int64_t bound = rc->getValue();
+
+        // 查找左侧非常量操作数（循环变量）
+        auto* varOp = dynamic_cast<IR::ConstantInt*>(inst->getOperand(1)) ? inst->getOperand(0) : inst->getOperand(1);
+
+        // 尝试从 PHI 获取初始值
+        int64_t initVal = 0;
+        bool initKnown = false;
+        if (auto* phiInst = dynamic_cast<IR::Instruction*>(varOp)) {
+            if (phiInst->getOpcode() == IR::Instruction::Opcode::PHI) {
+                // 遍历 PHI 的操作数，找来自非 body BB 的初始值
+                for (unsigned i = 0; i + 1 < phiInst->getNumOperands(); i += 2) {
+                    auto* predBB = dynamic_cast<IR::BasicBlock*>(phiInst->getOperand(i + 1));
+                    if (predBB != header) {
+                        // 这是初始值
+                        if (auto* ci = dynamic_cast<IR::ConstantInt*>(phiInst->getOperand(i))) {
+                            initVal = ci->getValue();
+                            initKnown = true;
+                        }
+                        break;
+                    }
+                }
+            }
         }
-        // sle（有符号小于等于）：i <= N → tripCount = N+1
-        if (inst->getName() == "sle" && val >= 0 && val < 64) {
-            return static_cast<int>(val) + 1;
+
+        // 如果初始值未知，迭代次数依赖于外层循环变量等动态值
+        // 实际 tripCount 不是常数，展开会导致越界访问（如 h-5-01 回代循环）
+        if (!initKnown) return -1;
+
+        // 仅处理 slt（有符号小于）：i < N  → tripCount = N - init
+        if (inst->getName() == "slt" && bound > 0 && bound <= 64) {
+            int tc = static_cast<int>(bound - initVal);
+            if (tc > 0 && tc <= 64) return tc;
+            return -1;
+        }
+        // sle（有符号小于等于）：i <= N → tripCount = N+1 - init
+        if (inst->getName() == "sle" && bound >= 0 && bound < 64) {
+            int tc = static_cast<int>(bound + 1 - initVal);
+            if (tc > 0 && tc <= 64) return tc;
+            return -1;
         }
     }
     return -1;
@@ -190,6 +226,8 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     if (tc < 2 || tc > 64) return false;
 
     // 按从大到小尝试因子，最大 8×
+    // 包含质数因子 5 和 7，支持 tc 为质数的循环完全展开
+    // （如 conv2d 的 KSIZE=5 循环，如果循环体是单 BB）
     unsigned factor = 0;
     static const unsigned candidates[] = {8, 6, 4, 3, 2};
     for (unsigned f : candidates) {
@@ -197,6 +235,10 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
             factor = f;
             break;
         }
+    }
+    // 如果没有整除因子且 tc ≤ 8，完全展开（支持质数 tc：5, 7）
+    if (factor == 0 && tc <= 8) {
+        factor = static_cast<unsigned>(tc);
     }
     if (factor == 0) return false;
 
@@ -213,6 +255,10 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
 
     // ★ 收集 header PHI → back-edge 值（从 bodyBB 来的值）的映射
     // 例如：%k = phi [0, entry], [%t4, body] → phiToBackEdge[%k] = %t4
+    // ★★ 关键：phiToBackEdge 保存的是 ORIGINAL back-edge 值，永不在克隆循环中更新。
+    //   valueMap[original] 始终映射到最新克隆值，所以每轮开始时通过 lookup(original)
+    //   即可获取当前归纳变量值。之前的 bug 是在每轮后更新 phiToBackEdge 为克隆值，
+    //   导致下一轮 lookup(克隆值) 在 valueMap 中找不到（valueMap 只映射 original→clone）。
     std::unordered_map<IR::Value*, IR::Value*> phiToBackEdge;
     for (auto& inst : loop.header->getInstructions()) {
         if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
@@ -241,10 +287,13 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     std::vector<IR::Instruction*> clonedInsts;
     for (unsigned u = 1; u < factor; ++u) {
         // ★ 在本轮克隆前，将 PHI 映射为"当前归纳变量值"
-        // 第 u=1 轮：PHI → 原 back-edge 值（即第 1 次迭代后的值）
-        // 第 u=2 轮：PHI → 第 1 轮克隆的 back-edge 值（即第 2 次迭代后的值）
-        for (auto& [phi, backEdge] : phiToBackEdge) {
-            valueMap[phi] = backEdge;
+        // 通过 lookup(original back-edge) 获取：
+        //   u=1 轮：valueMap 为空，lookup 返回 original（即第 1 次迭代后的值）
+        //   u=2 轮：valueMap[original] = u1 克隆（即第 2 次迭代后的值）
+        //   u=3 轮：valueMap[original] = u2 克隆（即第 3 次迭代后的值）
+        for (auto& [phi, origBackEdge] : phiToBackEdge) {
+            auto it = valueMap.find(origBackEdge);
+            valueMap[phi] = (it != valueMap.end()) ? it->second : origBackEdge;
         }
 
         for (auto* src : toClone) {
@@ -254,16 +303,8 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
                 clonedInsts.push_back(cloned);
             }
         }
-
-        // ★ 本轮克隆后，更新 phiToBackEdge 指向最新克隆的 back-edge 值
-        // 例如：原 back-edge 是 %t4，本轮克隆产生 %t4.u1
-        // 下轮克隆时 PHI 应映射为 %t4.u1
-        for (auto& [phi, backEdge] : phiToBackEdge) {
-            auto it = valueMap.find(backEdge);
-            if (it != valueMap.end()) {
-                phiToBackEdge[phi] = it->second;
-            }
-        }
+        // ★ 不更新 phiToBackEdge！保持原始 back-edge 值，
+        //   valueMap[original] 已被更新为最新克隆值。
     }
     if (clonedInsts.empty()) return false;
 
@@ -274,12 +315,15 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     }
 
     // ★ 全部克隆完成后，更新 PHI 的 back-edge operand 为最后一次克隆的值
-    // 例如：原 PHI 的 back-edge 是 %t4，2× 展开后应改为 %t4.u1
+    // 通过 lookup(original back-edge) 获取最新克隆值
     for (auto& inst : loop.header->getInstructions()) {
         if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
         auto it = phiToBackEdge.find(inst.get());
         if (it == phiToBackEdge.end()) continue;
-        IR::Value* finalBackEdge = it->second;
+        IR::Value* origBackEdge = it->second;
+        auto vIt = valueMap.find(origBackEdge);
+        if (vIt == valueMap.end()) continue; // back-edge 未被克隆（常量等）
+        IR::Value* finalBackEdge = vIt->second;
         for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
             auto* predBB = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
             if (predBB == bodyBB) {

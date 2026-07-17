@@ -66,18 +66,40 @@ bool isLoopInvariant(
         op == Opc::ALLOCA)
         return false;
 
-    // LOAD 指令：加载自全局变量时，检查是否可外提
+    // LOAD 指令：加载自全局变量或 ALLOCA 时，检查是否可外提
     if (op == Opc::LOAD) {
         auto* ptr = inst->getOperand(0);
         auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr);
-        if (!gv) return false;
-        // 如果全局变量在函数内被 STORE 过，不能外提
-        if (storedGlobals.count(gv)) return false;
-        // 增强：如果全局变量在整个模块中都是只读的，即使循环有 CALL 也可以外提
-        if (moduleReadOnlyGlobals.count(gv)) return true;
-        // 否则，如果循环有 CALL，保守不提升
-        if (hasCalls) return false;
-        return true;
+        if (gv) {
+            // 如果全局变量在函数内被 STORE 过，不能外提
+            if (storedGlobals.count(gv)) return false;
+            // 增强：如果全局变量在整个模块中都是只读的，即使循环有 CALL 也可以外提
+            if (moduleReadOnlyGlobals.count(gv)) return true;
+            // 否则，如果循环有 CALL，保守不提升
+            if (hasCalls) return false;
+            return true;
+        }
+        // ALLOCA：如果 ALLOCA 在循环体中从未被 STORE，则 LOAD 是不变的
+        // 这覆盖了外层循环变量（如 %i）和函数参数指针（如 %A）的情况
+        auto* alloca = dynamic_cast<IR::Instruction*>(ptr);
+        if (alloca && alloca->getOpcode() == Opc::ALLOCA) {
+            // 检查该 ALLOCA 在循环体中是否有 STORE
+            bool hasStoreInLoop = false;
+            for (auto& use : alloca->getUses()) {
+                auto* user = dynamic_cast<IR::Instruction*>(use.user);
+                if (!user) continue;
+                if (user->getOpcode() == Opc::STORE && use.operandNo == 1) {
+                    // STORE 的第 2 操作数是目标地址
+                    auto* storeBB = user->getParent();
+                    if (storeBB && loop.body.count(storeBB)) {
+                        hasStoreInLoop = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasStoreInLoop) return true;
+        }
+        return false;
     }
 
     for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
@@ -226,6 +248,23 @@ bool hoistLoopInvariants(NaturalLoop& loop, IR::Function* func,
         for (unsigned i = 0; i < term->getNumOperands(); ++i) {
             if (term->getOperand(i) == static_cast<IR::Value*>(loop.header)) {
                 term->setOperand(i, preheader);
+            }
+        }
+    }
+
+    // 8. 更新 header 中 PHI 节点的前驱指针：
+    //    原来从 outsidePred 进入的值现在从 preheader 进入。
+    //    如果不更新，PHI elimination 会基于过时的前驱边发射 moves，
+    //    导致 moves 被发送到不存在的边上 → SEGFAULT。
+    //    使用 continue 而非 break：PHI 节点可能因前序 Pass 被交错
+    //    在非 PHI 指令之间。
+    for (auto& inst : loop.header->getInstructions()) {
+        if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
+        for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+            auto* predBB = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+            if (!predBB) continue;
+            if (std::find(outsidePreds.begin(), outsidePreds.end(), predBB) != outsidePreds.end()) {
+                inst->setOperand(i + 1, preheader);
             }
         }
     }

@@ -190,7 +190,27 @@ LatticeValue evaluateInst(
         return result;
     }
 
-    // LOAD, STORE, CALL, ALLOCA, GETELEMENTPTR, BR, COND_BR, RET, PHI
+    // LOAD: 从 const 全局变量加载 → 返回常量值
+    // const int KSIZE = 5; load i32, i32* @KSIZE → ConstantInt(5)
+    // 这使得 SCCP 能将常量传播到分支条件（如 while (kr < KSIZE) → while (kr < 5)），
+    // 进而使 SimplifyCFG 能折叠更多分支，LoopUnrolling 能确定循环次数等。
+    if (op == Opc::LOAD) {
+        auto* ptr = inst->getOperand(0);
+        if (auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr)) {
+            if (gv->isConstant()) {
+                auto* init = gv->getInitializer();
+                if (auto* ci = dynamic_cast<IR::ConstantInt*>(init)) {
+                    result.state = LatticeState::CONSTANT;
+                    result.constant = ci;
+                    return result;
+                }
+            }
+        }
+        result.state = LatticeState::BOTTOM;
+        return result;
+    }
+
+    // STORE, CALL, ALLOCA, GETELEMENTPTR, BR, COND_BR, RET, PHI
     // 这些指令的结果不是常量
     result.state = LatticeState::BOTTOM;
     return result;
@@ -446,10 +466,29 @@ bool sccpOnFunction(IR::Function* func) {
         }
 
         // 移除死块
+        // ★ 必须先清理其他 BB 的 PHI 中对 deadBB 的引用，再删除 deadBB
+        //   否则 PHI 的 block 操作数会成为悬空指针，后续 Pass（如 simplifyCFG
+        //   的 removeNullPhiPairs）访问已释放内存导致 heap-use-after-free
+        //   （29_long_line 根因：fullUnrollSingleBB 产生新 IR 结构后 SCCP 删除死块触发）
         for (auto* deadBB : deadBlocks) {
+            // 清理所有可达 BB 的 PHI 中对 deadBB 的引用
+            for (auto& bb : func->getBlocks()) {
+                if (bb.get() == deadBB) continue;
+                for (auto& inst : bb->getInstructions()) {
+                    if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
+                    for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                        if (inst->getOperand(i + 1) == deadBB) {
+                            inst->setOperand(i, nullptr);
+                            inst->setOperand(i + 1, nullptr);
+                        }
+                    }
+                }
+            }
+            // 清理死块内指令的 operands
             for (auto& inst : deadBB->getInstructions()) {
                 inst->dropAllUses();
             }
+            // 从 blocks 向量中删除 BB
             auto& blks = func->getBlocks();
             for (auto it = blks.begin(); it != blks.end(); ++it) {
                 if (it->get() == deadBB) {

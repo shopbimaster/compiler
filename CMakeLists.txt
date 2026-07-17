@@ -101,7 +101,9 @@ add_library(sysy_opt STATIC
     src/opt/RecursiveMulToNative.cpp
     src/opt/BitOpPatternRecognition.cpp
     src/opt/GlobalVariablePromotion.cpp
+    src/opt/GlobalConstantPropagation.cpp
     src/opt/Mem2Reg.cpp
+    src/opt/GVN.cpp
     src/opt/PhiLowering.cpp
 )
 target_include_directories(sysy_opt PUBLIC include)

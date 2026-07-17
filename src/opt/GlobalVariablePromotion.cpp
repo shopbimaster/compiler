@@ -195,6 +195,7 @@ bool isGlobal(IR::Value* v) {
 // 在 entry block 开头插入指令（在所有 ALLOCA 之后、第一个非 ALLOCA 指令之前）
 // 确保 ALLOCA 及其初始化在使用之前被定义
 void insertAtEntryBeginning(IR::BasicBlock* bb, IR::Instruction* inst) {
+    inst->setParent(bb);
     auto& insts = const_cast<std::vector<std::unique_ptr<IR::Instruction>>&>(bb->getInstructions());
     // 找到第一个非 ALLOCA 指令的位置
     for (size_t i = 0; i < insts.size(); i++) {
@@ -209,6 +210,7 @@ void insertAtEntryBeginning(IR::BasicBlock* bb, IR::Instruction* inst) {
 
 // 在指定指令之前插入新指令
 void insertBefore(IR::BasicBlock* bb, IR::Instruction* beforeInst, IR::Instruction* newInst) {
+    newInst->setParent(bb);
     auto& insts = const_cast<std::vector<std::unique_ptr<IR::Instruction>>&>(bb->getInstructions());
     for (auto it = insts.begin(); it != insts.end(); ++it) {
         if (it->get() == beforeInst) {
@@ -220,6 +222,7 @@ void insertBefore(IR::BasicBlock* bb, IR::Instruction* beforeInst, IR::Instructi
 
 // 在指定指令之后插入新指令
 void insertAfter(IR::BasicBlock* bb, IR::Instruction* afterInst, IR::Instruction* newInst) {
+    newInst->setParent(bb);
     auto& insts = const_cast<std::vector<std::unique_ptr<IR::Instruction>>&>(bb->getInstructions());
     for (auto it = insts.begin(); it != insts.end(); ++it) {
         if (it->get() == afterInst) {
@@ -314,6 +317,9 @@ bool promoteGlobalsInFunction(
     auto accessedGlobals = collectAccessedGlobals(func);
     if (accessedGlobals.empty()) return false;
 
+    // 收集读/写访问信息，用于判断哪些全局变量在函数中被修改
+    auto accessInfo = collectDirectGlobalAccess(func);
+
     // 只提升标量全局变量（int/float），不提升数组
     // 数组提升需要缓存基地址，收益较小且更复杂
     // 也不提升 const 全局变量，因为它们放在 .rodata 只读段，无法写回
@@ -329,6 +335,50 @@ bool promoteGlobalsInFunction(
         }
     }
     if (scalarGlobals.empty()) return false;
+
+    // ================================================================
+    // 区分"只读"和"可写"全局变量
+    // 只读：函数本身不写入，且所有 callee（传递性）也不写入，且没有调用
+    //       未知 external 函数（可能写入任何全局变量）。
+    // 只读全局变量无需 ALLOCA + 同步点，直接在 entry 处 LOAD 一次，
+    // 将所有引用替换为该 LOAD 结果。这消除了循环中的冗余 LOAD，且
+    // 不需要 Mem2Reg 提升（没有 ALLOCA）。
+    // ================================================================
+
+    // 检查函数是否调用了未知的 external 函数（非 sylib）
+    // 如果是，所有全局变量都视为可写（保守处理）
+    bool callsUnknownExternal = false;
+    for (auto& bb : func->getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::CALL) continue;
+            if (inst->getNumOperands() < 1) continue;
+            auto* calleeFunc = dynamic_cast<IR::Function*>(inst->getOperand(0));
+            if (calleeFunc && calleeFunc->isExternal() && !isSylibFunction(calleeFunc->getName())) {
+                callsUnknownExternal = true;
+                break;
+            }
+        }
+        if (callsUnknownExternal) break;
+    }
+
+    // 计算传递性写入集合（函数自身 + 所有 callee）
+    std::unordered_set<IR::GlobalVariable*> allWrites = accessInfo.writes;
+    auto tiIt = transitiveAccess.find(func);
+    if (tiIt != transitiveAccess.end()) {
+        for (auto* gv : tiIt->second.writes) allWrites.insert(gv);
+    }
+
+    // 分类：只读 vs 可写
+    std::unordered_set<IR::GlobalVariable*> readOnlyGlobals;
+    std::unordered_set<IR::GlobalVariable*> readWriteGlobals;
+    for (auto* gv : scalarGlobals) {
+        if (!callsUnknownExternal && allWrites.find(gv) == allWrites.end()) {
+            // 只读：函数和所有 callee 都不写入此全局变量
+            readOnlyGlobals.insert(gv);
+        } else {
+            readWriteGlobals.insert(gv);
+        }
+    }
 
     // Step 0: 先收集所有需要替换的 LOAD/STORE 指令（在创建初始化指令之前）
     // 避免初始化指令（从全局变量加载）被错误替换
@@ -360,8 +410,14 @@ bool promoteGlobalsInFunction(
 
     // Step 1: 在 entry block 中为每个标量全局变量创建 ALLOCA 和初始化指令
     // 分两批插入：先插入所有 ALLOCA（在现有 ALLOCA 之后），再插入所有 LOAD/STORE（在所有 ALLOCA 之后）
+    //
+    // ★ 优化：只读全局变量不创建 ALLOCA，直接用 entry 处的 LOAD 替换所有引用。
+    // 这消除了循环中的冗余 LOAD，且不需要 Mem2Reg 提升。
+    // 可写全局变量仍使用 ALLOCA + 同步点。
     auto* entryBB = func->getEntryBlock();
     std::unordered_map<IR::GlobalVariable*, IR::Instruction*> globalToAlloca;
+    // globalToLoad: 只读全局变量 → entry 处的 LOAD 指令（用于替换所有 LOAD 引用）
+    std::unordered_map<IR::GlobalVariable*, IR::Instruction*> globalToReadOnlyLoad;
 
     struct InitGroup {
         IR::Instruction* alloca;
@@ -376,12 +432,22 @@ bool promoteGlobalsInFunction(
         auto* pointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
         if (!pointee) continue;
 
-        auto* alloca = IR::Instruction::createAlloca(pointee, gv->getName() + ".local" + std::to_string(counter));
-        auto* load = IR::Instruction::createLoad(pointee, gv, gv->getName() + ".init" + std::to_string(counter));
-        auto* store = IR::Instruction::createStore(load, alloca);
+        if (readOnlyGlobals.count(gv)) {
+            // ★ 只读全局变量：只创建一个 LOAD，不创建 ALLOCA/STORE
+            // 所有 load @gv 将被替换为引用此 LOAD 的结果
+            auto* load = IR::Instruction::createLoad(pointee, gv,
+                gv->getName() + ".readonly" + std::to_string(counter));
+            globalToReadOnlyLoad[gv] = load;
+            // 插入到 entry block 开头（在 ALLOCA 之后）
+            insertAtEntryBeginning(entryBB, load);
+        } else {
+            auto* alloca = IR::Instruction::createAlloca(pointee, gv->getName() + ".local" + std::to_string(counter));
+            auto* load = IR::Instruction::createLoad(pointee, gv, gv->getName() + ".init" + std::to_string(counter));
+            auto* store = IR::Instruction::createStore(load, alloca);
 
-        initGroups.push_back({alloca, load, store});
-        globalToAlloca[gv] = alloca;
+            initGroups.push_back({alloca, load, store});
+            globalToAlloca[gv] = alloca;
+        }
         counter++;
     }
 
@@ -400,13 +466,33 @@ bool promoteGlobalsInFunction(
         insertAtEntryBeginning(entryBB, *it);
     }
 
-    // Step 2: 替换之前收集的 LOAD/STORE 中的全局变量指针为 ALLOCA
-    // 初始化指令是新创建的，不在 replacements 列表中，不会被错误修改
+    // Step 2: 替换之前收集的 LOAD/STORE 中的全局变量指针
+    // - 可写全局变量：替换为 ALLOCA
+    // - 只读全局变量：LOAD 替换为引用 entry 处的 LOAD 结果
+    //   （只读全局变量不应有 STORE，但保守起见如果有则跳过）
     for (auto& [inst, idx] : replacements) {
         auto* ptr = inst->getOperand(idx);
-        auto it = globalToAlloca.find(dynamic_cast<IR::GlobalVariable*>(ptr));
-        if (it != globalToAlloca.end()) {
-            inst->setOperand(idx, it->second);
+        auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr);
+        if (!gv) continue;
+
+        auto allocaIt = globalToAlloca.find(gv);
+        if (allocaIt != globalToAlloca.end()) {
+            inst->setOperand(idx, allocaIt->second);
+            continue;
+        }
+
+        auto roIt = globalToReadOnlyLoad.find(gv);
+        if (roIt != globalToReadOnlyLoad.end()) {
+            // 只读全局变量：如果是 LOAD，直接替换整个 LOAD 指令的 uses
+            if (inst->getOpcode() == IR::Instruction::Opcode::LOAD) {
+                inst->replaceAllUsesWith(roIt->second);
+                // 标记此 LOAD 为死代码（DCE 会清除）
+                for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
+                    inst->setOperand(i, nullptr);
+                }
+            }
+            // 如果是 STORE 到只读全局变量，说明分析有误（不应出现），
+            // 保守跳过，保留原指令
         }
     }
 
@@ -427,6 +513,9 @@ bool promoteGlobalsInFunction(
 
     for (auto& [bb, retInst] : retInsts) {
         for (auto& [gv, alloca] : globalToAlloca) {
+            // 如果函数中从未写入此全局变量，则跳过出口同步
+            // （local 的值始终等于 global 的原始值，写回是死存储）
+            if (accessInfo.writes.find(gv) == accessInfo.writes.end()) continue;
             auto* ptrTy = dynamic_cast<IR::PointerType*>(gv->getType());
             auto* pointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
             if (!pointee) continue;
@@ -507,9 +596,15 @@ bool promoteGlobalsInFunction(
 
             if (!needSync) continue;
 
-            // 在 CALL 之前：STORE local→global，仅对 callee 可能读取的全局
-            // （callee 可能通过参数或返回值间接访问全局，但通过 LOAD 直接访问的需要同步）
-            auto syncStores = createSyncStoresForSet(globalToAlloca, readsToSync);
+            // 在 CALL 之前：STORE local→global，仅对 callee 可能读取且本函数修改过的全局
+            // 如果本函数从未写入此全局变量，local 的值始终等于 global 的原始值，无需同步
+            std::unordered_set<IR::GlobalVariable*> effectiveReadsToSync;
+            for (auto* gv : readsToSync) {
+                if (accessInfo.writes.find(gv) != accessInfo.writes.end()) {
+                    effectiveReadsToSync.insert(gv);
+                }
+            }
+            auto syncStores = createSyncStoresForSet(globalToAlloca, effectiveReadsToSync);
             for (auto* s : syncStores) {
                 insertBefore(bb.get(), callInst, s);
             }

@@ -1,6 +1,7 @@
 #include "backend/TargetCodeGen.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <iostream>
 #include <set>
 
@@ -23,6 +24,41 @@ static const std::unordered_map<Register, const char*> REG_NAMES = {
 std::string regToString(Register reg) {
     auto it = REG_NAMES.find(reg);
     return it != REG_NAMES.end() ? std::string(it->second) : "?";
+}
+
+static bool isFloatReg(const std::string& reg) {
+    return !reg.empty() && reg[0] == 'f';
+}
+
+// Callee-saved registers: s0-s11, fs0-fs11 (preserved across calls)
+static bool isCalleeSavedReg(const std::string& reg) {
+    if (reg.size() >= 2 && reg[0] == 's' && std::isdigit(static_cast<unsigned char>(reg[1])))
+        return true;
+    if (reg.size() >= 3 && reg[0] == 'f' && reg[1] == 's' && std::isdigit(static_cast<unsigned char>(reg[2])))
+        return true;
+    return false;
+}
+
+// Caller-saved registers: t0-t6, a0-a7, ft0-ft11, fa0-fa7 (clobbered by calls)
+static bool isCallerSavedReg(const std::string& reg) {
+    if (reg.size() >= 2 && reg[0] == 't' && std::isdigit(static_cast<unsigned char>(reg[1])))
+        return true;
+    if (reg.size() >= 2 && reg[0] == 'a' && std::isdigit(static_cast<unsigned char>(reg[1])))
+        return true;
+    if (reg.size() >= 3 && reg[0] == 'f' && reg[1] == 't' && std::isdigit(static_cast<unsigned char>(reg[2])))
+        return true;
+    if (reg.size() >= 3 && reg[0] == 'f' && reg[1] == 'a' && std::isdigit(static_cast<unsigned char>(reg[2])))
+        return true;
+    return false;
+}
+
+// Argument registers: a0-a7, fa0-fa7 (used for parameter passing, subject to shuffling)
+static bool isArgReg(const std::string& reg) {
+    if (reg.size() >= 2 && reg[0] == 'a' && std::isdigit(static_cast<unsigned char>(reg[1])))
+        return true;
+    if (reg.size() >= 3 && reg[0] == 'f' && reg[1] == 'a' && std::isdigit(static_cast<unsigned char>(reg[2])))
+        return true;
+    return false;
 }
 
 TargetCodeGen::TargetCodeGen()
@@ -149,10 +185,52 @@ void TargetCodeGen::emitGlobalInitData(IR::Constant* init, IR::Type* type, const
     emitter.emitData(indent + ".word   0");
 }
 
+void TargetCodeGen::detectLoopHeaders(IR::Function& func) {
+    loopHeaders.clear();
+    // 构建 BB → 索引映射
+    std::unordered_map<IR::BasicBlock*, size_t> bbIndex;
+    const auto& blocks = func.getBlocks();
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        bbIndex[blocks[i].get()] = i;
+    }
+    // 遍历每个 BB 的 terminator，检测回边
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        auto* term = blocks[i]->getTerminator();
+        if (!term) continue;
+        using Opc = IR::Instruction::Opcode;
+        if (term->getOpcode() == Opc::BR) {
+            // BR: 1 个操作数 = 目标 BB
+            if (term->getNumOperands() >= 1) {
+                auto* target = dynamic_cast<IR::BasicBlock*>(term->getOperand(0));
+                if (target) {
+                    auto it = bbIndex.find(target);
+                    if (it != bbIndex.end() && it->second <= i) {
+                        loopHeaders.insert(target);
+                    }
+                }
+            }
+        } else if (term->getOpcode() == Opc::COND_BR) {
+            // COND_BR: 3 个操作数 = cond, thenBB, elseBB
+            for (unsigned j = 1; j <= 2 && j < term->getNumOperands(); ++j) {
+                auto* target = dynamic_cast<IR::BasicBlock*>(term->getOperand(j));
+                if (target) {
+                    auto it = bbIndex.find(target);
+                    if (it != bbIndex.end() && it->second <= i) {
+                        loopHeaders.insert(target);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void TargetCodeGen::emitFunction(IR::Function& func) {
     currentFunc = &func;
     promotedAllocas.clear();
     regAlloc.clearReservedRegs();
+
+    // 检测循环头（用于后续对齐）
+    detectLoopHeaders(func);
 
     // 先收集全局变量地址并分配 callee-saved 寄存器缓存（优先级高于 ALLOCA 提升）
     globalAddrCache.clear();
@@ -160,6 +238,9 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
     for (auto& [gv, reg] : globalAddrCache) {
         regAlloc.reserveReg(reg);
     }
+
+    // 收集大常量偏移并分配 callee-saved 寄存器缓存（优先级介于全局地址和 ALLOCA 之间）
+    collectLargeConstants(func);
 
     // 再提升 ALLOCA 到寄存器（跳过已被全局地址缓存占用的寄存器）
     promoteAllocasInFunction(func);
@@ -173,20 +254,55 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
 
     regAlloc.allocate(func);
 
+    // 构建 PHI move 映射表（基于边）
+    buildPhiMoveMap(func);
+
     // 收集可以融合的 GEP+LOAD/STORE 模式（FoldMemoryAccess）
     foldedGeps.clear();
     collectFoldedGeps(func);
 
+    // 收集可以融合的 ICMP+COND_BR 模式
+    inlinedIcmps.clear();
+    collectInlinedIcmps(func);
+
+    // ★ K1+K2 修复：重建 usedCalleeSaved，移除两种无用寄存器：
+    //   K1: coalescePhis 释放的 incoming 原寄存器
+    //   K2: 被折叠的 GEP/ICMP 指令的寄存器（从未被写入）
+    //   必须在 collectFoldedGeps/collectInlinedIcmps 之后调用
+    {
+        std::set<IR::Instruction*> deadInsts;
+        deadInsts.insert(foldedGeps.begin(), foldedGeps.end());
+        deadInsts.insert(inlinedIcmps.begin(), inlinedIcmps.end());
+        regAlloc.pruneUnusedCalleeSaved(deadInsts);
+    }
+
     // 将 promoted ALLOCA 的 LOAD 指令映射到 callee-saved 寄存器，
-    // 避免后续 emitLoad 生成冗余的 mv 指令
+    // 避免后续 emitLoad 生成冗余的 mv 指令。
+    // ★ 安全检查：如果同一个 BB 内 LOAD 之后有 STORE 到同一个 ALLOCA，
+    //   则不能复用 ALLOCA 寄存器——STORE 会覆写该寄存器，
+    //   导致后续使用 LOAD 旧值的指令得到错误值（64_calculator SEGFAULT 根因）。
     for (auto& bb : func.getBlocks()) {
-        for (auto& inst : bb->getInstructions()) {
-            if (inst->getOpcode() == IR::Instruction::Opcode::LOAD) {
-                auto* ptrOp = inst->getOperand(0);
-                auto promotedIt = promotedAllocas.find(ptrOp);
-                if (promotedIt != promotedAllocas.end()) {
-                    regAlloc.setReg(inst.get(), promotedIt->second);
+        for (auto it = bb->getInstructions().begin(); it != bb->getInstructions().end(); ++it) {
+            auto& inst = *it;
+            if (inst->getOpcode() != IR::Instruction::Opcode::LOAD) continue;
+            auto* ptrOp = inst->getOperand(0);
+            auto promotedIt = promotedAllocas.find(ptrOp);
+            if (promotedIt == promotedAllocas.end()) continue;
+
+            // 检查同一 BB 内 LOAD 之后是否有 STORE 到同一个 ALLOCA
+            bool hasSubsequentStore = false;
+            for (auto it2 = it + 1; it2 != bb->getInstructions().end(); ++it2) {
+                if ((*it2)->getOpcode() == IR::Instruction::Opcode::STORE) {
+                    if ((*it2)->getOperand(1) == ptrOp) {
+                        hasSubsequentStore = true;
+                        break;
+                    }
                 }
+            }
+
+            // 只有在没有后续 STORE 时才安全复用 ALLOCA 寄存器
+            if (!hasSubsequentStore) {
+                regAlloc.setReg(inst.get(), promotedIt->second);
             }
         }
     }
@@ -196,6 +312,8 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
     stackSize += savedRegSpace;
     stackSize = (stackSize + 15) & ~15;
 
+    // 函数入口对齐到 16 字节边界，优化 BOOM 取指
+    emitter.emitText("  .p2align 4");
     emitter.emitText("  .globl  " + func.getName());
     emitter.emitText("  .type   " + func.getName() + ", @function");
     emitter.emitText(func.getName() + ":");
@@ -297,7 +415,7 @@ void TargetCodeGen::computeStackLayout(IR::Function& func) {
         stackSize += 8;
     }
 
-    bool savesRA = false;
+    savesRA = false;
     for (auto& bb : func.getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
             if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
@@ -365,17 +483,54 @@ std::string TargetCodeGen::emitStackStore(const std::string& reg, int offset, co
     return result;
 }
 
+// 生成 stride 乘法代码：将 srcReg 乘以 stride，结果留在 srcReg
+// 优化：stride 为 2 的幂次时使用 slli（1 cycle），否则使用 mul（3 cycle）
+// largeConstReg 用于非 2 的幂次大 stride 的 li 临时寄存器
+std::string TargetCodeGen::emitStrideMul(const std::string& srcReg, int stride,
+                                         const std::string& largeConstReg) {
+    std::string result;
+    if (stride == 1) {
+        // 无操作
+    } else if (stride == 2) {
+        result += "  slli    " + srcReg + ", " + srcReg + ", 1\n";
+    } else if (stride == 4) {
+        result += "  slli    " + srcReg + ", " + srcReg + ", 2\n";
+    } else if (stride == 8) {
+        result += "  slli    " + srcReg + ", " + srcReg + ", 3\n";
+    } else if (stride > 0 && (stride & (stride - 1)) == 0) {
+        // 2 的幂次（16, 32, 64, ..., 4096, ...）：使用 slli
+        int shift = 0;
+        int tmp = stride;
+        while (tmp > 1) { tmp >>= 1; shift++; }
+        result += "  slli    " + srcReg + ", " + srcReg + ", " + std::to_string(shift) + "\n";
+    } else {
+        // 非 2 的幂次：优先使用常量缓存，避免每次发射 li
+        auto cacheIt = constantCache.find(stride);
+        if (cacheIt != constantCache.end()) {
+            result += "  mul     " + srcReg + ", " + srcReg + ", " + cacheIt->second + "\n";
+        } else {
+            result += "  li      " + largeConstReg + ", " + std::to_string(stride) + "\n";
+            result += "  mul     " + srcReg + ", " + srcReg + ", " + largeConstReg + "\n";
+        }
+    }
+    return result;
+}
+
 void TargetCodeGen::emitPrologue(IR::Function& func) {
     // Adjust stack pointer, handling large stack frames
     emitter.emitText(emitSPAddImm(-stackSize));
 
-    if (stackSize > 0) {
+    // Save ra only for non-leaf functions (leaf functions don't call anything)
+    if (savesRA && stackSize > 0) {
         emitter.emitText(emitStackStore("ra", stackSize - 8, "sd"));
     }
 
+    // Save only callee-saved registers (s*, fs*) in prologue.
+    // Caller-saved registers (t*, ft*) are saved at call sites.
     int csrOffset = stackSize - 8;
     for (auto& reg : regAlloc.getUsedCalleeSaved()) {
         csrOffset -= 8;
+        if (!isCalleeSavedReg(reg)) continue;  // Skip caller-saved
         if (reg[0] == 'f') {
             emitter.emitText(emitStackStore(reg, csrOffset, "fsd"));
         } else {
@@ -394,49 +549,81 @@ void TargetCodeGen::emitPrologue(IR::Function& func) {
         bool pIsPtr = ft->getParamTypes()[i]->isPointer();
 
         if (pIsFloat && fReg < 8) {
-            std::string reg = std::string("fa") + std::to_string(fReg++);
-            emitter.emitText(emitStackStore(reg, offset, "fsw"));
+            std::string srcReg = std::string("fa") + std::to_string(fReg++);
+            if (regAlloc.hasReg(arg)) {
+                // 直接从 fa 寄存器 mv 到分配的寄存器，避免栈中转
+                std::string dstReg = regAlloc.getReg(arg);
+                if (dstReg != srcReg) {
+                    bool dstFloat = isFloatReg(dstReg);
+                    if (dstFloat) {
+                        emitter.emitText("  fmv.s   " + dstReg + ", " + srcReg + "\n");
+                    } else {
+                        emitter.emitText("  fmv.x.w " + dstReg + ", " + srcReg + "\n");
+                    }
+                }
+            } else {
+                emitter.emitText(emitStackStore(srcReg, offset, "fsw"));
+            }
         } else if (!pIsFloat && iReg < 8) {
-            std::string reg = std::string("a") + std::to_string(iReg++);
-            emitter.emitText(emitStackStore(reg, offset, pIsPtr ? "sd" : "sw"));
+            std::string srcReg = std::string("a") + std::to_string(iReg++);
+            if (regAlloc.hasReg(arg)) {
+                // 直接从 a 寄存器 mv 到分配的寄存器，避免栈中转
+                std::string dstReg = regAlloc.getReg(arg);
+                if (dstReg != srcReg) {
+                    bool dstFloat = isFloatReg(dstReg);
+                    if (dstFloat) {
+                        emitter.emitText("  mv      t2, " + srcReg + "\n");
+                        emitter.emitText("  " + std::string(pIsPtr ? "fmv.d.x" : "fmv.w.x") + " " + dstReg + ", t2\n");
+                    } else {
+                        emitter.emitText("  mv      " + dstReg + ", " + srcReg + "\n");
+                    }
+                }
+            } else {
+                emitter.emitText(emitStackStore(srcReg, offset, pIsPtr ? "sd" : "sw"));
+            }
         } else {
             // Arguments beyond registers: load from the caller's stack frame
             int callerOffset = stackSize + stackParamIdx * 8;
             stackParamIdx++;
             if (pIsFloat) {
-                emitter.emitText(emitStackLoad("ft0", callerOffset, "flw"));
-                emitter.emitText(emitStackStore("ft0", offset, "fsw"));
+                if (regAlloc.hasReg(arg)) {
+                    std::string dstReg = regAlloc.getReg(arg);
+                    if (isFloatReg(dstReg)) {
+                        emitter.emitText(emitStackLoad(dstReg, callerOffset, "flw"));
+                    } else {
+                        emitter.emitText(emitStackLoad("ft0", callerOffset, "flw"));
+                        emitter.emitText("  fmv.x.w " + dstReg + ", ft0\n");
+                    }
+                } else {
+                    emitter.emitText(emitStackLoad("ft0", callerOffset, "flw"));
+                    emitter.emitText(emitStackStore("ft0", offset, "fsw"));
+                }
             } else if (pIsPtr) {
-                emitter.emitText(emitStackLoad("t1", callerOffset, "ld"));
-                emitter.emitText(emitStackStore("t1", offset, "sd"));
+                if (regAlloc.hasReg(arg)) {
+                    std::string dstReg = regAlloc.getReg(arg);
+                    if (isFloatReg(dstReg)) {
+                        emitter.emitText(emitStackLoad("t1", callerOffset, "ld"));
+                        emitter.emitText("  fmv.d.x " + dstReg + ", t1\n");
+                    } else {
+                        emitter.emitText(emitStackLoad(dstReg, callerOffset, "ld"));
+                    }
+                } else {
+                    emitter.emitText(emitStackLoad("t1", callerOffset, "ld"));
+                    emitter.emitText(emitStackStore("t1", offset, "sd"));
+                }
             } else {
-                emitter.emitText(emitStackLoad("t1", callerOffset, "lw"));
-                emitter.emitText(emitStackStore("t1", offset, "sw"));
-            }
-        }
-    }
-
-    for (unsigned i = 0; i < func.getNumArgs(); ++i) {
-        auto* arg = func.getArg(i);
-        if (regAlloc.hasReg(arg)) {
-            int offset = getStackOffset(arg);
-            std::string r = regAlloc.getReg(arg);
-            auto* pt = ft->getParamTypes()[i];
-            bool paramFloat = pt->isFloat();
-            bool regFloat = !r.empty() && r[0] == 'f';
-
-            if (paramFloat && regFloat) {
-                emitter.emitText(emitStackLoad(r, offset, "flw"));
-            } else if (paramFloat && !regFloat) {
-                emitter.emitText(emitStackLoad("ft0", offset, "flw"));
-                emitter.emitText("  fmv.x.w " + r + ", ft0\n");
-            } else if (!paramFloat && regFloat) {
-                emitter.emitText(emitStackLoad("t2", offset,
-                    pt->isPointer() ? "ld" : "lw"));
-                emitter.emitText("  " + std::string(pt->isPointer() ? "fmv.d.x" : "fmv.w.x") + " " + r + ", t2\n");
-            } else {
-                emitter.emitText(emitStackLoad(r, offset,
-                    pt->isPointer() ? "ld" : "lw"));
+                if (regAlloc.hasReg(arg)) {
+                    std::string dstReg = regAlloc.getReg(arg);
+                    if (isFloatReg(dstReg)) {
+                        emitter.emitText(emitStackLoad("t1", callerOffset, "lw"));
+                        emitter.emitText("  fmv.w.x " + dstReg + ", t1\n");
+                    } else {
+                        emitter.emitText(emitStackLoad(dstReg, callerOffset, "lw"));
+                    }
+                } else {
+                    emitter.emitText(emitStackLoad("t1", callerOffset, "lw"));
+                    emitter.emitText(emitStackStore("t1", offset, "sw"));
+                }
             }
         }
     }
@@ -445,20 +632,31 @@ void TargetCodeGen::emitPrologue(IR::Function& func) {
     for (auto& [gv, reg] : globalAddrCache) {
         emitter.emitText("  la      " + reg + ", " + gv->getName());
     }
+
+    // 初始化大常量缓存（GEP 频繁使用的大偏移量）
+    for (auto& [val, reg] : constantCache) {
+        emitter.emitText("  li      " + reg + ", " + std::to_string(val));
+    }
 }
 
 void TargetCodeGen::emitEpilogue(IR::Function& func) {
     if (stackSize > 0) {
+        // Restore only callee-saved registers (s*, fs*).
+        // Caller-saved registers were restored at call sites.
         int csrOffset = stackSize - 8;
         for (auto& reg : regAlloc.getUsedCalleeSaved()) {
             csrOffset -= 8;
+            if (!isCalleeSavedReg(reg)) continue;  // Skip caller-saved
             if (reg[0] == 'f') {
                 emitter.emitText(emitStackLoad(reg, csrOffset, "fld"));
             } else {
                 emitter.emitText(emitStackLoad(reg, csrOffset, "ld"));
             }
         }
-        emitter.emitText(emitStackLoad("ra", stackSize - 8, "ld"));
+        // Restore ra only for non-leaf functions
+        if (savesRA) {
+            emitter.emitText(emitStackLoad("ra", stackSize - 8, "ld"));
+        }
         emitter.emitText(emitSPAddImm(stackSize));
     }
     emitter.emitText("  ret");
@@ -513,36 +711,153 @@ void TargetCodeGen::collectFoldedGeps(IR::Function& func) {
     }
 }
 
+// 收集可以融合到 COND_BR 的 ICMP 指令：
+// 当 ICMP 结果只被单个 COND_BR 使用时，跳过 ICMP 结果计算，
+// 直接在 COND_BR 中生成分支指令 (beq/bne/blt/bge)
+void TargetCodeGen::collectInlinedIcmps(IR::Function& func) {
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::COND_BR) continue;
+            auto* condVal = inst->getOperand(0);
+            auto* icmp = dynamic_cast<IR::Instruction*>(condVal);
+            if (!icmp || icmp->getOpcode() != IR::Instruction::Opcode::ICMP) continue;
+            if (!icmp->hasOneUse()) continue;
+            // 浮点比较不支持分支指令，跳过
+            auto* op0Ty = icmp->getOperand(0)->getType();
+            if (op0Ty && op0Ty->isFloat()) continue;
+            inlinedIcmps.insert(icmp);
+        }
+    }
+}
+
 // 将 GEP 的地址计算内联到指定寄存器中，不存储结果
 // 使用 addrReg 作为基址/结果寄存器，t1 作为索引寄存器，t3 作为临时乘法寄存器
 std::string TargetCodeGen::emitGEPAddressToReg(IR::Instruction& gep,
                                                 const std::string& addrReg) {
     std::string code;
-    code += loadToReg(gep.getOperand(0), addrReg);
 
     unsigned numOps = gep.getNumOperands();
-    if (numOps >= 2) {
-        auto* ptrTy = dynamic_cast<IR::PointerType*>(gep.getOperand(0)->getType());
-        IR::Type* curPointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
+    auto* ptrTy = dynamic_cast<IR::PointerType*>(gep.getOperand(0)->getType());
+    IR::Type* curPointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
 
+    // 快速路径：如果所有索引都是常量，直接计算总偏移量
+    // 避免通过 mv+addi 序列，直接生成 addi addrReg, baseReg, totalOffset
+    if (numOps >= 2) {
+        bool allConst = true;
+        int64_t totalOffset = 0;
+
+        auto* firstIdx = dynamic_cast<IR::ConstantInt*>(gep.getOperand(1));
+        if (firstIdx) {
+            if (firstIdx->getValue() != 0) {
+                int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
+                totalOffset += (int64_t)firstIdx->getValue() * ptrStride;
+            }
+        } else {
+            allConst = false;
+        }
+        IR::Type* curType = curPointee;
+        for (unsigned i = 2; i < numOps && allConst; ++i) {
+            auto* idxConst = dynamic_cast<IR::ConstantInt*>(gep.getOperand(i));
+            if (!idxConst) { allConst = false; break; }
+            if (idxConst->getValue() == 0) {
+                if (curType && curType->isArray()) {
+                    auto* arrTy = dynamic_cast<IR::ArrayType*>(curType);
+                    curType = arrTy->getElementType();
+                }
+                continue;
+            }
+            int stride = 4;
+            if (curType && curType->isArray()) {
+                auto* arrTy = dynamic_cast<IR::ArrayType*>(curType);
+                stride = getTypeSize(arrTy->getElementType());
+                curType = arrTy->getElementType();
+            }
+            totalOffset += (int64_t)idxConst->getValue() * stride;
+        }
+
+        if (allConst) {
+            // 如果 base 指针在寄存器中，直接从 base 寄存器计算
+            if (regAlloc.hasReg(gep.getOperand(0))) {
+                std::string baseReg = regAlloc.getReg(gep.getOperand(0));
+                if (totalOffset == 0) {
+                    code += "  mv      " + addrReg + ", " + baseReg + "\n";
+                } else if (-2048 <= totalOffset && totalOffset <= 2047) {
+                    code += "  addi    " + addrReg + ", " + baseReg + ", " +
+                            std::to_string(totalOffset) + "\n";
+                } else {
+                    // 大偏移：优先使用常量缓存，避免每次发射 li
+                    auto cacheIt = constantCache.find(totalOffset);
+                    if (cacheIt != constantCache.end()) {
+                        code += "  add     " + addrReg + ", " + baseReg + ", " + cacheIt->second + "\n";
+                    } else {
+                        code += "  li      t1, " + std::to_string(totalOffset) + "\n";
+                        code += "  add     " + addrReg + ", " + baseReg + ", t1\n";
+                    }
+                }
+                return code;
+            }
+            // base 不在寄存器中，先 loadToReg 再加偏移
+            code += loadToReg(gep.getOperand(0), addrReg);
+            if (totalOffset != 0) {
+                if (-2048 <= totalOffset && totalOffset <= 2047) {
+                    code += "  addi    " + addrReg + ", " + addrReg + ", " +
+                            std::to_string(totalOffset) + "\n";
+                } else {
+                    auto cacheIt = constantCache.find(totalOffset);
+                    if (cacheIt != constantCache.end()) {
+                        code += "  add     " + addrReg + ", " + addrReg + ", " + cacheIt->second + "\n";
+                    } else {
+                        code += "  li      t1, " + std::to_string(totalOffset) + "\n";
+                        code += "  add     " + addrReg + ", " + addrReg + ", t1\n";
+                    }
+                }
+            }
+            return code;
+        }
+    }
+
+    // 一般路径：有变量索引
+    // ★ GEP 寻址优化：当基址已在寄存器中时，跳过 mv addrReg,baseReg，
+    //   直接在第一条 add/addi 中使用基址寄存器作为源，消除冗余 mv。
+    std::string addrSrc;
+    {
+        std::string r = getValueRegIfAny(gep.getOperand(0));
+        if (!r.empty() && r != addrReg) {
+            addrSrc = r;  // 基址在寄存器中，跳过 mv
+        } else {
+            code += loadToReg(gep.getOperand(0), addrReg);
+            addrSrc = addrReg;
+        }
+    }
+
+    if (numOps >= 2) {
         // 第一个索引（operand 1）：指针偏移，乘以 sizeof(pointee)
         auto* firstIdx = dynamic_cast<IR::ConstantInt*>(gep.getOperand(1));
         bool firstIsZero = firstIdx && firstIdx->getValue() == 0;
         if (!firstIsZero) {
             int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
-            code += loadToReg(gep.getOperand(1), "t1");
-            if (ptrStride == 1) {
-            } else if (ptrStride == 2) {
-                code += "  slli    t1, t1, 1\n";
-            } else if (ptrStride == 4) {
-                code += "  slli    t1, t1, 2\n";
-            } else if (ptrStride == 8) {
-                code += "  slli    t1, t1, 3\n";
+            if (firstIdx) {
+                // 常量索引：直接计算偏移量，避免 li+slli+add 序列
+                int64_t offset = (int64_t)firstIdx->getValue() * ptrStride;
+                if (-2048 <= offset && offset <= 2047) {
+                    code += "  addi    " + addrReg + ", " + addrSrc + ", " + std::to_string(offset) + "\n";
+                } else {
+                    // 大偏移：优先使用常量缓存
+                    auto cacheIt = constantCache.find(offset);
+                    if (cacheIt != constantCache.end()) {
+                        code += "  add     " + addrReg + ", " + addrSrc + ", " + cacheIt->second + "\n";
+                    } else {
+                        code += "  li      t1, " + std::to_string(offset) + "\n";
+                        code += "  add     " + addrReg + ", " + addrSrc + ", t1\n";
+                    }
+                }
+                addrSrc = addrReg;
             } else {
-                code += "  li      t3, " + std::to_string(ptrStride) + "\n";
-                code += "  mul     t1, t1, t3\n";
+                code += loadToReg(gep.getOperand(1), "t1");
+                code += emitStrideMul("t1", ptrStride, "t3");
+                code += "  add     " + addrReg + ", " + addrSrc + ", t1\n";
+                addrSrc = addrReg;
             }
-            code += "  add     " + addrReg + ", " + addrReg + ", t1\n";
         }
 
         // 后续索引（operand 2+）：数组索引
@@ -562,28 +877,49 @@ std::string TargetCodeGen::emitGEPAddressToReg(IR::Instruction& gep,
                 stride = getTypeSize(arrTy->getElementType());
                 curPointee = arrTy->getElementType();
             }
-            code += loadToReg(gep.getOperand(i), "t1");
-            if (stride == 1) {
-            } else if (stride == 2) {
-                code += "  slli    t1, t1, 1\n";
-            } else if (stride == 4) {
-                code += "  slli    t1, t1, 2\n";
-            } else if (stride == 8) {
-                code += "  slli    t1, t1, 3\n";
+            if (idxConst) {
+                // 常量索引：直接计算偏移量
+                int64_t offset = (int64_t)idxConst->getValue() * stride;
+                if (-2048 <= offset && offset <= 2047) {
+                    code += "  addi    " + addrReg + ", " + addrSrc + ", " + std::to_string(offset) + "\n";
+                } else {
+                    // 大偏移：优先使用常量缓存
+                    auto cacheIt = constantCache.find(offset);
+                    if (cacheIt != constantCache.end()) {
+                        code += "  add     " + addrReg + ", " + addrSrc + ", " + cacheIt->second + "\n";
+                    } else {
+                        code += "  li      t1, " + std::to_string(offset) + "\n";
+                        code += "  add     " + addrReg + ", " + addrSrc + ", t1\n";
+                    }
+                }
+                addrSrc = addrReg;
             } else {
-                code += "  li      t3, " + std::to_string(stride) + "\n";
-                code += "  mul     t1, t1, t3\n";
+                code += loadToReg(gep.getOperand(i), "t1");
+                code += emitStrideMul("t1", stride, "t3");
+                code += "  add     " + addrReg + ", " + addrSrc + ", t1\n";
+                addrSrc = addrReg;
             }
-            code += "  add     " + addrReg + ", " + addrReg + ", t1\n";
         }
+    }
+
+    // 如果没有任何偏移（addrSrc 仍是 baseReg），需要 mv addrReg, baseReg
+    if (addrSrc != addrReg) {
+        code += "  mv      " + addrReg + ", " + addrSrc + "\n";
     }
     return code;
 }
 
 void TargetCodeGen::emitBasicBlock(IR::BasicBlock& bb) {
+    currentBB = &bb;
+    // 循环头对齐到 16 字节边界，优化 BOOM 分支预测和取指
+    if (loopHeaders.count(&bb)) {
+        emitter.emitText("  .p2align 4");
+    }
     // Use .L prefix for local labels to avoid symbol conflicts across functions
     emitter.emitText(".L" + currentFunc->getName() + "_" + bb.getName() + ":");
-    for (auto& inst : bb.getInstructions()) {
+
+    auto& insts = bb.getInstructions();
+    for (auto& inst : insts) {
         emitInstruction(*inst);
     }
 }
@@ -655,8 +991,7 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
         emitSelect(inst);
         break;
     case Opc::PHI:
-        // PHI 指令不生成任何代码，由 PhiLowering pass 在代码生成前处理
-        // （将 PHI 转换为前驱块中的并行拷贝）
+        // PHI 指令不生成代码，由 emitPhiMovesForEdge 在前驱块的 terminator 中发射寄存器拷贝
         break;
     default:
         emitter.emitText("  # unknown opcode " + std::to_string(static_cast<int>(inst.getOpcode())));
@@ -664,8 +999,285 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
     }
 }
 
-static bool isFloatReg(const std::string& reg) {
-    return !reg.empty() && reg[0] == 'f';
+// ================================================================
+// PHI 消除实现
+// ================================================================
+
+void TargetCodeGen::buildPhiMoveMap(IR::Function& func) {
+    phiMoveMap.clear();
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            // 使用 continue 而非 break：某些优化 Pass（如 InstCombine/CodeSink）
+            // 可能在 PHI 之前插入非 PHI 指令（GEP/LOAD 等），导致 PHI 不在块首。
+            // 必须扫描所有指令以收集全部 PHI 节点。
+            if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
+            // PHI 的操作数：(val0, predBB0, val1, predBB1, ...)
+            for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                auto* predBB = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+                if (!predBB) continue;
+                EdgeKey key{predBB, bb.get()};
+                phiMoveMap[key].push_back({inst.get(), inst->getOperand(i)});
+            }
+        }
+    }
+}
+
+void TargetCodeGen::emitPhiMovesForEdge(IR::BasicBlock* from, IR::BasicBlock* to) {
+    if (!from || !to) return;
+    auto it = phiMoveMap.find({from, to});
+    if (it == phiMoveMap.end() || it->second.empty()) return;
+
+    auto& moves = it->second;
+
+    // 简单情况：只有 1 个 PHI move，直接发射
+    if (moves.size() == 1) {
+        auto* phi = moves[0].phi;
+        auto* incoming = moves[0].incoming;
+
+        bool isFloat = phi->getType() && phi->getType()->isFloat();
+        bool isPointer = phi->getType() && phi->getType()->isPointer();
+        std::string phiReg = regAlloc.hasReg(phi) ? regAlloc.getReg(phi) : "";
+        std::string srcReg = (incoming && regAlloc.hasReg(incoming)) ? regAlloc.getReg(incoming) : "";
+
+        if (!phiReg.empty() && !srcReg.empty()) {
+            // 两者都在寄存器中
+            if (phiReg != srcReg) {
+                emitter.emitText("  " + std::string(isFloat ? "fmv.s" : "mv") + "  " + phiReg + ", " + srcReg);
+            }
+        } else if (!phiReg.empty()) {
+            // PHI 在寄存器，incoming 是常量或在栈上
+            if (auto* ci = dynamic_cast<IR::ConstantInt*>(incoming)) {
+                emitter.emitText("  li  " + phiReg + ", " + std::to_string(ci->getValue()));
+            } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(incoming)) {
+                union { float f; uint32_t i; } u;
+                u.f = static_cast<float>(cf->getValue());
+                emitter.emitText("  li  t2, " + std::to_string(u.i));
+                emitter.emitText("  fmv.w.x  " + phiReg + ", t2");
+            } else {
+                // 从栈加载
+                int srcOffset = getStackOffset(incoming);
+                if (srcOffset >= 0) {
+                    std::string loadInsn = isFloat ? "flw" : (isPointer ? "ld" : "lw");
+                    emitter.emitText(emitStackLoad(phiReg, srcOffset, loadInsn));
+                }
+            }
+        } else if (!srcReg.empty()) {
+            // PHI 在栈上，incoming 在寄存器
+            int phiOffset = getStackOffset(phi);
+            if (phiOffset >= 0) {
+                std::string storeInsn = isFloat ? "fsw" : (isPointer ? "sd" : "sw");
+                emitter.emitText(emitStackStore(srcReg, phiOffset, storeInsn));
+            }
+        } else {
+            // 两者都在栈上（或 incoming 是常量），通过临时寄存器中转
+            int phiOffset = getStackOffset(phi);
+            if (phiOffset < 0) return;
+
+            if (auto* ci = dynamic_cast<IR::ConstantInt*>(incoming)) {
+                emitter.emitText("  li  t0, " + std::to_string(ci->getValue()));
+                emitter.emitText(emitStackStore("t0", phiOffset, isPointer ? "sd" : "sw"));
+            } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(incoming)) {
+                union { float f; uint32_t i; } u;
+                u.f = static_cast<float>(cf->getValue());
+                emitter.emitText("  li  t2, " + std::to_string(u.i));
+                emitter.emitText("  fmv.w.x  ft0, t2");
+                emitter.emitText(emitStackStore("ft0", phiOffset, "fsw"));
+            } else {
+                int srcOffset = getStackOffset(incoming);
+                if (srcOffset >= 0) {
+                    std::string loadInsn = isFloat ? "flw" : (isPointer ? "ld" : "lw");
+                    std::string storeInsn = isFloat ? "fsw" : (isPointer ? "sd" : "sw");
+                    std::string tmpReg = isFloat ? "ft0" : "t0";
+                    emitter.emitText(emitStackLoad(tmpReg, srcOffset, loadInsn));
+                    emitter.emitText(emitStackStore(tmpReg, phiOffset, storeInsn));
+                }
+            }
+        }
+        return;
+    }
+
+    // 多个 PHI moves：需要处理并行拷贝（避免循环覆盖）
+    // 收集所有 (destReg, srcReg) 对，其中 srcReg 和 destReg 都在寄存器中
+    struct MovePair {
+        std::string destReg;
+        std::string srcReg;
+        bool isFloat;
+        bool isPointer;
+        IR::Instruction* phi;
+        IR::Value* incoming;
+    };
+    std::vector<MovePair> regMoves;
+    std::vector<MovePair> stackMoves;  // 需要通过栈中转的 moves
+
+    for (auto& m : moves) {
+        auto* phi = m.phi;
+        auto* incoming = m.incoming;
+        bool isFloat = phi->getType() && phi->getType()->isFloat();
+        bool isPointer = phi->getType() && phi->getType()->isPointer();
+
+        std::string phiReg = regAlloc.hasReg(phi) ? regAlloc.getReg(phi) : "";
+        std::string srcReg = (incoming && regAlloc.hasReg(incoming)) ? regAlloc.getReg(incoming) : "";
+
+        if (!phiReg.empty() && !srcReg.empty() && phiReg != srcReg) {
+            regMoves.push_back({phiReg, srcReg, isFloat, isPointer, phi, incoming});
+        } else if (!phiReg.empty() && srcReg.empty()) {
+            // PHI 在寄存器，incoming 不在 → 需要特殊处理
+            stackMoves.push_back({phiReg, "", isFloat, isPointer, phi, incoming});
+        } else if (phiReg.empty() && !srcReg.empty()) {
+            // PHI 不在寄存器，incoming 在寄存器 → 存到栈
+            stackMoves.push_back({"", srcReg, isFloat, isPointer, phi, incoming});
+        } else if (phiReg.empty() && srcReg.empty()) {
+            // 两者都不在寄存器 → 通过临时寄存器中转
+            stackMoves.push_back({"", "", isFloat, isPointer, phi, incoming});
+        }
+        // phiReg == srcReg 时无需 move
+    }
+
+    // 先处理非寄存器 moves（不会产生循环依赖）
+    for (auto& m : stackMoves) {
+        int phiOffset = getStackOffset(m.phi);
+        if (m.destReg.empty() && m.srcReg.empty()) {
+            // 两者都在栈上
+            if (phiOffset < 0) continue;
+            if (auto* ci = dynamic_cast<IR::ConstantInt*>(m.incoming)) {
+                emitter.emitText("  li  t0, " + std::to_string(ci->getValue()));
+                emitter.emitText(emitStackStore("t0", phiOffset, m.isPointer ? "sd" : "sw"));
+            } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(m.incoming)) {
+                union { float f; uint32_t i; } u;
+                u.f = static_cast<float>(cf->getValue());
+                emitter.emitText("  li  t2, " + std::to_string(u.i));
+                emitter.emitText("  fmv.w.x  ft0, t2");
+                emitter.emitText(emitStackStore("ft0", phiOffset, "fsw"));
+            } else {
+                int srcOffset = getStackOffset(m.incoming);
+                if (srcOffset >= 0) {
+                    std::string loadInsn = m.isFloat ? "flw" : (m.isPointer ? "ld" : "lw");
+                    std::string storeInsn = m.isFloat ? "fsw" : (m.isPointer ? "sd" : "sw");
+                    std::string tmpReg = m.isFloat ? "ft0" : "t0";
+                    emitter.emitText(emitStackLoad(tmpReg, srcOffset, loadInsn));
+                    emitter.emitText(emitStackStore(tmpReg, phiOffset, storeInsn));
+                }
+            }
+        } else if (m.destReg.empty()) {
+            // PHI 在栈上，incoming 在寄存器
+            if (phiOffset < 0) continue;
+            std::string storeInsn = m.isFloat ? "fsw" : (m.isPointer ? "sd" : "sw");
+            emitter.emitText(emitStackStore(m.srcReg, phiOffset, storeInsn));
+        } else {
+            // PHI 在寄存器，incoming 不在
+            if (auto* ci = dynamic_cast<IR::ConstantInt*>(m.incoming)) {
+                emitter.emitText("  li  " + m.destReg + ", " + std::to_string(ci->getValue()));
+            } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(m.incoming)) {
+                union { float f; uint32_t i; } u;
+                u.f = static_cast<float>(cf->getValue());
+                emitter.emitText("  li  t2, " + std::to_string(u.i));
+                emitter.emitText("  fmv.w.x  " + m.destReg + ", t2");
+            } else {
+                int srcOffset = getStackOffset(m.incoming);
+                if (srcOffset >= 0) {
+                    std::string loadInsn = m.isFloat ? "flw" : (m.isPointer ? "ld" : "lw");
+                    emitter.emitText(emitStackLoad(m.destReg, srcOffset, loadInsn));
+                }
+            }
+        }
+    }
+
+    // 处理寄存器-寄存器 moves（可能有循环依赖）
+    // 简单方法：检测循环并使用临时寄存器破环
+    if (regMoves.empty()) return;
+
+    // 分离 int 和 float moves
+    std::vector<MovePair*> intMoves, floatMoves;
+    for (auto& m : regMoves) {
+        if (m.isFloat) floatMoves.push_back(&m);
+        else intMoves.push_back(&m);
+    }
+
+    // 处理一类 moves（int 或 float）
+    // 并行拷贝解析：拓扑排序 + 破环
+    // 一个 move i 可以执行当且仅当它的 dest 不是任何 UNDONE move 的 src
+    // （即不会覆盖别人还需要读的值）
+    auto processMoves = [&](std::vector<MovePair*>& moves, const std::string& scratchReg) {
+        if (moves.empty()) return;
+
+        std::vector<bool> done(moves.size(), false);
+        int remaining = static_cast<int>(moves.size());
+        int redirectIdx = -1;  // 破环后需要从 scratch 读取的 move 索引
+
+        // 拓扑扫描：执行不被其他 move 阻塞的 move
+        auto topologicalScan = [&]() -> bool {
+            bool anyProgress = true;
+            while (anyProgress && remaining > 0) {
+                anyProgress = false;
+                for (int i = 0; i < (int)moves.size(); ++i) {
+                    if (done[i]) continue;
+                    bool blocked = false;
+                    for (int j = 0; j < (int)moves.size(); ++j) {
+                        if (i != j && !done[j] &&
+                            moves[j]->srcReg == moves[i]->destReg) {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                    if (!blocked) {
+                        std::string src = (i == redirectIdx) ? scratchReg : moves[i]->srcReg;
+                        emitter.emitText("  " + std::string(moves[i]->isFloat ? "fmv.s" : "mv") +
+                                         "  " + moves[i]->destReg + ", " + src);
+                        done[i] = true;
+                        remaining--;
+                        anyProgress = true;
+                    }
+                }
+            }
+            return anyProgress;
+        };
+
+        // Phase 1: 拓扑扫描
+        topologicalScan();
+
+        // Phase 2: 破环（处理一个或多个独立循环）
+        while (remaining > 0) {
+            int start = -1;
+            for (int i = 0; i < (int)moves.size(); ++i) {
+                if (!done[i]) { start = i; break; }
+            }
+            if (start < 0) break;
+
+            // 保存 start->dest 到 scratch，然后执行 start
+            emitter.emitText("  " + std::string(moves[start]->isFloat ? "fmv.s" : "mv") +
+                             "  " + scratchReg + ", " + moves[start]->destReg);
+            emitter.emitText("  " + std::string(moves[start]->isFloat ? "fmv.s" : "mv") +
+                             "  " + moves[start]->destReg + ", " + moves[start]->srcReg);
+            done[start] = true;
+            remaining--;
+
+            // 找到读取 start->dest 旧值的 move，标记它从 scratch 读取
+            redirectIdx = -1;
+            for (int j = 0; j < (int)moves.size(); ++j) {
+                if (!done[j] && moves[j]->srcReg == moves[start]->destReg) {
+                    redirectIdx = j;
+                    break;
+                }
+            }
+
+            // 重新拓扑扫描，环已断开，剩余的链可按序执行
+            topologicalScan();
+            redirectIdx = -1;
+        }
+    };
+
+    processMoves(intMoves, "t0");
+    processMoves(floatMoves, "ft0");
+}
+
+std::string TargetCodeGen::emitValueToStack(IR::Value* val, int stackOffset, bool isFloat) {
+    std::string result;
+    std::string tmpReg = isFloat ? "ft0" : "t0";
+    result += loadToReg(val, tmpReg);
+    bool isPointer = val && val->getType() && val->getType()->isPointer();
+    std::string storeInsn = isFloat ? "fsw" : (isPointer ? "sd" : "sw");
+    result += emitStackStore(tmpReg, stackOffset, storeInsn);
+    return result;
 }
 
 std::string TargetCodeGen::loadToReg(IR::Value* val, const std::string& destReg) {
@@ -872,18 +1484,94 @@ void TargetCodeGen::emitRet(IR::Instruction& inst) {
 
 void TargetCodeGen::emitBr(IR::Instruction& inst) {
     auto* target = dynamic_cast<IR::BasicBlock*>(inst.getOperand(0));
+    emitPhiMovesForEdge(currentBB, target);
     emitter.emitText("  j       .L" + currentFunc->getName() + "_" + target->getName());
 }
 
 void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
-    std::string code;
-    // Use loadToReg to handle constants (li) and variables (mv/stack load)
-    code += loadToReg(inst.getOperand(0), "t0");
     auto* thenBB = dynamic_cast<IR::BasicBlock*>(inst.getOperand(1));
     auto* elseBB = dynamic_cast<IR::BasicBlock*>(inst.getOperand(2));
-    code += "  bnez    t0, .L" + currentFunc->getName() + "_" + thenBB->getName() + "\n";
-    code += "  j       .L" + currentFunc->getName() + "_" + elseBB->getName() + "\n";
+
+    // 检查条件是否来自已内联的 ICMP 指令
+    auto* condVal = inst.getOperand(0);
+    auto* icmp = dynamic_cast<IR::Instruction*>(condVal);
+    if (icmp && inlinedIcmps.count(icmp)) {
+        std::string cond = icmp->getName(); // eq/ne/slt/sle/sgt/sge
+        auto* op0 = icmp->getOperand(0);
+        auto* op1 = icmp->getOperand(1);
+
+        std::string code;
+        std::string r0 = getValueReg(op0);
+        bool op0InReg = !r0.empty();
+        if (!op0InReg) {
+            code += loadToReg(op0, "t0");
+            r0 = "t0";
+        }
+
+        std::string edgeLabel = ".L" + currentFunc->getName() + "_edge_" +
+                                std::to_string(labelCounter++);
+
+        // 与常量 0 比较时使用 beqz/bnez
+        auto* ci1 = dynamic_cast<IR::ConstantInt*>(op1);
+        if (ci1 && ci1->getValue() == 0 && (cond == "eq" || cond == "ne")) {
+            if (cond == "eq")
+                code += "  beqz    " + r0 + ", " + edgeLabel + "\n";
+            else
+                code += "  bnez    " + r0 + ", " + edgeLabel + "\n";
+        } else {
+            // 两个寄存器操作数的分支指令
+            std::string r1 = getValueReg(op1);
+            bool op1InReg = !r1.empty();
+            if (!op1InReg) {
+                code += loadToReg(op1, "t1");
+                r1 = "t1";
+            }
+            if (cond == "eq")
+                code += "  beq     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+            else if (cond == "ne")
+                code += "  bne     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+            else if (cond == "slt")
+                code += "  blt     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+            else if (cond == "sle")
+                code += "  bge     " + r1 + ", " + r0 + ", " + edgeLabel + "\n";
+            else if (cond == "sgt")
+                code += "  blt     " + r1 + ", " + r0 + ", " + edgeLabel + "\n";
+            else if (cond == "sge")
+                code += "  bge     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+            else
+                code += "  bne     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+        }
+
+        emitter.emitText(code);
+
+        // False 分支：PHI moves + 跳转
+        emitPhiMovesForEdge(currentBB, elseBB);
+        emitter.emitText("  j       .L" + currentFunc->getName() + "_" + elseBB->getName());
+
+        // True 分支：标签 + PHI moves + 跳转
+        emitter.emitText(edgeLabel + ":");
+        emitPhiMovesForEdge(currentBB, thenBB);
+        emitter.emitText("  j       .L" + currentFunc->getName() + "_" + thenBB->getName());
+        return;
+    }
+
+    // 一般路径：加载条件到 t0，使用 bnez
+    std::string code;
+    code += loadToReg(inst.getOperand(0), "t0");
+
+    std::string edgeLabel = ".L" + currentFunc->getName() + "_edge_" +
+                            std::to_string(labelCounter++);
+    code += "  bnez    t0, " + edgeLabel + "\n";
     emitter.emitText(code);
+
+    // False 分支：先发射 PHI moves，再跳转
+    emitPhiMovesForEdge(currentBB, elseBB);
+    emitter.emitText("  j       .L" + currentFunc->getName() + "_" + elseBB->getName());
+
+    // True 分支：标签 + PHI moves + 跳转
+    emitter.emitText(edgeLabel + ":");
+    emitPhiMovesForEdge(currentBB, thenBB);
+    emitter.emitText("  j       .L" + currentFunc->getName() + "_" + thenBB->getName());
 }
 
 std::string TargetCodeGen::getValueReg(IR::Value* val) {
@@ -893,8 +1581,206 @@ std::string TargetCodeGen::getValueReg(IR::Value* val) {
     return "";
 }
 
+std::string TargetCodeGen::getValueRegIfAny(IR::Value* val) {
+    // 先检查寄存器分配器
+    if (regAlloc.hasReg(val)) {
+        return regAlloc.getReg(val);
+    }
+    // 再检查全局变量地址缓存
+    if (auto* gv = dynamic_cast<IR::GlobalVariable*>(val)) {
+        auto it = globalAddrCache.find(gv);
+        if (it != globalAddrCache.end()) {
+            return it->second;
+        }
+    }
+    // 检查已提升的 ALLOCA
+    auto promotedIt = promotedAllocas.find(val);
+    if (promotedIt != promotedAllocas.end()) {
+        return promotedIt->second;
+    }
+    return "";
+}
+
 void TargetCodeGen::emitBinOp(IR::Instruction& inst) {
     std::string code;
+
+    using Opc = IR::Instruction::Opcode;
+
+    // 检查操作数 1 是否是 imm12 范围内的常量，优化 ADD/SUB/AND/OR/XOR/SHL/ASHR/MUL(2的幂)
+    auto* ci1 = dynamic_cast<IR::ConstantInt*>(inst.getOperand(1));
+    if (ci1 && -2048 <= ci1->getValue() && ci1->getValue() <= 2047) {
+        if (inst.getOpcode() == Opc::ADD || inst.getOpcode() == Opc::SUB) {
+            std::string r0 = getValueReg(inst.getOperand(0));
+            std::string rd = getValueReg(&inst);
+            bool op0InReg = !r0.empty();
+            bool rdInReg = !rd.empty();
+
+            if (!op0InReg) code += loadToReg(inst.getOperand(0), "t0");
+            std::string op0 = op0InReg ? r0 : "t0";
+            std::string dest = rdInReg ? rd : "t0";
+
+            int64_t imm = ci1->getValue();
+            if (inst.getOpcode() == Opc::SUB) imm = -imm;
+            code += "  addiw   " + dest + ", " + op0 + ", " + std::to_string(imm) + "\n";
+
+            if (!rdInReg) code += storeFromReg(&inst, dest);
+            emitter.emitText(code);
+            return;
+        }
+        // AND/OR/XOR 与 imm12 常量：用 andi/ori/xori 代替 li+and/or/xor（省 1 条 li）
+        // 语义一致：imm12 符号扩展到 64 位，与先 li（符号扩展）再 64 位 and/or/xor 结果相同
+        // SHL/ASHR 与 0-31 常量：用 slliw/sraiw 代替 li+sllw/sraw（省 1 条 li）
+        // MUL 与 2 的幂（1-2048，log2 0-11）：用 slliw 代替 li+mulw（省 1 条 li + 减少 mul 延迟）
+        if (inst.getOpcode() == Opc::AND || inst.getOpcode() == Opc::OR
+            || inst.getOpcode() == Opc::XOR || inst.getOpcode() == Opc::SHL
+            || inst.getOpcode() == Opc::ASHR || inst.getOpcode() == Opc::MUL) {
+            int64_t imm = ci1->getValue();
+            std::string mnemonic;
+            bool canOptimize = true;
+            if (inst.getOpcode() == Opc::AND) mnemonic = "andi";
+            else if (inst.getOpcode() == Opc::OR) mnemonic = "ori";
+            else if (inst.getOpcode() == Opc::XOR) mnemonic = "xori";
+            else if (inst.getOpcode() == Opc::SHL) {
+                if (imm < 0 || imm > 31) canOptimize = false;
+                else mnemonic = "slliw";
+            } else if (inst.getOpcode() == Opc::ASHR) {
+                if (imm < 0 || imm > 31) canOptimize = false;
+                else mnemonic = "sraiw";
+            } else { // MUL
+                // 2 的幂检查（imm > 0 且只有 1 个 bit）
+                if (imm <= 0 || (imm & (imm - 1)) != 0) canOptimize = false;
+                else {
+                    int shift = 0;
+                    int64_t v = imm;
+                    while (v > 1) { v >>= 1; shift++; }
+                    if (shift > 31) canOptimize = false;
+                    else {
+                        mnemonic = "slliw";
+                        imm = shift;
+                    }
+                }
+            }
+            if (canOptimize) {
+                std::string r0 = getValueReg(inst.getOperand(0));
+                std::string rd = getValueReg(&inst);
+                bool op0InReg = !r0.empty();
+                bool rdInReg = !rd.empty();
+
+                if (!op0InReg) code += loadToReg(inst.getOperand(0), "t0");
+                std::string op0 = op0InReg ? r0 : "t0";
+                std::string dest = rdInReg ? rd : "t0";
+
+                code += "  " + mnemonic + ((int)mnemonic.size() >= 5 ? "   " : "    ")
+                        + dest + ", " + op0 + ", " + std::to_string(imm) + "\n";
+
+                if (!rdInReg) code += storeFromReg(&inst, dest);
+                emitter.emitText(code);
+                return;
+            }
+        }
+    }
+
+    // 检查操作数 0 是否是 imm12 范围内的常量（可交换操作：ADD/AND/OR/XOR/MUL(2的幂)）
+    auto* ci0 = dynamic_cast<IR::ConstantInt*>(inst.getOperand(0));
+    if (ci0 && -2048 <= ci0->getValue() && ci0->getValue() <= 2047
+        && (inst.getOpcode() == Opc::ADD || inst.getOpcode() == Opc::AND
+            || inst.getOpcode() == Opc::OR || inst.getOpcode() == Opc::XOR
+            || inst.getOpcode() == Opc::MUL)) {
+        int64_t imm = ci0->getValue();
+        std::string mnemonic;
+        bool canOptimize = true;
+        if (inst.getOpcode() == Opc::ADD) mnemonic = "addiw";
+        else if (inst.getOpcode() == Opc::AND) mnemonic = "andi";
+        else if (inst.getOpcode() == Opc::OR) mnemonic = "ori";
+        else if (inst.getOpcode() == Opc::XOR) mnemonic = "xori";
+        else { // MUL — 仅 2 的幂可优化为 slliw
+            if (imm <= 0 || (imm & (imm - 1)) != 0) canOptimize = false;
+            else {
+                int shift = 0;
+                int64_t v = imm;
+                while (v > 1) { v >>= 1; shift++; }
+                if (shift > 31) canOptimize = false;
+                else {
+                    mnemonic = "slliw";
+                    imm = shift;
+                }
+            }
+        }
+        if (canOptimize) {
+            std::string r1 = getValueReg(inst.getOperand(1));
+            std::string rd = getValueReg(&inst);
+            bool op1InReg = !r1.empty();
+            bool rdInReg = !rd.empty();
+
+            if (!op1InReg) code += loadToReg(inst.getOperand(1), "t0");
+            std::string op1 = op1InReg ? r1 : "t0";
+            std::string dest = rdInReg ? rd : "t0";
+
+            code += "  " + mnemonic + ((int)mnemonic.size() >= 5 ? "   " : "    ")
+                    + dest + ", " + op1 + ", " + std::to_string(imm) + "\n";
+
+            if (!rdInReg) code += storeFromReg(&inst, dest);
+            emitter.emitText(code);
+            return;
+        }
+    }
+
+    // 大常量缓存：当操作数是大常量且已在 constantCache 中时，直接使用缓存的 callee-saved 寄存器
+    // 典型场景：mul %i, 5600（数组行步长），避免每次发射 li t2, 5600
+    {
+        auto tryConstCache = [&](IR::ConstantInt* ci, unsigned opIdx, unsigned otherIdx) -> bool {
+            if (!ci) return false;
+            int64_t val = ci->getValue();
+            if (val >= -2048 && val <= 2047) return false;  // imm12 已由上面处理
+            auto cacheIt = constantCache.find(val);
+            if (cacheIt == constantCache.end()) return false;
+
+            std::string rOther = getValueReg(inst.getOperand(otherIdx));
+            std::string rd = getValueReg(&inst);
+            bool otherInReg = !rOther.empty();
+            bool rdInReg = !rd.empty();
+
+            if (!otherInReg) code += loadToReg(inst.getOperand(otherIdx), "t0");
+            std::string opOther = otherInReg ? rOther : "t0";
+            std::string dest = rdInReg ? rd : "t0";
+            std::string cachedReg = cacheIt->second;
+
+            switch (inst.getOpcode()) {
+            case Opc::ADD:  code += "  addw    " + dest + ", " + opOther + ", " + cachedReg + "\n"; break;
+            case Opc::SUB:
+                if (opIdx == 1) {
+                    // dest = op0 - cachedConst
+                    code += "  subw    " + dest + ", " + opOther + ", " + cachedReg + "\n";
+                } else {
+                    // dest = cachedConst - op1，SUB 不可交换，无法用单条指令完成，回退
+                    return false;
+                }
+                break;
+            case Opc::MUL:  code += "  mulw    " + dest + ", " + opOther + ", " + cachedReg + "\n"; break;
+            case Opc::AND:  code += "  and     " + dest + ", " + opOther + ", " + cachedReg + "\n"; break;
+            case Opc::OR:   code += "  or      " + dest + ", " + opOther + ", " + cachedReg + "\n"; break;
+            case Opc::XOR:  code += "  xor     " + dest + ", " + opOther + ", " + cachedReg + "\n"; break;
+            default: return false;  // SDIV/SREM/SHL/ASHR 暂不处理
+            }
+
+            if (!rdInReg) code += storeFromReg(&inst, dest);
+            emitter.emitText(code);
+            return true;
+        };
+
+        // 先检查操作数 1（非交换操作也适用）
+        if (tryConstCache(ci1, 1, 0)) return;
+        // 再检查操作数 0（仅交换操作：ADD/MUL/AND/OR/XOR）
+        if (ci0) {
+            switch (inst.getOpcode()) {
+            case Opc::ADD: case Opc::MUL:
+            case Opc::AND: case Opc::OR: case Opc::XOR:
+                if (tryConstCache(ci0, 0, 1)) return;
+                break;
+            default: break;
+            }
+        }
+    }
 
     std::string r0 = getValueReg(inst.getOperand(0));
     std::string r1 = getValueReg(inst.getOperand(1));
@@ -911,7 +1797,6 @@ void TargetCodeGen::emitBinOp(IR::Instruction& inst) {
     std::string op1 = op1InReg ? r1 : "t1";
     std::string dest = rdInReg ? rd : "t0";
 
-    using Opc = IR::Instruction::Opcode;
     switch (inst.getOpcode()) {
     case Opc::ADD:  code += "  addw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
     case Opc::SUB:  code += "  subw    " + dest + ", " + op0 + ", " + op1 + "\n"; break;
@@ -973,6 +1858,9 @@ void TargetCodeGen::emitFBinOp(IR::Instruction& inst) {
 }
 
 void TargetCodeGen::emitIcmp(IR::Instruction& inst) {
+    // 如果 ICMP 已被 COND_BR 内联，跳过代码生成
+    if (inlinedIcmps.count(&inst)) return;
+
     auto* condType = inst.getOperand(0)->getType();
     bool isFloat = condType && condType->isFloat();
 
@@ -1012,6 +1900,71 @@ void TargetCodeGen::emitIcmp(IR::Instruction& inst) {
 
     std::string code;
 
+    // 优化：与常量 0 比较时使用 seqz/snez
+    auto* ci1 = dynamic_cast<IR::ConstantInt*>(inst.getOperand(1));
+    std::string cond = inst.getName();
+
+    if (ci1 && ci1->getValue() == 0 && (cond == "eq" || cond == "ne")) {
+        std::string r0 = getValueReg(inst.getOperand(0));
+        std::string rd = getValueReg(&inst);
+        bool op0InReg = !r0.empty();
+        bool rdInReg = !rd.empty();
+
+        if (!op0InReg) code += loadToReg(inst.getOperand(0), "t0");
+        std::string op0 = op0InReg ? r0 : "t0";
+        std::string dest = rdInReg ? rd : "t0";
+
+        if (cond == "eq") code += "  seqz    " + dest + ", " + op0 + "\n";
+        else code += "  snez    " + dest + ", " + op0 + "\n";
+
+        if (!rdInReg) code += storeFromReg(&inst, dest);
+        emitter.emitText(code);
+        return;
+    }
+
+    // 优化：与 imm12 范围内的常量比较时使用 slti（slt/sge/sgt/sle）
+    //       或 addi+seqz/snez（eq/ne）代替 li+sub+seqz/snez
+    bool usedSlti = false;
+    if (ci1 && -2048 <= ci1->getValue() && ci1->getValue() <= 2047
+        && (cond == "slt" || cond == "sge" || cond == "sgt" || cond == "sle"
+            || cond == "eq" || cond == "ne")) {
+        std::string r0 = getValueReg(inst.getOperand(0));
+        std::string rd = getValueReg(&inst);
+        bool op0InReg = !r0.empty();
+        bool rdInReg = !rd.empty();
+
+        if (!op0InReg) code += loadToReg(inst.getOperand(0), "t0");
+        std::string op0 = op0InReg ? r0 : "t0";
+        std::string dest = rdInReg ? rd : "t0";
+
+        if (cond == "slt") {
+            code += "  slti    " + dest + ", " + op0 + ", " + std::to_string(ci1->getValue()) + "\n";
+        } else if (cond == "sge") {
+            code += "  slti    " + dest + ", " + op0 + ", " + std::to_string(ci1->getValue()) + "\n";
+            code += "  xori    " + dest + ", " + dest + ", 1\n";
+        } else if (cond == "sgt") {
+            code += "  slti    " + dest + ", " + op0 + ", " + std::to_string(ci1->getValue() + 1) + "\n";
+            code += "  xori    " + dest + ", " + dest + ", 1\n";
+        } else if (cond == "sle") {
+            code += "  slti    " + dest + ", " + op0 + ", " + std::to_string(ci1->getValue() + 1) + "\n";
+        } else if (cond == "eq") {
+            // eq: (op0 - imm == 0) → addi dest, op0, -imm; seqz dest, dest
+            code += "  addi    " + dest + ", " + op0 + ", " + std::to_string(-ci1->getValue()) + "\n";
+            code += "  seqz    " + dest + ", " + dest + "\n";
+        } else { // ne
+            // ne: (op0 - imm != 0) → addi dest, op0, -imm; snez dest, dest
+            code += "  addi    " + dest + ", " + op0 + ", " + std::to_string(-ci1->getValue()) + "\n";
+            code += "  snez    " + dest + ", " + dest + "\n";
+        }
+
+        if (!rdInReg) code += storeFromReg(&inst, dest);
+        emitter.emitText(code);
+        usedSlti = true;
+    }
+
+    if (usedSlti) return;
+
+    {
     std::string r0 = getValueReg(inst.getOperand(0));
     std::string r1 = getValueReg(inst.getOperand(1));
     std::string rd = getValueReg(&inst);
@@ -1027,7 +1980,6 @@ void TargetCodeGen::emitIcmp(IR::Instruction& inst) {
     std::string op1 = op1InReg ? r1 : "t1";
     std::string dest = rdInReg ? rd : "t0";
 
-    std::string cond = inst.getName();
     if (cond == "eq")  code += "  sub     " + dest + ", " + op0 + ", " + op1 + "\n  seqz    " + dest + ", " + dest + "\n";
     else if (cond == "ne")  code += "  sub     " + dest + ", " + op0 + ", " + op1 + "\n  snez    " + dest + ", " + dest + "\n";
     else if (cond == "slt") code += "  slt     " + dest + ", " + op0 + ", " + op1 + "\n";
@@ -1040,6 +1992,7 @@ void TargetCodeGen::emitIcmp(IR::Instruction& inst) {
         code += storeFromReg(&inst, dest);
     }
     emitter.emitText(code);
+    }
 }
 
 void TargetCodeGen::emitFcmp(IR::Instruction& inst) {
@@ -1102,10 +2055,26 @@ void TargetCodeGen::emitLoad(IR::Instruction& inst) {
     // 则内联地址计算，避免存储/加载 GEP 结果的往返开销
     auto* gepInst = dynamic_cast<IR::Instruction*>(ptrOp);
     bool isFoldedGep = gepInst && foldedGeps.count(gepInst);
+
+    // 地址寄存器优化：如果地址已在寄存器中，直接使用该寄存器，省略 mv t0, addrReg
+    std::string addrReg;
     if (isFoldedGep) {
         code += emitGEPAddressToReg(*gepInst, "t0");
+        addrReg = "t0";
     } else {
-        code += loadToReg(ptrOp, "t0");
+        // 检查地址操作数是否已在寄存器中
+        if (regAlloc.hasReg(ptrOp)) {
+            addrReg = regAlloc.getReg(ptrOp);
+        } else {
+            auto allocaIt = promotedAllocas.find(ptrOp);
+            if (allocaIt != promotedAllocas.end()) {
+                addrReg = allocaIt->second;
+            }
+        }
+        if (addrReg.empty()) {
+            code += loadToReg(ptrOp, "t0");
+            addrReg = "t0";
+        }
     }
 
     auto* loadTy = inst.getType();
@@ -1115,15 +2084,15 @@ void TargetCodeGen::emitLoad(IR::Instruction& inst) {
 
     if (loadTy && loadTy->isFloat()) {
         std::string dest = rdInReg ? rd : "ft0";
-        code += "  flw     " + dest + ", 0(t0)\n";
+        code += "  flw     " + dest + ", 0(" + addrReg + ")\n";
         if (!rdInReg) code += storeFromReg(&inst, dest);
     } else if (loadTy && loadTy->isPointer()) {
         std::string dest = rdInReg ? rd : "t0";
-        code += "  ld      " + dest + ", 0(t0)\n";
+        code += "  ld      " + dest + ", 0(" + addrReg + ")\n";
         if (!rdInReg) code += storeFromReg(&inst, dest);
     } else {
         std::string dest = rdInReg ? rd : "t0";
-        code += "  lw      " + dest + ", 0(t0)\n";
+        code += "  lw      " + dest + ", 0(" + addrReg + ")\n";
         if (!rdInReg) code += storeFromReg(&inst, dest);
     }
     emitter.emitText(code);
@@ -1168,32 +2137,115 @@ void TargetCodeGen::emitStore(IR::Instruction& inst) {
 
     auto* valTy = inst.getOperand(0)->getType();
     if (valTy && valTy->isFloat()) {
-        code += loadToReg(inst.getOperand(0), "ft0");
-        // 浮点存储：值在 ft0，地址可用 t0（不与 GEP 内部使用的 t1/t3 冲突）
+        // 浮点存储优化：值已在寄存器中时直接使用，省略 fmv
+        std::string valReg = getValueReg(inst.getOperand(0));
+        if (valReg.empty()) {
+            code += loadToReg(inst.getOperand(0), "ft0");
+            valReg = "ft0";
+        }
+        // 浮点存储：值在 valReg，地址可用 t0（不与 GEP 内部使用的 t1/t3 冲突）
         if (isFoldedGep) {
             code += emitGEPAddressToReg(*gepInst, "t0");
+            code += "  fsw     " + valReg + ", 0(t0)\n";
         } else {
-            code += loadToReg(inst.getOperand(1), "t0");
+            // 检查地址操作数是否已在寄存器中
+            auto* addrOp = inst.getOperand(1);
+            std::string addrReg;
+            if (regAlloc.hasReg(addrOp)) {
+                addrReg = regAlloc.getReg(addrOp);
+            } else {
+                auto allocaIt = promotedAllocas.find(addrOp);
+                if (allocaIt != promotedAllocas.end()) {
+                    addrReg = allocaIt->second;
+                }
+            }
+            if (!addrReg.empty()) {
+                code += "  fsw     " + valReg + ", 0(" + addrReg + ")\n";
+            } else {
+                code += loadToReg(addrOp, "t0");
+                code += "  fsw     " + valReg + ", 0(t0)\n";
+            }
         }
-        code += "  fsw     ft0, 0(t0)\n";
     } else if (valTy && valTy->isPointer()) {
-        code += loadToReg(inst.getOperand(0), "t0");
-        // 指针存储：值在 t0，地址用 t2（避免与 GEP 的 t1 索引寄存器冲突）
+        // 指针存储优化：
+        // 1. 如果值是常量 0（null 指针），使用 x0，省略 li 指令
+        // 2. 如果值已在寄存器中，直接使用，省略 mv
+        auto* valOp = inst.getOperand(0);
+        auto* ci = dynamic_cast<IR::ConstantInt*>(valOp);
+        bool valIsZero = ci && ci->getValue() == 0;
+        std::string valReg;
+        if (valIsZero) {
+            valReg = "x0";
+        } else {
+            valReg = getValueReg(valOp);
+            if (valReg.empty()) {
+                code += loadToReg(valOp, "t0");
+                valReg = "t0";
+            }
+        }
+        // 指针存储：值在 valReg，地址用 t2（避免与 GEP 的 t1 索引寄存器冲突）
         if (isFoldedGep) {
             code += emitGEPAddressToReg(*gepInst, "t2");
+            code += "  sd      " + valReg + ", 0(t2)\n";
         } else {
-            code += loadToReg(inst.getOperand(1), "t1");
+            auto* addrOp = inst.getOperand(1);
+            std::string addrReg;
+            if (regAlloc.hasReg(addrOp)) {
+                addrReg = regAlloc.getReg(addrOp);
+            } else {
+                auto allocaIt = promotedAllocas.find(addrOp);
+                if (allocaIt != promotedAllocas.end()) {
+                    addrReg = allocaIt->second;
+                }
+            }
+            if (!addrReg.empty()) {
+                code += "  sd      " + valReg + ", 0(" + addrReg + ")\n";
+            } else {
+                code += loadToReg(addrOp, "t1");
+                code += "  sd      " + valReg + ", 0(t1)\n";
+            }
         }
-        code += "  sd      t0, 0(" + std::string(isFoldedGep ? "t2" : "t1") + ")\n";
     } else {
-        code += loadToReg(inst.getOperand(0), "t0");
-        // 整数存储：值在 t0，地址用 t2（避免与 GEP 的 t1 索引寄存器冲突）
+        // 整数存储优化：
+        // 1. 如果值是常量 0，使用 x0（硬连线零寄存器），省略 li 指令
+        // 2. 如果值已在寄存器中，直接使用，省略 mv 指令
+        // 3. 如果地址已在寄存器中，直接使用该寄存器，省略 mv 指令
+        auto* valOp = inst.getOperand(0);
+        auto* ci = dynamic_cast<IR::ConstantInt*>(valOp);
+        bool valIsZero = ci && ci->getValue() == 0;
+        std::string valReg;
+        if (valIsZero) {
+            valReg = "x0";
+        } else {
+            valReg = getValueReg(valOp);
+            if (valReg.empty()) {
+                code += loadToReg(valOp, "t0");
+                valReg = "t0";
+            }
+        }
+        // 整数存储：值在 valReg，地址用 t2（避免与 GEP 的 t1 索引寄存器冲突）
         if (isFoldedGep) {
             code += emitGEPAddressToReg(*gepInst, "t2");
+            code += "  sw      " + valReg + ", 0(t2)\n";
         } else {
-            code += loadToReg(inst.getOperand(1), "t1");
+            // 检查地址操作数是否已在寄存器中（避免 mv t1, s4; sw t0, 0(t1)）
+            auto* addrOp = inst.getOperand(1);
+            std::string addrReg;
+            if (regAlloc.hasReg(addrOp)) {
+                addrReg = regAlloc.getReg(addrOp);
+            } else {
+                auto allocaIt = promotedAllocas.find(addrOp);
+                if (allocaIt != promotedAllocas.end()) {
+                    addrReg = allocaIt->second;
+                }
+            }
+            if (!addrReg.empty()) {
+                code += "  sw      " + valReg + ", 0(" + addrReg + ")\n";
+            } else {
+                code += loadToReg(addrOp, "t1");
+                code += "  sw      " + valReg + ", 0(t1)\n";
+            }
         }
-        code += "  sw      t0, 0(" + std::string(isFoldedGep ? "t2" : "t1") + ")\n";
     }
     emitter.emitText(code);
 }
@@ -1201,45 +2253,86 @@ void TargetCodeGen::emitStore(IR::Instruction& inst) {
 void TargetCodeGen::emitCall(IR::Instruction& inst) {
     std::string code;
 
-    // Save caller-saved registers that are in use before the call
-    std::string saveCode, restoreCode;
+    // Pre-compute stack offsets for all saved registers (matching prologue layout).
+    // This ensures caller-saved save offsets don't overlap with callee-saved saves.
+    std::unordered_map<std::string, int> regStackOffset;
     int csrOffset = stackSize - 8;
     for (auto& reg : regAlloc.getUsedCalleeSaved()) {
         csrOffset -= 8;
-        bool isCallerSaved = false;
-        if (reg.size() >= 2 && reg[0] == 't') isCallerSaved = true;           // t3-t6
-        if (reg.size() >= 3 && reg[0] == 'f' && reg[1] == 't') isCallerSaved = true; // ft*
-        if (isCallerSaved) {
-            if (reg[0] == 'f') {
-                if (fitsImm12(csrOffset)) {
-                    saveCode += "  fsd     " + reg + ", " + std::to_string(csrOffset) + "(sp)\n";
-                    restoreCode += "  fld     " + reg + ", " + std::to_string(csrOffset) + "(sp)\n";
-                } else {
-                    saveCode += "  li      t2, " + std::to_string(csrOffset) + "\n";
-                    saveCode += "  add     t2, sp, t2\n";
-                    saveCode += "  fsd     " + reg + ", 0(t2)\n";
-                    restoreCode += "  li      t2, " + std::to_string(csrOffset) + "\n";
-                    restoreCode += "  add     t2, sp, t2\n";
-                    restoreCode += "  fld     " + reg + ", 0(t2)\n";
-                }
-            } else {
-                if (fitsImm12(csrOffset)) {
-                    saveCode += "  sd      " + reg + ", " + std::to_string(csrOffset) + "(sp)\n";
-                    restoreCode += "  ld      " + reg + ", " + std::to_string(csrOffset) + "(sp)\n";
-                } else {
-                    saveCode += "  li      t2, " + std::to_string(csrOffset) + "\n";
-                    saveCode += "  add     t2, sp, t2\n";
-                    saveCode += "  sd      " + reg + ", 0(t2)\n";
-                    restoreCode += "  li      t2, " + std::to_string(csrOffset) + "\n";
-                    restoreCode += "  add     t2, sp, t2\n";
-                    restoreCode += "  ld      " + reg + ", 0(t2)\n";
-                }
-            }
-        }
+        regStackOffset[reg] = csrOffset;
+    }
+
+    // Save ONLY caller-saved registers that are live across this call.
+    // This avoids saving/restoring registers that aren't actually live here.
+    auto liveRegs = regAlloc.getRegsLiveAtCall(&inst);
+    std::unordered_map<std::string, int> savedRegOffsets;
+    std::string saveCode, restoreCode;
+    for (auto& reg : liveRegs) {
+        if (!isCallerSavedReg(reg)) continue;  // Callee-saved regs are preserved by callee
+        auto offsetIt = regStackOffset.find(reg);
+        if (offsetIt == regStackOffset.end()) continue;
+        int offset = offsetIt->second;
+        std::string storeInsn = isFloatReg(reg) ? "fsd" : "sd";
+        std::string loadInsn = isFloatReg(reg) ? "fld" : "ld";
+        saveCode += emitStackStore(reg, offset, storeInsn);
+        restoreCode += emitStackLoad(reg, offset, loadInsn);
+        savedRegOffsets[reg] = offset;
     }
     code += saveCode;
 
     unsigned numArgs = inst.getNumOperands() - 1;
+
+    // Pre-pass: Precisely detect register shuffling conflicts.
+    // For each parameter i, if its source register (where the value currently
+    // lives) is the target of any earlier parameter j (j < i), the source
+    // will be clobbered before parameter i is set up. Save ONLY these
+    // conflicting registers to minimize call-site overhead.
+    // The main loop's shuffling protection checks savedRegOffsets, which is
+    // populated by getRegsLiveAtCall — but parameter values are consumed
+    // (not live across) the call, so they aren't included there.
+    {
+        std::set<std::string> earlierTargetRegs;
+        unsigned tiReg = 0, tfReg = 0;
+        for (unsigned i = 0; i < numArgs; ++i) {
+            auto* argVal = inst.getOperand(i + 1);
+            auto* argTy = argVal->getType();
+            bool isFloat = argTy && argTy->isFloat();
+
+            // Compute this parameter's target register (same logic as main loop)
+            std::string targetReg;
+            if (isFloat && tfReg < 8) {
+                targetReg = std::string("fa") + std::to_string(tfReg++);
+            } else if (!isFloat && tiReg < 8) {
+                targetReg = std::string("a") + std::to_string(tiReg++);
+            }
+
+            // Check if this parameter's source register conflicts
+            if (regAlloc.hasReg(argVal)) {
+                std::string srcReg = regAlloc.getReg(argVal);
+                if (isArgReg(srcReg) && earlierTargetRegs.count(srcReg)) {
+                    // Source register is clobbered by an earlier parameter setup
+                    if (savedRegOffsets.find(srcReg) == savedRegOffsets.end()) {
+                        auto offsetIt = regStackOffset.find(srcReg);
+                        if (offsetIt != regStackOffset.end()) {
+                            int offset = offsetIt->second;
+                            std::string storeInsn = isFloatReg(srcReg) ? "fsd" : "sd";
+                            code += emitStackStore(srcReg, offset, storeInsn);
+                            savedRegOffsets[srcReg] = offset;
+                        }
+                    }
+                }
+            }
+
+            if (!targetReg.empty()) {
+                earlierTargetRegs.insert(targetReg);
+            }
+        }
+    }
+
+    // Set up arguments, handling register shuffling.
+    // When a value is in an argument register (a0-a7/fa0-fa7) that was saved
+    // to the stack above, load from the saved slot to avoid reading a
+    // clobbered register.
     unsigned iReg = 0;   // Next available integer argument register (a0-a7)
     unsigned fReg = 0;   // Next available float argument register (fa0-fa7)
     unsigned stackIdx = 0; // Stack parameter offset counter
@@ -1252,41 +2345,77 @@ void TargetCodeGen::emitCall(IR::Instruction& inst) {
 
         if (isFloat && fReg < 8) {
             std::string reg = std::string("fa") + std::to_string(fReg++);
+            // Check if source is in a saved argument register (shuffling risk)
+            if (regAlloc.hasReg(argVal)) {
+                std::string srcReg = regAlloc.getReg(argVal);
+                if (isArgReg(srcReg)) {
+                    auto it = savedRegOffsets.find(srcReg);
+                    if (it != savedRegOffsets.end()) {
+                        code += emitStackLoad(reg, it->second, "fld");
+                        continue;
+                    }
+                }
+            }
             code += loadToReg(argVal, reg);
         } else if (!isFloat && iReg < 8) {
             std::string reg = std::string("a") + std::to_string(iReg++);
+            if (regAlloc.hasReg(argVal)) {
+                std::string srcReg = regAlloc.getReg(argVal);
+                if (isArgReg(srcReg)) {
+                    auto it = savedRegOffsets.find(srcReg);
+                    if (it != savedRegOffsets.end()) {
+                        code += emitStackLoad(reg, it->second, "ld");
+                        continue;
+                    }
+                }
+            }
             code += loadToReg(argVal, reg);
         } else {
             // Arguments beyond registers: pass on the stack
             int stackOffset = stackIdx * 8;
             stackIdx++;
             if (isFloat) {
+                if (regAlloc.hasReg(argVal)) {
+                    std::string srcReg = regAlloc.getReg(argVal);
+                    if (isArgReg(srcReg)) {
+                        auto it = savedRegOffsets.find(srcReg);
+                        if (it != savedRegOffsets.end()) {
+                            code += emitStackLoad("ft0", it->second, "fld");
+                            code += emitStackStore("ft0", stackOffset, "fsw");
+                            continue;
+                        }
+                    }
+                }
                 code += loadToReg(argVal, "ft0");
-                if (fitsImm12(stackOffset)) {
-                    code += "  fsw     ft0, " + std::to_string(stackOffset) + "(sp)\n";
-                } else {
-                    code += "  li      t1, " + std::to_string(stackOffset) + "\n";
-                    code += "  add     t1, sp, t1\n";
-                    code += "  fsw     ft0, 0(t1)\n";
-                }
+                code += emitStackStore("ft0", stackOffset, "fsw");
             } else if (isPtr) {
-                code += loadToReg(argVal, "t0");
-                if (fitsImm12(stackOffset)) {
-                    code += "  sd      t0, " + std::to_string(stackOffset) + "(sp)\n";
-                } else {
-                    code += "  li      t1, " + std::to_string(stackOffset) + "\n";
-                    code += "  add     t1, sp, t1\n";
-                    code += "  sd      t0, 0(t1)\n";
+                if (regAlloc.hasReg(argVal)) {
+                    std::string srcReg = regAlloc.getReg(argVal);
+                    if (isArgReg(srcReg)) {
+                        auto it = savedRegOffsets.find(srcReg);
+                        if (it != savedRegOffsets.end()) {
+                            code += emitStackLoad("t0", it->second, "ld");
+                            code += emitStackStore("t0", stackOffset, "sd");
+                            continue;
+                        }
+                    }
                 }
+                code += loadToReg(argVal, "t0");
+                code += emitStackStore("t0", stackOffset, "sd");
             } else {
-                code += loadToReg(argVal, "t0");
-                if (fitsImm12(stackOffset)) {
-                    code += "  sw      t0, " + std::to_string(stackOffset) + "(sp)\n";
-                } else {
-                    code += "  li      t1, " + std::to_string(stackOffset) + "\n";
-                    code += "  add     t1, sp, t1\n";
-                    code += "  sw      t0, 0(t1)\n";
+                if (regAlloc.hasReg(argVal)) {
+                    std::string srcReg = regAlloc.getReg(argVal);
+                    if (isArgReg(srcReg)) {
+                        auto it = savedRegOffsets.find(srcReg);
+                        if (it != savedRegOffsets.end()) {
+                            code += emitStackLoad("t0", it->second, "ld");
+                            code += emitStackStore("t0", stackOffset, "sw");
+                            continue;
+                        }
+                    }
                 }
+                code += loadToReg(argVal, "t0");
+                code += emitStackStore("t0", stackOffset, "sw");
             }
         }
     }
@@ -1294,14 +2423,39 @@ void TargetCodeGen::emitCall(IR::Instruction& inst) {
     std::string calleeName = inst.getOperand(0)->getName();
     code += "  call    " + calleeName + "\n";
 
-    code += restoreCode;
-
     auto* retTy = inst.getType();
-    if (!retTy->isVoid()) {
-        if (retTy->isFloat()) {
-            code += storeFromReg(&inst, "fa0");
+    if (retTy->isVoid()) {
+        // No return value — just restore caller-saved registers
+        code += restoreCode;
+    } else {
+        bool retIsFloat = retTy->isFloat();
+        std::string retReg = retIsFloat ? "fa0" : "a0";
+        // Check if the return register will be overwritten by restoreCode
+        bool retRegSaved = savedRegOffsets.find(retReg) != savedRegOffsets.end();
+
+        if (retRegSaved) {
+            // Return register was saved and will be restored (overwriting the
+            // return value). Save the return value to the stack slot FIRST,
+            // then restore caller-saved registers, then load to assigned reg.
+            int retOffset = getStackOffset(&inst);
+            std::string storeInsn = retIsFloat ? "fsw" :
+                                    (retTy->isPointer() ? "sd" : "sw");
+            code += emitStackStore(retReg, retOffset, storeInsn);
+
+            code += restoreCode;
+
+            // If the CALL result has an assigned register, load from stack.
+            // If spilled, the value is already in its stack slot.
+            if (regAlloc.hasReg(&inst)) {
+                std::string r = regAlloc.getReg(&inst);
+                std::string loadInsn = retIsFloat ? "flw" :
+                                       (retTy->isPointer() ? "ld" : "lw");
+                code += emitStackLoad(r, retOffset, loadInsn);
+            }
         } else {
-            code += storeFromReg(&inst, "a0");
+            // Return register was not saved — return value is safe
+            code += restoreCode;
+            code += storeFromReg(&inst, retReg);
         }
     }
 
@@ -1312,9 +2466,103 @@ void TargetCodeGen::emitGetElementPtr(IR::Instruction& inst) {
     // 如果此 GEP 已被融合到 LOAD/STORE 中，跳过发射
     if (foldedGeps.count(&inst)) return;
 
+    // 快速路径：如果所有索引都是常量，直接计算总偏移量
+    // 避免通过临时寄存器 t0 中转（mv t0,base; addi t0,t0,off; mv result,t0 → addi result,base,off）
+    {
+        auto* ptrTy = dynamic_cast<IR::PointerType*>(inst.getOperand(0)->getType());
+        IR::Type* curPointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
+        unsigned numOps = inst.getNumOperands();
+        bool allConst = true;
+        int64_t totalOffset = 0;
+
+        if (numOps >= 2) {
+            // 第一个索引
+            auto* firstIdx = dynamic_cast<IR::ConstantInt*>(inst.getOperand(1));
+            if (firstIdx) {
+                if (firstIdx->getValue() != 0) {
+                    int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
+                    totalOffset += (int64_t)firstIdx->getValue() * ptrStride;
+                }
+            } else {
+                allConst = false;
+            }
+            // 后续索引
+            for (unsigned i = 2; i < numOps && allConst; ++i) {
+                auto* idxConst = dynamic_cast<IR::ConstantInt*>(inst.getOperand(i));
+                if (!idxConst) { allConst = false; break; }
+                if (idxConst->getValue() == 0) {
+                    if (curPointee && curPointee->isArray()) {
+                        auto* arrTy = dynamic_cast<IR::ArrayType*>(curPointee);
+                        curPointee = arrTy->getElementType();
+                    }
+                    continue;
+                }
+                int stride = 4;
+                if (curPointee && curPointee->isArray()) {
+                    auto* arrTy = dynamic_cast<IR::ArrayType*>(curPointee);
+                    stride = getTypeSize(arrTy->getElementType());
+                    curPointee = arrTy->getElementType();
+                }
+                totalOffset += (int64_t)idxConst->getValue() * stride;
+            }
+        } else {
+            allConst = false;
+        }
+
+        if (allConst && totalOffset == 0) {
+            // 偏移为 0：直接 mv result, base（或什么都不做）
+            // ★ 同时检查 regAlloc、globalAddrCache、promotedAllocas
+            if (regAlloc.hasReg(&inst)) {
+                std::string dstReg = regAlloc.getReg(&inst);
+                std::string srcReg = getValueRegIfAny(inst.getOperand(0));
+                if (!srcReg.empty()) {
+                    if (dstReg != srcReg) {
+                        emitter.emitText("  mv      " + dstReg + ", " + srcReg + "\n");
+                    }
+                    return;
+                }
+            }
+        } else if (allConst) {
+            // 有常量偏移：尽量直接从 base 寄存器计算
+            // ★ 同时检查 regAlloc、globalAddrCache、promotedAllocas
+            if (regAlloc.hasReg(&inst)) {
+                std::string dstReg = regAlloc.getReg(&inst);
+                std::string srcReg = getValueRegIfAny(inst.getOperand(0));
+                if (!srcReg.empty()) {
+                    if (-2048 <= totalOffset && totalOffset <= 2047) {
+                        emitter.emitText("  addi    " + dstReg + ", " + srcReg + ", " +
+                                         std::to_string(totalOffset) + "\n");
+                    } else {
+                        auto cacheIt = constantCache.find(totalOffset);
+                        if (cacheIt != constantCache.end()) {
+                            emitter.emitText("  add     " + dstReg + ", " + srcReg + ", " + cacheIt->second + "\n");
+                        } else {
+                            emitter.emitText("  li      t1, " + std::to_string(totalOffset) + "\n");
+                            emitter.emitText("  add     " + dstReg + ", " + srcReg + ", t1\n");
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     std::string code;
 
-    code += loadToReg(inst.getOperand(0), "t0");
+    // ★ GEP 寻址优化：当基址已在寄存器中时，跳过 mv t0,baseReg，
+    //   直接在第一条 add/addi 中使用基址寄存器作为源，消除冗余 mv。
+    //   addrSrc 追踪当前地址所在寄存器：初始为 baseReg，第一次写入 t0 后改为 t0。
+    //   同时检查 regAlloc、globalAddrCache、promotedAllocas（getValueRegIfAny）
+    std::string addrSrc;
+    {
+        std::string r = getValueRegIfAny(inst.getOperand(0));
+        if (!r.empty() && r != "t0") {
+            addrSrc = r;  // 基址在寄存器中，跳过 mv
+        } else {
+            code += loadToReg(inst.getOperand(0), "t0");
+            addrSrc = "t0";
+        }
+    }
 
     unsigned numOps = inst.getNumOperands();
     if (numOps >= 2) {
@@ -1328,19 +2576,27 @@ void TargetCodeGen::emitGetElementPtr(IR::Instruction& inst) {
         bool firstIsZero = firstIdx && firstIdx->getValue() == 0;
         if (!firstIsZero) {
             int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
-            code += loadToReg(inst.getOperand(1), "t1");
-            if (ptrStride == 1) {
-            } else if (ptrStride == 2) {
-                code += "  slli    t1, t1, 1\n";
-            } else if (ptrStride == 4) {
-                code += "  slli    t1, t1, 2\n";
-            } else if (ptrStride == 8) {
-                code += "  slli    t1, t1, 3\n";
+            if (firstIdx) {
+                // 常量索引：直接计算偏移量，避免 li+slli+add 序列
+                int64_t offset = (int64_t)firstIdx->getValue() * ptrStride;
+                if (-2048 <= offset && offset <= 2047) {
+                    code += "  addi    t0, " + addrSrc + ", " + std::to_string(offset) + "\n";
+                } else {
+                    auto cacheIt = constantCache.find(offset);
+                    if (cacheIt != constantCache.end()) {
+                        code += "  add     t0, " + addrSrc + ", " + cacheIt->second + "\n";
+                    } else {
+                        code += "  li      t1, " + std::to_string(offset) + "\n";
+                        code += "  add     t0, " + addrSrc + ", t1\n";
+                    }
+                }
+                addrSrc = "t0";
             } else {
-                code += "  li      t2, " + std::to_string(ptrStride) + "\n";
-                code += "  mul     t1, t1, t2\n";
+                code += loadToReg(inst.getOperand(1), "t1");
+                code += emitStrideMul("t1", ptrStride, "t2");
+                code += "  add     t0, " + addrSrc + ", t1\n";
+                addrSrc = "t0";
             }
-            code += "  add     t0, t0, t1\n";
         }
 
         // Remaining indices (operand 2+) are array indices:
@@ -1363,22 +2619,34 @@ void TargetCodeGen::emitGetElementPtr(IR::Instruction& inst) {
                 stride = getTypeSize(arrTy->getElementType());
                 curPointee = arrTy->getElementType();
             }
-            code += loadToReg(inst.getOperand(i), "t1");
-            if (stride == 1) {
-            } else if (stride == 2) {
-                code += "  slli    t1, t1, 1\n";
-            } else if (stride == 4) {
-                code += "  slli    t1, t1, 2\n";
-            } else if (stride == 8) {
-                code += "  slli    t1, t1, 3\n";
+            if (idxConst) {
+                // 常量索引：直接计算偏移量
+                int64_t offset = (int64_t)idxConst->getValue() * stride;
+                if (-2048 <= offset && offset <= 2047) {
+                    code += "  addi    t0, " + addrSrc + ", " + std::to_string(offset) + "\n";
+                } else {
+                    auto cacheIt = constantCache.find(offset);
+                    if (cacheIt != constantCache.end()) {
+                        code += "  add     t0, " + addrSrc + ", " + cacheIt->second + "\n";
+                    } else {
+                        code += "  li      t1, " + std::to_string(offset) + "\n";
+                        code += "  add     t0, " + addrSrc + ", t1\n";
+                    }
+                }
+                addrSrc = "t0";
             } else {
-                code += "  li      t2, " + std::to_string(stride) + "\n";
-                code += "  mul     t1, t1, t2\n";
+                code += loadToReg(inst.getOperand(i), "t1");
+                code += emitStrideMul("t1", stride, "t2");
+                code += "  add     t0, " + addrSrc + ", t1\n";
+                addrSrc = "t0";
             }
-            code += "  add     t0, t0, t1\n";
         }
     }
 
+    // 如果没有任何偏移（addrSrc 仍是 baseReg），需要 mv t0, baseReg
+    if (addrSrc != "t0") {
+        code += "  mv      t0, " + addrSrc + "\n";
+    }
     code += storeFromReg(&inst, "t0");
     emitter.emitText(code);
 }
@@ -1452,15 +2720,153 @@ void TargetCodeGen::emitCast(IR::Instruction& inst) {
 
 void TargetCodeGen::emitSelect(IR::Instruction& inst) {
     // SELECT %cond, %trueVal, %falseVal -> %result
-    // RISC-V has no native select; use branch pattern.
+    // RISC-V has no native select; use branch pattern or branchless for integer.
     //
-    // IMPORTANT: Only t0 may be used as scratch because t0 is NOT in the
-    // register allocator's pool (INT_REGS = s0-s11, t3-t6). Using t3/t4/t5
-    // as scratch would clobber values allocated to those registers.
+    // IMPORTANT: Only t0/t1 may be used as scratch (NOT in INT_REGS pool =
+    // s0-s11, t3-t6). t2 is also available but unused here for simplicity.
     //
-    // To avoid needing multiple scratch registers, operands are loaded
-    // lazily — each operand is loaded into t0 immediately before use,
-    // and cond is dead after the beqz, allowing t0 reuse.
+    // ★ Branchless optimization: SELECT is only produced by IfConversion from
+    // COND_BR, so cond is always 0/1 (from ICMP/SEQZ/SNEZ). For integer select
+    // with a constant operand, we can use mask arithmetic instead of branches,
+    // eliminating 2 branches per select. This is QEMU-safe (only uses t0/t1,
+    // does not change register allocation).
+    std::string rd = getValueReg(&inst);
+    std::string dest = rd.empty() ? "t0" : rd;
+    bool isFloat = inst.getType()->isFloat();
+
+    if (!isFloat) {
+        auto* trueVal = inst.getOperand(1);
+        auto* falseVal = inst.getOperand(2);
+        auto* trueConst = dynamic_cast<IR::ConstantInt*>(trueVal);
+        auto* falseConst = dynamic_cast<IR::ConstantInt*>(falseVal);
+
+        // Pattern A: select cond(0/1), var, 0
+        //   cond=1 → dest=var; cond=0 → dest=0
+        //   neg t0, cond  (t0 = -cond = 0 or -1, the bitmask; cond is dead after)
+        //   and dest, var, t0
+        // Safe: cond is dead after neg, so t0 can be reused. Even if both cond
+        // and var need loading, t0=cond→neg t0→t1=var→and dest,t1,t0 works.
+        if (falseConst && falseConst->getValue() == 0 && !trueConst) {
+            std::string code;
+            std::string condReg = getValueReg(inst.getOperand(0));
+            std::string trueReg = getValueReg(trueVal);
+
+            std::string cond = condReg;
+            if (cond.empty()) { code += loadToReg(inst.getOperand(0), "t0"); cond = "t0"; }
+            std::string tv = trueReg;
+            if (tv.empty()) { code += loadToReg(trueVal, "t1"); tv = "t1"; }
+
+            code += "  neg     t0, " + cond + "\n";
+            code += "  and     " + dest + ", " + tv + ", t0\n";
+            if (rd.empty()) code += storeFromReg(&inst, dest);
+            emitter.emitText(code);
+            return;
+        }
+
+        // Pattern C: select cond(0/1), 0, var
+        //   cond=1 → dest=0; cond=0 → dest=var
+        //   seqz t0, cond  (t0 = !cond; cond is dead after)
+        //   neg  t0, t0    (t0 = -!cond = 0 or -1)
+        //   and  dest, var, t0
+        // Safe: cond is dead after seqz.
+        if (trueConst && trueConst->getValue() == 0 && !falseConst) {
+            std::string code;
+            std::string condReg = getValueReg(inst.getOperand(0));
+            std::string falseReg = getValueReg(falseVal);
+
+            std::string cond = condReg;
+            if (cond.empty()) { code += loadToReg(inst.getOperand(0), "t0"); cond = "t0"; }
+            std::string fv = falseReg;
+            if (fv.empty()) { code += loadToReg(falseVal, "t1"); fv = "t1"; }
+
+            code += "  seqz    t0, " + cond + "\n";
+            code += "  neg     t0, t0\n";
+            code += "  and     " + dest + ", " + fv + ", t0\n";
+            if (rd.empty()) code += storeFromReg(&inst, dest);
+            emitter.emitText(code);
+            return;
+        }
+
+        // Pattern B: select cond(0/1), 1, var
+        //   cond=1 → dest=1; cond=0 → dest=var
+        //   seqz tX, cond; neg tX, tX; and tX, var, tX; or dest, tX, cond
+        // CAUTION: cond is needed in the final `or`, so it must survive the seqz.
+        // - If cond is in its own register: use t0 for intermediate. cond survives in its reg.
+        // - If cond needs loading (→t0): use t1 for intermediate. cond survives in t0.
+        // - If BOTH cond and var need loading: only 2 scratch regs, need 3 slots → fall back.
+        if (trueConst && trueConst->getValue() == 1 && !falseConst) {
+            std::string condReg = getValueReg(inst.getOperand(0));
+            std::string falseReg = getValueReg(falseVal);
+            bool condNeedsLoad = condReg.empty();
+            bool fvNeedsLoad = falseReg.empty();
+
+            if (!(condNeedsLoad && fvNeedsLoad)) {
+                std::string code;
+                std::string cond, fv, scratch;
+                if (condNeedsLoad) {
+                    code += loadToReg(inst.getOperand(0), "t0");
+                    cond = "t0"; fv = falseReg; scratch = "t1";
+                } else {
+                    cond = condReg;
+                    if (fvNeedsLoad) { code += loadToReg(falseVal, "t1"); fv = "t1"; }
+                    else { fv = falseReg; }
+                    scratch = "t0";
+                }
+                code += "  seqz    " + scratch + ", " + cond + "\n";
+                code += "  neg     " + scratch + ", " + scratch + "\n";
+                code += "  and     " + scratch + ", " + fv + ", " + scratch + "\n";
+                code += "  or      " + dest + ", " + scratch + ", " + cond + "\n";
+                if (rd.empty()) code += storeFromReg(&inst, dest);
+                emitter.emitText(code);
+                return;
+            }
+        }
+
+        // Pattern D: select cond(0/1), var, 1
+        //   cond=1 → dest=var; cond=0 → dest=1
+        //   neg  tX, cond; and tX, var, tX; xori tY, cond, 1; or dest, tX, tY
+        // CAUTION: cond is needed in xori. Same scratch constraint as Pattern B.
+        // - If cond in own reg: t0 for mask, t1 for !cond. ✓
+        // - If cond needs load (→t0): t1 for mask, t0 still has cond for xori.
+        //   But then !cond also needs a reg... xori t1, cond, 1 overwrites t1 (mask).
+        //   Need 3 regs: cond(t0), mask, !cond. Only have 2 scratch. Fall back.
+        // - If BOTH need loading: fall back.
+        if (falseConst && falseConst->getValue() == 1 && !trueConst) {
+            std::string condReg = getValueReg(inst.getOperand(0));
+            std::string trueReg = getValueReg(trueVal);
+            bool condNeedsLoad = condReg.empty();
+            bool tvNeedsLoad = trueReg.empty();
+
+            if (!condNeedsLoad && !tvNeedsLoad) {
+                // Best case: both in registers, use t0 and t1
+                std::string code;
+                std::string cond = condReg;
+                std::string tv = trueReg;
+                code += "  neg     t0, " + cond + "\n";
+                code += "  and     t0, " + tv + ", t0\n";
+                code += "  xori    t1, " + cond + ", 1\n";
+                code += "  or      " + dest + ", t0, t1\n";
+                if (rd.empty()) code += storeFromReg(&inst, dest);
+                emitter.emitText(code);
+                return;
+            } else if (!condNeedsLoad && tvNeedsLoad) {
+                // cond in reg, tv needs load → t1. Use t0 for mask+!cond carefully.
+                std::string code;
+                std::string cond = condReg;
+                code += loadToReg(trueVal, "t1");  // t1 = tv
+                code += "  neg     t0, " + cond + "\n";
+                code += "  and     t0, t1, t0\n";   // t0 = tv & -cond
+                code += "  xori    t1, " + cond + ", 1\n";  // t1 = !cond (tv dead)
+                code += "  or      " + dest + ", t0, t1\n";
+                if (rd.empty()) code += storeFromReg(&inst, dest);
+                emitter.emitText(code);
+                return;
+            }
+            // condNeedsLoad: fall back (not enough scratch regs)
+        }
+    }
+
+    // Fallback: branch-based lowering (for float or non-constant-operand integer)
     static int selectLabelCounter = 0;
     int labelId = selectLabelCounter++;
     std::string labelFalse = ".Lselect_false_" + std::to_string(labelId);
@@ -1470,12 +2876,6 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
     std::string condReg = getValueReg(inst.getOperand(0));
     std::string trueReg = getValueReg(inst.getOperand(1));
     std::string falseReg = getValueReg(inst.getOperand(2));
-    std::string rd = getValueReg(&inst);
-
-    // Result register: use rd if allocated, else t0 (then store to stack)
-    std::string dest = rd.empty() ? "t0" : rd;
-
-    bool isFloat = inst.getType()->isFloat();
 
     // 1. Load cond into its register or t0
     std::string cond = condReg;
@@ -1491,8 +2891,6 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
     //    cond is dead, so t0 is free for reuse (if cond was in t0)
     std::string tv = trueReg;
     if (tv.empty()) {
-        // trueVal has no register (constant); load into t0
-        // Safe: cond is dead, t0 is free
         code += loadToReg(inst.getOperand(1), "t0");
         tv = "t0";
     }
@@ -1509,8 +2907,6 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
     code += labelFalse + ":\n";
     std::string fv = falseReg;
     if (fv.empty()) {
-        // falseVal has no register (constant); load into t0
-        // Safe: trueVal is dead (we're on false path), t0 is free
         code += loadToReg(inst.getOperand(2), "t0");
         fv = "t0";
     }
@@ -1539,14 +2935,11 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
 bool TargetCodeGen::isAllocaPromotable(IR::Instruction* alloca) const {
     if (alloca->getOpcode() != IR::Instruction::Opcode::ALLOCA) return false;
 
-    // 不提升 PHI 降低产生的 ALLOCA：这些 ALLOCA 数量可能很多（每个 PHI 一个），
-    // 提升它们会消耗所有 callee-saved 寄存器（s0-s11），导致寄存器分配冲突
-    // (12_DSU SEGFAULT 根因)。PHI 值通过栈内存传递是安全的。
-    // SSA 优化已在 PHI 形式上运行完毕，此处只是降低步骤，性能影响有限。
-    const std::string& allocaName = alloca->getName();
-    if (allocaName.find(".phi.ptr") != std::string::npos) {
-        return false;
-    }
+    // 允许提升 PHI 降低产生的 ALLOCA（.phi.ptr）：
+    // 这些 ALLOCA 对应循环变量、累加器等高频使用的值。
+    // promoteAllocasInFunction 按使用次数降序排序，只提升使用频率最高的
+    // 前 N 个（N = 可用 callee-saved 寄存器数），因此不会耗尽寄存器。
+    // 之前的"12_DSU SEGFAULT"是因为没有限制提升数量，现在有限制所以安全。
 
     // 只提升标量类型（int/float），不提升数组或指针
     auto* ptrTy = dynamic_cast<IR::PointerType*>(alloca->getType());
@@ -1607,25 +3000,43 @@ void TargetCodeGen::promoteAllocasInFunction(IR::Function& func) {
             return a.useCount > b.useCount;
         });
 
+    // 寄存器预算管理：
+    //   s0-s11 共 12 个，fs0-fs11 共 12 个
+    //   collectGlobalAddresses 已占用部分 s 寄存器缓存全局数组地址
+    //   collectLargeConstants 可能占用最多 2 个 s 寄存器缓存大常量
+    //   必须为线性扫描分配器保留足够的寄存器，否则会导致大量溢出
+    //   策略：int 最多用 8 个（含全局地址+常量缓存），float 最多用 8 个
+    //   这样分配器至少有 4 个 s 寄存器 + 4 个 t 寄存器 = 8 个可用
+    const int MAX_INT_PROMOTIONS = 8;
+    const int MAX_FLOAT_PROMOTIONS = 8;
+    int globalIntRegsUsed = static_cast<int>(globalAddrCache.size() + constantCache.size());
+    int intPromotionBudget = MAX_INT_PROMOTIONS - globalIntRegsUsed;
+    if (intPromotionBudget < 0) intPromotionBudget = 0;
+
     int intIdx = 0, floatIdx = 0;
+    int intPromoted = 0, floatPromoted = 0;
 
     for (auto& cand : candidates) {
         std::string reg;
         if (cand.isFloat) {
+            if (floatPromoted >= MAX_FLOAT_PROMOTIONS) continue;
             while (floatIdx < static_cast<int>(floatRegPool.size()) &&
                    regAlloc.isRegReserved(floatRegPool[floatIdx])) {
                 floatIdx++;
             }
             if (floatIdx < static_cast<int>(floatRegPool.size())) {
                 reg = floatRegPool[floatIdx++];
+                floatPromoted++;
             }
         } else {
+            if (intPromoted >= intPromotionBudget) continue;
             while (intIdx < static_cast<int>(intRegPool.size()) &&
                    regAlloc.isRegReserved(intRegPool[intIdx])) {
                 intIdx++;
             }
             if (intIdx < static_cast<int>(intRegPool.size())) {
                 reg = intRegPool[intIdx++];
+                intPromoted++;
             }
         }
 
@@ -1671,6 +3082,110 @@ void TargetCodeGen::collectGlobalAddresses(IR::Function& func) {
         if (regIdx < static_cast<int>(intRegPool.size())) {
             std::string reg = intRegPool[regIdx++];
             globalAddrCache[gv] = reg;
+        }
+    }
+}
+
+void TargetCodeGen::collectLargeConstants(IR::Function& func) {
+    constantCache.clear();
+    // 统计大常量在 GEP 中出现的次数：
+    //   1. 全常量索引 GEP 的总偏移量（> 2047）
+    //   2. 变量索引 GEP 的 stride（> 8，无法用 slli 优化）
+    std::unordered_map<int64_t, int> offsetCounts;
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::GETELEMENTPTR) continue;
+            unsigned numOps = inst->getNumOperands();
+            if (numOps < 2) continue;
+
+            auto* ptrTy = dynamic_cast<IR::PointerType*>(inst->getOperand(0)->getType());
+            IR::Type* curPointee = ptrTy ? ptrTy->getPointeeType() : nullptr;
+
+            // 第一个索引
+            auto* firstIdx = dynamic_cast<IR::ConstantInt*>(inst->getOperand(1));
+            int ptrStride = curPointee ? getTypeSize(curPointee) : 4;
+            if (firstIdx) {
+                // 常量索引：计算偏移量
+                if (firstIdx->getValue() != 0) {
+                    int64_t offset = (int64_t)firstIdx->getValue() * ptrStride;
+                    if (offset > 2047 || offset < -2048) {
+                        offsetCounts[offset]++;
+                    }
+                }
+            } else {
+                // 变量索引：stride 本身是大常量时需要缓存
+                if (ptrStride > 8) {
+                    offsetCounts[ptrStride]++;
+                }
+            }
+
+            // 后续索引（operand 2+）
+            IR::Type* curType = curPointee;
+            for (unsigned i = 2; i < numOps; ++i) {
+                int stride = 4;
+                if (curType && curType->isArray()) {
+                    auto* arrTy = dynamic_cast<IR::ArrayType*>(curType);
+                    stride = getTypeSize(arrTy->getElementType());
+                    curType = arrTy->getElementType();
+                }
+                auto* idxConst = dynamic_cast<IR::ConstantInt*>(inst->getOperand(i));
+                if (idxConst) {
+                    if (idxConst->getValue() != 0) {
+                        int64_t offset = (int64_t)idxConst->getValue() * stride;
+                        if (offset > 2047 || offset < -2048) {
+                            offsetCounts[offset]++;
+                        }
+                    }
+                } else {
+                    if (stride > 8) {
+                        offsetCounts[stride]++;
+                    }
+                }
+            }
+        }
+    }
+
+    // 也统计 binop 中的大常量操作数（如 mul %i, 5600）
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            using Opc = IR::Instruction::Opcode;
+            Opc oc = inst->getOpcode();
+            if (oc != Opc::ADD && oc != Opc::SUB && oc != Opc::MUL &&
+                oc != Opc::AND && oc != Opc::OR && oc != Opc::XOR) continue;
+            unsigned numOps = inst->getNumOperands();
+            for (unsigned i = 0; i < numOps && i < 2; ++i) {
+                auto* ci = dynamic_cast<IR::ConstantInt*>(inst->getOperand(i));
+                if (!ci) continue;
+                int64_t val = ci->getValue();
+                if (val > 2047 || val < -2048) {
+                    offsetCounts[val]++;
+                }
+            }
+        }
+    }
+
+    // 按出现次数降序排序，只缓存出现 >= 3 次的常量
+    std::vector<std::pair<int64_t, int>> sortedOffsets(offsetCounts.begin(), offsetCounts.end());
+    std::sort(sortedOffsets.begin(), sortedOffsets.end(),
+        [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    static const std::vector<std::string> intRegPool = {
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "s8", "s9", "s10", "s11"
+    };
+    const int MAX_CONST_REGS = 2;  // 限制常量缓存最多用 2 个 s 寄存器
+    int allocated = 0;
+    for (auto& [val, count] : sortedOffsets) {
+        if (allocated >= MAX_CONST_REGS) break;
+        if (count < 3) break;
+        // 找一个未预留的寄存器
+        for (const auto& reg : intRegPool) {
+            if (!regAlloc.isRegReserved(reg)) {
+                constantCache[val] = reg;
+                regAlloc.reserveReg(reg);
+                ++allocated;
+                break;
+            }
         }
     }
 }

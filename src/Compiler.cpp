@@ -2,7 +2,6 @@
 #include "backend/TargetCodeGen.h"
 #include "opt/Optimizer.h"
 #include <fstream>
-#include <iostream>
 
 namespace IR {
 
@@ -26,7 +25,7 @@ static void runOptPasses(Module* mod, OptLevel opt) {
         Opt::runO2(mod);
         Opt::runO3(mod);
         Opt::runP0(mod);
-        Opt::runP3(mod);  // 指令调度（scheduleBB 的 vector::insert 迭代器失效已修复）
+        Opt::runP3(mod);  // 指令调度
         break;
     case OptLevel::O0:
     default:
@@ -58,8 +57,8 @@ void Compiler::emitIRToFile(const std::string& sourcePath, const std::string& ou
 void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out, OptLevel opt) {
     auto mod = compile(sourcePath);
     runOptPasses(mod.get(), opt);
-    // 在代码生成前降级 PHI 指令（如果 Mem2Reg 引入了 PHI）
-    Opt::phiLowering(mod.get());
+    // PHI 指令由 TargetCodeGen 的 emitPhiMovesForEdge 直接在前驱块中
+    // 发射寄存器拷贝，无需 phiLowering 降级为 alloca/store/load
     Backend::TargetCodeGen cg;
     std::string asmCode = cg.generate(*mod);
     out << Opt::peepholeOptimize(asmCode);
@@ -68,15 +67,31 @@ void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out, OptLeve
 void Compiler::emitAsmToFile(const std::string& sourcePath, const std::string& outputPath, OptLevel opt) {
     auto mod = compile(sourcePath);
     runOptPasses(mod.get(), opt);
-    // 在代码生成前降级 PHI 指令（如果 Mem2Reg 引入了 PHI）
-    Opt::phiLowering(mod.get());
+    // PHI 指令由 TargetCodeGen 的 emitPhiMovesForEdge 直接在前驱块中
+    // 发射寄存器拷贝，无需 phiLowering 降级为 alloca/store/load
     Backend::TargetCodeGen cg;
     std::ofstream ofs(outputPath);
     if (!ofs.is_open()) {
         throw std::runtime_error("Cannot open output file: " + outputPath);
     }
     std::string asmCode = cg.generate(*mod);
-    ofs << Opt::peepholeOptimize(asmCode);
+    const char* noPeep = std::getenv("NO_PEEPHOLE");
+    if (noPeep && std::string(noPeep) == "1") {
+        ofs << asmCode;
+    } else {
+        const char* dumpPre = std::getenv("DUMP_PEEPHOLE_PRE");
+        if (dumpPre) {
+            std::ofstream pre("/tmp/peep_pre.S");
+            pre << asmCode;
+        }
+        std::string optimized = Opt::peepholeOptimize(asmCode);
+        const char* dumpPost = std::getenv("DUMP_PEEPHOLE_POST");
+        if (dumpPost) {
+            std::ofstream post("/tmp/peep_post.S");
+            post << optimized;
+        }
+        ofs << optimized;
+    }
 }
 
 } // namespace IR

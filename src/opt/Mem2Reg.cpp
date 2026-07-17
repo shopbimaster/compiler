@@ -30,6 +30,14 @@ bool isPromotableAlloca(IR::Instruction* alloca) {
     if (alloca->getOpcode() != IR::Instruction::Opcode::ALLOCA)
         return false;
 
+    // 只提升标量类型（int/float），不提升数组或指针
+    // 指针类型 ALLOCA 的 LOAD/STORE 使用 ld/sd（64 位），
+    // 替换后可能导致类型不匹配（如 i32* 值被当作 i32 使用）
+    auto* ptrTy = dynamic_cast<IR::PointerType*>(alloca->getType());
+    if (!ptrTy) return false;
+    auto* pointee = ptrTy->getPointeeType();
+    if (!pointee || (!pointee->isInteger() && !pointee->isFloat())) return false;
+
     for (auto& use : alloca->getUses()) {
         auto* user = use.user;
         auto* userInst = dynamic_cast<IR::Instruction*>(user);
@@ -364,6 +372,172 @@ bool mem2reg(IR::Module* mod) {
     bool changed = false;
     for (auto& func : mod->getFunctions()) {
         if (mem2regOnFunction(func.get())) {
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// ================================================================
+// mem2regLocal — 安全的局部 mem2reg
+// 只提升所有 STORE 都在同一个 BB 中的 ALLOCA。
+// 这种 ALLOCA 不需要 PHI 节点（所有定义在同一个 BB 内），
+// 因此不会产生 PHI 爆炸问题（64_calculator 的 274 PHI 根因）。
+//
+// 算法：
+//   1. 对每个可提升的 ALLOCA，收集所有 STORE 所在的 BB
+//   2. 如果所有 STORE 都在同一个 BB 中：
+//      a. 在该 BB 内，按指令顺序维护"当前值"
+//      b. STORE 更新当前值
+//      c. LOAD 替换为当前值
+//      d. 对于其他 BB 中的 LOAD，使用最后一个 STORE 的值
+//         （因为该 BB 支配所有其他 BB — 如果 ALLOCA 在 entry 且
+//          所有 STORE 都在 entry，则 entry 支配所有 BB）
+//   3. 移除被替换的 LOAD 和 STORE，以及空的 ALLOCA
+// ================================================================
+
+bool mem2regLocalOnFunction(IR::Function* func) {
+    if (func->isExternal() || func->getBlocks().empty())
+        return false;
+
+    // 1. 收集可提升的 alloca
+    std::vector<IR::Instruction*> promotableAllocas;
+    for (auto& bb : func->getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::ALLOCA &&
+                isPromotableAlloca(inst.get())) {
+                promotableAllocas.push_back(inst.get());
+            }
+        }
+    }
+    if (promotableAllocas.empty()) return false;
+
+    bool changed = false;
+
+    for (auto* alloca : promotableAllocas) {
+        // 收集所有 STORE 和 LOAD
+        std::vector<IR::Instruction*> stores;
+        std::vector<IR::Instruction*> loads;
+        IR::BasicBlock* storeBB = nullptr;
+        bool multiBBStores = false;
+
+        for (auto& use : alloca->getUses()) {
+            auto* userInst = dynamic_cast<IR::Instruction*>(use.user);
+            if (!userInst) continue;
+            if (userInst->getOpcode() == IR::Instruction::Opcode::STORE) {
+                stores.push_back(userInst);
+                auto* bb = userInst->getParent();
+                if (storeBB == nullptr) {
+                    storeBB = bb;
+                } else if (storeBB != bb) {
+                    multiBBStores = true;
+                }
+            } else if (userInst->getOpcode() == IR::Instruction::Opcode::LOAD) {
+                loads.push_back(userInst);
+            }
+        }
+
+        // 只处理所有 STORE 都在同一个 BB 的情况
+        if (multiBBStores) continue;
+        if (stores.empty()) continue;  // 没有 STORE，跳过（mem2reg 会处理）
+
+        // ★ 安全检查：只有当 storeBB 是 entry block 时才安全地替换跨 BB 的 LOAD。
+        //   entry block 支配所有其他 BB，所以最后一个 STORE 的值对其他 BB 可见。
+        //   非 entry BB 不保证支配所有 LOAD 所在的 BB。
+        //
+        //   ★★★ 关键安全规则：如果 storeBB 不是 entry，且存在跨 BB 的 LOAD，
+        //   则不能处理该 ALLOCA！因为：
+        //   1. 不能替换跨 BB 的 LOAD（storeBB 不支配其他 BB）
+        //   2. 不能删除 STORE（删除后跨 BB 的 LOAD 会读到未初始化值）
+        //   3. 只删除 storeBB 内的 LOAD 也不安全（STORE 也需要保留给跨 BB LOAD）
+        //
+        //   80_chaos_token SEGFAULT 根因：storeBB=while_cond_3，LOAD 在 then_6，
+        //   mem2regLocal 删除了 STORE 但没有替换 then_6 中的 LOAD，
+        //   导致 LOAD 读到未初始化值 → LICM 将 LOAD 外提 → SEGFAULT
+        bool isEntryStoreBB = (storeBB == func->getEntryBlock());
+        bool hasCrossBBLoads = false;
+        for (auto* load : loads) {
+            if (load->getParent() != storeBB) {
+                hasCrossBBLoads = true;
+                break;
+            }
+        }
+
+        // 非 entry storeBB 有跨 BB LOAD 时不处理
+        if (!isEntryStoreBB && hasCrossBBLoads) continue;
+
+        // 2. 在 storeBB 内做局部 store-to-load 前推
+        //    按指令顺序遍历，维护当前值
+        IR::Value* currentValue = nullptr;
+        std::vector<IR::Instruction*> toErase;
+
+        for (auto& inst : storeBB->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::STORE &&
+                inst->getOperand(1) == alloca) {
+                currentValue = inst->getOperand(0);
+                // 只有当所有 LOAD 都能被替换时才删除 STORE
+                // isEntryStoreBB=true 时可以安全删除（跨 BB LOAD 会被替换）
+                // hasCrossBBLoads=false 时可以安全删除（所有 LOAD 都在同 BB 内已被替换）
+                toErase.push_back(inst.get());
+            } else if (inst->getOpcode() == IR::Instruction::Opcode::LOAD &&
+                       inst->getOperand(0) == alloca) {
+                if (currentValue) {
+                    inst->replaceAllUsesWith(currentValue);
+                    toErase.push_back(inst.get());
+                }
+            }
+        }
+
+        // 3. 处理其他 BB 中的 LOAD（仅当 storeBB 是 entry block 时安全）
+        //    所有 STORE 都在 entry block，所以最后一个 STORE 的值
+        //    是所有后续 LOAD 能读到的值
+        if (currentValue && isEntryStoreBB) {
+            for (auto* load : loads) {
+                if (load->getParent() == storeBB) continue;  // 已处理
+                load->replaceAllUsesWith(currentValue);
+                toErase.push_back(load);
+            }
+        }
+
+        // 4. 批量删除被替换的指令
+        for (auto* inst : toErase) {
+            auto* parentBB = inst->getParent();
+            if (parentBB) {
+                for (auto it = parentBB->begin(); it != parentBB->end(); ++it) {
+                    if (it->get() == inst) {
+                        inst->dropAllUses();
+                        parentBB->erase(it);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!toErase.empty()) changed = true;
+    }
+
+    // 5. 清理空的 ALLOCA
+    for (auto* alloca : promotableAllocas) {
+        if (alloca->getNumUses() == 0) {
+            auto* parentBB = alloca->getParent();
+            if (parentBB) {
+                for (auto it = parentBB->begin(); it != parentBB->end(); ++it) {
+                    if (it->get() == alloca) {
+                        parentBB->erase(it);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    return changed;
+}
+
+bool mem2regLocal(IR::Module* mod) {
+    bool changed = false;
+    for (auto& func : mod->getFunctions()) {
+        if (mem2regLocalOnFunction(func.get())) {
             changed = true;
         }
     }

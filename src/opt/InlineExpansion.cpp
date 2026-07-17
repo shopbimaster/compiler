@@ -16,10 +16,14 @@ namespace Opt {
 namespace {
 
 const unsigned MAX_INLINE_INSTS_SINGLE = 20;
-const unsigned MAX_INLINE_INSTS_MULTI = 60;
-const unsigned MAX_INLINE_BBS_MULTI = 8;
+const unsigned MAX_INLINE_INSTS_MULTI = 120;
+const unsigned MAX_INLINE_BBS_MULTI = 15;
 // 多BB函数在同一caller中被调用超过此次数则不内联，避免代码膨胀导致性能下降
+// 但小函数（≤30指令）豁免此限制，因为它们的内联收益远大于代码膨胀代价
 const unsigned MAX_MULTI_BB_CALL_SITES = 2;
+const unsigned SMALL_FUNCTION_INST_THRESHOLD = 30;
+// 总内联指令预算：单个 caller 中所有被内联 callee 的总指令数不超过此值
+const unsigned MAX_TOTAL_INLINE_INSTS = 800;
 
 bool isLeafCall(IR::Function* func) {
     if (func->isExternal()) return false;
@@ -77,6 +81,19 @@ std::unordered_map<IR::Value*, IR::Value*> buildParamAllocaMap(
 
             auto* src = inst->getOperand(0);
             auto* dst = inst->getOperand(1);
+
+            // ★ 必须验证 dst 是 ALLOCA 指令！
+            // 此 pass 的目的是消除参数 ALLOCA（stack slot）模式：
+            //   %param_alloca = alloca i32
+            //   store i32 %arg, i32* %param_alloca
+            //   %val = load i32, i32* %param_alloca
+            // 如果不检查 dst 是 ALLOCA，在 mem2reg 后会错误匹配对全局数组的
+            // 单次存储（如 to[cnt] = To 中 dst 是 GEP，只被存一次），导致
+            // 关键 STORE 被错误消除 → 程序语义错误 → SEGFAULT（13_LCA 根因）。
+            auto* dstInst = dynamic_cast<IR::Instruction*>(dst);
+            if (!dstInst || dstInst->getOpcode() != IR::Instruction::Opcode::ALLOCA) {
+                continue;
+            }
 
             // 检查 src 是否为参数
             bool isParam = false;
@@ -177,7 +194,16 @@ IR::Instruction* cloneInstruction(
         auto* elseBB = dynamic_cast<IR::BasicBlock*>(src->getOperand(2));
         cloned = IR::Instruction::createCondBr(cond, thenBB, elseBB);
     } else if (op == Opc::PHI) {
-        return nullptr;
+        // 克隆 PHI 节点：暂用原始操作数引用，后续在 step 4b 中修正
+        // 延迟映射的原因：PHI 的值可能来自后向边（如循环回边），此时 valueMap
+        // 尚未包含该值（因为定义该值的 BB 可能还未被克隆）。
+        // 块操作数也需延迟映射，因为 bbMap 在所有 BB 克隆后才完整。
+        cloned = IR::Instruction::createPhi(
+            src->getType(), src->getName() + ".i", src->getNumOperands());
+        for (unsigned i = 0; i < src->getNumOperands(); ++i) {
+            cloned->addOperand(src->getOperand(i));
+        }
+        // ★ 必须更新 valueMap！否则使用此 PHI 的其他指令无法映射到克隆值
     } else if (op == Opc::GETELEMENTPTR) {
         std::vector<IR::Value*> indices;
         for (unsigned i = 1; i < src->getNumOperands(); ++i)
@@ -354,6 +380,23 @@ bool tryInlineMultiBBCall(IR::Instruction* callInst, IR::Function* callee,
         contBB->pushBack(inst.release());
     }
 
+    // ★ 修复 PHI 前驱引用：callBB 的原始 terminator 已移到 contBB，
+    //   所有引用 callBB 作为前驱的 PHI 节点必须更新为 contBB。
+    //   否则 PHI 的 block 操作数指向错误的前驱 → 寄存器分配器
+    //   计算 live interval 时遗漏回边 → 循环变量永不更新 → 无限循环
+    //   （59_sort_test5 根因：while_cond_14 的 PHI 仍引用 while_body_15
+    //   而非 inline_cont_heap_ajust_2，导致 i=i-1 的结果进入错误 PHI 条目）
+    for (auto& bb : caller->getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != Opc::PHI) continue;
+            for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                if (inst->getOperand(i + 1) == callBB) {
+                    inst->setOperand(i + 1, contBB);
+                }
+            }
+        }
+    }
+
     // ================================================================
     // 2. 构建参数 ALLOCA → 实参 映射，消除冗余的 ALLOCA/STORE/LOAD
     // ================================================================
@@ -384,12 +427,33 @@ bool tryInlineMultiBBCall(IR::Instruction* callInst, IR::Function* callee,
         auto* clonedBB = caller->insertBlock("inline_" + callee->getName() + "_" + calleeBB->getName() + "_" + std::to_string(curId), contBB);
         bbMap[calleeBB.get()] = clonedBB;
         clonedBBs.push_back(clonedBB);
+    }
 
+    // 3a. 第一遍：先克隆所有 PHI 节点
+    //   ★ 关键：PHI 必须先于其他指令克隆！
+    //   原因：callee 的 BB 列表顺序可能使得使用 PHI 的指令（如循环体中的
+    //   算术运算）在 PHI 之前被克隆。如果此时 valueMap 中还没有 PHI 映射，
+    //   lookup() 会返回原始 PHI 指针，导致克隆的指令引用错误的（原始）PHI。
+    //   后续 LICM 会将这些指令误判为循环不变量（因为引用的是另一个函数的
+    //   PHI），将其外提到 preheader，使循环体变空 → 无限循环。
+    //   解决方案：两遍克隆——先克隆所有 PHI（填充 valueMap），再克隆其他指令。
+    for (auto& calleeBB : callee->getBlocks()) {
+        auto* clonedBB = bbMap[calleeBB.get()];
         for (auto& inst : calleeBB->getInstructions()) {
-            if (inst->getOpcode() == Opc::RET) {
-                // 不克隆 RET，后续替换为 STORE(返回值) + BR 到 contBB
-                continue;
+            if (inst->getOpcode() != Opc::PHI) continue;
+            auto* cloned = cloneInstruction(inst.get(), valueMap, caller, paramAllocaToArg);
+            if (cloned) {
+                clonedBB->pushBack(cloned);
             }
+        }
+    }
+
+    // 3b. 第二遍：克隆所有非 PHI、非 RET 指令
+    for (auto& calleeBB : callee->getBlocks()) {
+        auto* clonedBB = bbMap[calleeBB.get()];
+        for (auto& inst : calleeBB->getInstructions()) {
+            auto op = inst->getOpcode();
+            if (op == Opc::PHI || op == Opc::RET) continue;
             auto* cloned = cloneInstruction(inst.get(), valueMap, caller, paramAllocaToArg);
             if (cloned) {
                 clonedBB->pushBack(cloned);
@@ -417,6 +481,37 @@ bool tryInlineMultiBBCall(IR::Instruction* callInst, IR::Function* callee,
             }
             if (origElse && bbMap.count(origElse)) {
                 term->setOperand(2, bbMap[origElse]);
+            }
+        }
+    }
+
+    // ================================================================
+    // 4b. 修正 PHI 节点的值和块操作数（延迟映射）
+    //   cloneInstruction 中 PHI 暂用原始引用，此处统一修正：
+    //     - 值操作数（偶数索引）：通过 valueMap 映射到克隆值
+    //     - 块操作数（奇数索引）：通过 bbMap 映射到克隆块
+    //   延迟映射确保后向边（循环回边）的值已被克隆并进入 valueMap
+    // ================================================================
+    for (auto* clonedBB : clonedBBs) {
+        for (auto& inst : clonedBB->getInstructions()) {
+            if (inst->getOpcode() != Opc::PHI) continue;
+            for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                // 修正值操作数
+                IR::Value* val = inst->getOperand(i);
+                if (val) {
+                    auto it = valueMap.find(val);
+                    if (it != valueMap.end()) {
+                        inst->setOperand(i, it->second);
+                    }
+                }
+                // 修正块操作数
+                auto* origBB = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+                if (origBB) {
+                    auto it = bbMap.find(origBB);
+                    if (it != bbMap.end()) {
+                        inst->setOperand(i + 1, it->second);
+                    }
+                }
             }
         }
     }
@@ -456,6 +551,31 @@ bool tryInlineMultiBBCall(IR::Instruction* callInst, IR::Function* callee,
             it = callBB->erase(it);
             callBB->insert(it, brToEntry);
             break;
+        }
+    }
+
+    // ================================================================
+    // 7. 防御性清理：删除克隆 BB 中第一条 terminator 之后的所有指令
+    //   SimplifyCFG 合并空块时可能遗留额外的 BR，导致同一 BB
+    //   出现多条 terminator。getTerminator() 返回 insts.back()
+    //   会选择错误的 terminator → 无限循环（59_sort_test5 根因）
+    // ================================================================
+    for (auto* clonedBB : clonedBBs) {
+        bool seenTerm = false;
+        for (auto it = clonedBB->begin(); it != clonedBB->end(); ) {
+            auto op = (*it)->getOpcode();
+            if (seenTerm) {
+                (*it)->replaceAllUsesWith(nullptr);
+                for (unsigned i = 0; i < (*it)->getNumOperands(); ++i) {
+                    (*it)->setOperand(i, nullptr);
+                }
+                it = clonedBB->erase(it);
+            } else if (op == Opc::BR || op == Opc::COND_BR || op == Opc::RET) {
+                seenTerm = true;
+                ++it;
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -511,10 +631,25 @@ bool inlineExpansion(IR::Module* mod) {
                 }
             }
             // 标记需要跳过的多BB函数（被调用次数超过阈值）
+            // 小函数（≤SMALL_FUNCTION_INST_THRESHOLD指令）豁免此限制，
+            // 因为它们内联后的代码膨胀很小，但 CALL 开销消除收益大。
+            // 同时检查总内联指令预算，避免过度膨胀。
             std::unordered_set<IR::Function*> skipMultiBB;
+            unsigned totalInlineInsts = 0;
             for (auto& [callee, cnt] : callCount) {
-                if (callee->getBlocks().size() > 1 && cnt > MAX_MULTI_BB_CALL_SITES) {
-                    skipMultiBB.insert(callee);
+                if (callee->getBlocks().size() > 1) {
+                    unsigned calleeInsts = countInstructions(callee);
+                    unsigned projectedInsts = calleeInsts * cnt;
+                    // 小函数豁免 call-site 限制，但仍受总预算约束
+                    bool tooManyCalls = (cnt > MAX_MULTI_BB_CALL_SITES) &&
+                                        (calleeInsts > SMALL_FUNCTION_INST_THRESHOLD);
+                    // 总预算检查：如果内联此函数所有调用点会超出预算，跳过
+                    bool budgetExceeded = (totalInlineInsts + projectedInsts) > MAX_TOTAL_INLINE_INSTS;
+                    if (tooManyCalls || budgetExceeded) {
+                        skipMultiBB.insert(callee);
+                    } else {
+                        totalInlineInsts += projectedInsts;
+                    }
                 }
             }
 
