@@ -27,6 +27,15 @@ bool hasSideEffect(IR::Instruction* inst) {
 
 // 对单个 BB 做代码下沉
 bool sinkInBlock(IR::BasicBlock* bb) {
+    // ★ 大 BB 豁免：CodeSink 的 sinkInBlock 算法复杂度为 O(N⁴)
+    //   （while(localChanged) 外层循环每次移动后 break 重启 ×
+    //    O(N) 候选 × O(N) 位置查找 × O(N) 使用者查找）。
+    //   对于 86_long_code2.sy 等含数百项 `a[2*2][20000-1] + ...` 表达式的测试，
+    //   BB 可能有数千条指令，导致 CodeSink 挂起。
+    //   正常代码的 BB 极少超过 100 条指令，200 的限制安全且无性能损失。
+    //   CodeSink 对大 BB 的收益本就有限（寄存器分配器已通过溢出处理压力）。
+    if (bb->size() > 200) return false;
+
     bool changed = false;
     std::unordered_set<IR::Instruction*> moved;
 
