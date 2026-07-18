@@ -154,6 +154,15 @@ set_source_files_properties(tests/test_ir.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_ir PRIVATE ${ANTLR_INCLUDES})
 target_link_libraries(test_ir sysy_ir_builder sysy_opt ${ANTLR4_RUNTIME_TARGET})
 
+# Focused backend peephole regression tests. Keep these independent from the
+# IR pipeline fixtures so a target-code safety fix can be validated in
+# isolation.
+add_executable(test_peephole
+    tests/test_peephole.cpp
+)
+target_include_directories(test_peephole PRIVATE include)
+target_link_libraries(test_peephole PRIVATE sysy_opt)
+
 # ================================================================
 # 编译器主入口 compiler
 # ================================================================
@@ -178,7 +187,8 @@ target_link_libraries(test_integration sysy_compiler sysy_opt ${ANTLR4_RUNTIME_T
 if(BUILD_TESTING)
     add_test(NAME ir_unit COMMAND test_ir)
     add_test(NAME compiler_integration COMMAND test_integration)
-    set_tests_properties(ir_unit compiler_integration PROPERTIES
+    add_test(NAME peephole_unit COMMAND test_peephole)
+    set_tests_properties(ir_unit compiler_integration peephole_unit PROPERTIES
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 endif()
