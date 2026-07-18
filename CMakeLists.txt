@@ -1,14 +1,49 @@
 cmake_minimum_required(VERSION 3.20)
 project(SysY2022Compiler VERSION 1.0.0 LANGUAGES CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ================================================================
-# ANTLR4 C++ Runtime (系统包 libantlr4-runtime-dev)
+# ANTLR4 C++ Runtime
+#
+# Generated parser sources use the ANTLR 4.13.1 C++ API (std::any,
+# SerializedATNView and ParserATNSimulatorOptions).  Ubuntu's distro package
+# can be older, so verify the API explicitly instead of accidentally linking
+# an incompatible runtime and failing later with hundreds of compiler errors.
 # ================================================================
-find_package(antlr4-runtime REQUIRED)
+find_path(ANTLR4_RUNTIME_INCLUDE_DIR
+    NAMES antlr4-runtime.h
+    PATH_SUFFIXES antlr4-runtime
+)
+find_library(ANTLR4_RUNTIME_LIBRARY NAMES antlr4-runtime)
+
+if(NOT ANTLR4_RUNTIME_INCLUDE_DIR OR NOT ANTLR4_RUNTIME_LIBRARY)
+    message(FATAL_ERROR
+        "ANTLR4 C++ runtime 4.13.1 not found. Run scripts/setup/setup-ubuntu.sh."
+    )
+endif()
+
+if(NOT EXISTS "${ANTLR4_RUNTIME_INCLUDE_DIR}/atn/SerializedATNView.h" OR
+   NOT EXISTS "${ANTLR4_RUNTIME_INCLUDE_DIR}/atn/ParserATNSimulatorOptions.h")
+    message(FATAL_ERROR
+        "Incompatible ANTLR4 C++ runtime at ${ANTLR4_RUNTIME_INCLUDE_DIR}. "
+        "Generated sources require 4.13.1; run scripts/setup/setup-ubuntu.sh."
+    )
+endif()
+
+add_library(antlr4_runtime_system UNKNOWN IMPORTED)
+set_target_properties(antlr4_runtime_system PROPERTIES
+    IMPORTED_LOCATION "${ANTLR4_RUNTIME_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${ANTLR4_RUNTIME_INCLUDE_DIR}"
+)
+set(ANTLR4_RUNTIME_TARGET antlr4_runtime_system)
+
+message(STATUS "ANTLR4 runtime headers: ${ANTLR4_RUNTIME_INCLUDE_DIR}")
+message(STATUS "ANTLR4 runtime library: ${ANTLR4_RUNTIME_LIBRARY}")
 
 set(ANTLR_GENERATED_DIR ${CMAKE_SOURCE_DIR}/src/antlr)
 
@@ -23,7 +58,6 @@ set(ANTLR_SOURCES
 
 set(ANTLR_INCLUDES
     ${ANTLR_GENERATED_DIR}
-    ${ANTLR4_INCLUDE_DIR}
 )
 
 # ================================================================
@@ -41,7 +75,7 @@ add_library(sysy_ir_builder STATIC
     src/ir/IRBuilder.cpp
 )
 target_include_directories(sysy_ir_builder PUBLIC include ${ANTLR_INCLUDES})
-target_link_libraries(sysy_ir_builder PUBLIC sysy_ir_core antlr4_static)
+target_link_libraries(sysy_ir_builder PUBLIC sysy_ir_core ${ANTLR4_RUNTIME_TARGET})
 
 # ================================================================
 # Compiler 封装库
@@ -118,7 +152,7 @@ add_executable(test_ir
 )
 set_source_files_properties(tests/test_ir.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_ir PRIVATE ${ANTLR_INCLUDES})
-target_link_libraries(test_ir sysy_ir_builder sysy_opt antlr4_static)
+target_link_libraries(test_ir sysy_ir_builder sysy_opt ${ANTLR4_RUNTIME_TARGET})
 
 # ================================================================
 # 编译器主入口 compiler
@@ -128,7 +162,7 @@ add_executable(compiler
     ${ANTLR_SOURCES}
 )
 target_include_directories(compiler PRIVATE include ${ANTLR_INCLUDES})
-target_link_libraries(compiler sysy_compiler sysy_backend sysy_opt antlr4_static)
+target_link_libraries(compiler sysy_compiler sysy_backend sysy_opt ${ANTLR4_RUNTIME_TARGET})
 
 # ================================================================
 # 集成测试
@@ -139,4 +173,12 @@ add_executable(test_integration
 )
 set_source_files_properties(tests/test_integration.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_integration PRIVATE include ${ANTLR_INCLUDES})
-target_link_libraries(test_integration sysy_compiler sysy_opt antlr4_static)
+target_link_libraries(test_integration sysy_compiler sysy_opt ${ANTLR4_RUNTIME_TARGET})
+
+if(BUILD_TESTING)
+    add_test(NAME ir_unit COMMAND test_ir)
+    add_test(NAME compiler_integration COMMAND test_integration)
+    set_tests_properties(ir_unit compiler_integration PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
+endif()
