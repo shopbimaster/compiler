@@ -2,6 +2,17 @@
 
 一个将 SysY2022 语言编译为 RV64GC 汇编的完整编译器。
 
+当前初赛目标为 SysY2022。编译器只启用依赖程序语义和 IR 数据流的通用优化，
+不得通过函数名、测试名、输入值或测评环境特征触发专用优化。合规记录见
+[`COMPLIANCE.md`](COMPLIANCE.md)。
+
+## 当前评测状态（2026-07-20）
+
+- 官网最近一次完整结果（六例修复前）：Functional 100/100、H_Functional 40/40、Performance 54/60。
+- `h-5-01/02/03` 与 `crypto-1/2/3` 的通用正确性修复已提交；当前提交态已在
+  Ubuntu 24.04 下通过 RISC-V 静态链接和 QEMU 执行，本地目标用例 6/6 PASS。
+- 尚未运行修改后的官网完整回归，不能将本地 6/6 记为 Performance 60/60；最终成绩以官网为准。
+
 ## 项目架构
 
 ```
@@ -69,24 +80,36 @@ make
 
 | 命令行参数 | 优化级别 | 包含的优化Pass | 用途 |
 |-----------|---------|---------------|------|
-| `-O1` | OALL | O1 + O2 + O3（不含P0/P3） | **测评服务器使用** |
+| `-O1` | OALL | O1 + O2 + O3 + 通用模式优化 + 指令调度 | **测评服务器使用** |
 | `-O0` | O0 | 无优化 | 评测基准 |
 | `-o0` | O0 | 无优化 | 本地调试 |
-| `-o1` | O1 | CF + DCE + CSE + LICM | 本地逐级调试 |
-| `-o2` | O2 | O1 + 内联 + 额外CSE/LICM | 本地逐级调试 |
-| `-o3` | O3 | O1+O2 + 代数化简/循环交换/展开/尾递归 | 本地逐级调试 |
+| `-o1` | O1 | 常量折叠 + DCE + 局部 CSE | 本地逐级调试 |
+| `-o2` | O2 | O1 + SSA/内联/SCCP/LICM/CFG 等中层优化 | 本地逐级调试 |
+| `-o3` | O3 | O1+O2 + 循环交换/强度削减/展开 | 本地逐级调试 |
 
-> **注意**：大写 `-O1` 对应全部优化（映射到内部 OALL 级别），小写 `-o1` 对应仅 O1 优化。
+> **注意**：大写 `-O1` 对应全部通用优化（映射到内部 OALL 级别），小写 `-o1` 对应仅 O1 优化。
 > 这一设计是因为测评服务器只支持 `-O1` 选项，我们必须在此选项下输出最佳性能。
 
 ## 测试
 
 ```bash
+# 构建并运行 C++ 单元/集成测试
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+
+# 构建本地 QEMU 回归所需的运行时库
+bash scripts/build_sylib.sh
+
 # 运行全部优化（测评服务器级别）
-./scripts/run_tests.sh func O1
+bash scripts/run_tests.sh func O1
 
 # 本地逐级调试
-./scripts/run_tests.sh func o1
-./scripts/run_tests.sh func o2
-./scripts/run_tests.sh all o0
+bash scripts/run_tests.sh func o1
+bash scripts/run_tests.sh func o2
+bash scripts/run_tests.sh all o0
 ```
+
+批量回归默认执行严格校验：每个用例必须存在对应 `.out`，并同时比较标准输出
+和 `main` 的退出值；缺少期望输出或发生超时都会使测试失败。测试期望文件可通过
+`.gitignore` 中的例外规则纳入版本控制。

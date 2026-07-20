@@ -1,15 +1,24 @@
 # SysY2022 编译器 — 开发规划
 
+> **2026-07-20 状态校正**：初赛当前仍使用 SysY2022，本项目继续以 SysY2022
+> 为近期目标。`src/opt/` 现有 38 个优化/分析实现文件及 1 个流水线编排文件，
+> 下文“13 个 Pass”是 2026-06-04 的历史快照。测评用 `-O1` 实际运行
+> O1 + O2 + O3 + 通用模式优化 + 指令调度。批量测试现改为严格比较 stdout
+> 与退出值，缺少 `.out` 或超时不再计为通过。六例修复前官网成绩为
+> Functional 100/100、H_Functional 40/40、Performance 54/60；当前提交态仅完成
+> `h-5-01/02/03`、`crypto-1/2/3` 本地 6/6 验证，完整成绩仍需官网确认。
+> 合规审计与 AI/借鉴记录见 [`COMPLIANCE.md`](COMPLIANCE.md)。
+
 ## 项目目标
 
-将 SysY2022 语言编译为 **RV64GC** 汇编（medany 内存模型），最终在 BOOM FPGA 软核上通过全部 208 条测试用例。
+将 SysY2022 语言编译为 **RV64GC** 汇编（medany 内存模型），最终在 BOOM FPGA 软核上通过全部 200 条测试用例。
 
 | 测试类别 | 路径 | 数量 | 难度 |
 |----------|------|------|------|
 | 功能测试 | `test/functional/` | 100 | O0 |
 | 高级功能测试 | `test/h_functional/` | 40 | O0 |
-| 性能测试 | `test/performance/` | 68（23组×3） | O2~O3 |
-| **合计** | | **~208** | |
+| 性能测试 | `test/performance/` | 60（20组×3） | O2~O3 |
+| **合计** | | **200** | |
 
 ---
 
@@ -146,9 +155,9 @@ P3 = instructionScheduling → O1
 |---|------|------|:--:|
 | B1 | **I/O 运行时库** — getint/putint/starttime/stoptime 等 C 实现 + 编译为 libsysy.a | 解锁全部 functional/h_functional/performance 测试 | ✅ 已完成 |
 | B2 | **自动化测试脚本** — .sy→.S→gcc→qemu diff .out 批量回归 | functional 100 + h_functional 40 | ✅ 已完成 |
-| B3 | **functional 100 回归** + Bug 修复 | 确保 O0 基本正确 | 🔴 待运行 |
-| B4 | **h_functional 40 回归** + Bug 修复 | 高级特性正确 | 🔴 待运行 |
-| B5 | **性能测试 68 回归** + O0 基线测量 | 性能基准 | 🔴 待运行 |
+| B3 | **functional 100 回归** + Bug 修复 | 确保 O0 基本正确 | ✅ 官网 100/100 |
+| B4 | **h_functional 40 回归** + Bug 修复 | 高级特性正确 | ✅ 官网 40/40 |
+| B5 | **性能测试 60 回归** + O0 基线测量 | 性能基准 | 🟡 六例已验证，完整官网回归待运行 |
 
 ### 3.2 🟡 高价值优化（实现复杂但收益大）
 
@@ -237,7 +246,7 @@ compiler/
 │   ├── *.sy                         端到端测试用例
 │   ├── functional/*.sy              100 功能测试（尚未批量回归）
 │   ├── h_functional/*.sy            40 高级功能测试（尚未批量回归）
-│   └── performance/*.sy             68 性能测试（尚未批量回归）
+│   └── performance/*.sy             60 性能测试（完整官网回归待确认）
 ├── SysYlib/
 │   ├── sylib.h                       运行时库头文件（I/O + 计时函数声明）
 │   └── sylib.c                       运行时库实现（getint/putint/starttime/stoptime等）
@@ -307,4 +316,4 @@ compiler/
 远期:          循环分块/融合/向量化 → FPGA 上板
 ```
 
-> **当前日期**：2026-06-04 &nbsp;|&nbsp; **测试通过**：functional 99/100, h_functional 39/40, performance 51/60 (O0) &nbsp;|&nbsp; **优化 Pass**：13 个全部实现 &nbsp;|&nbsp; **运行时库**：已集成
+> **历史快照（2026-06-04）**：functional 99/100, h_functional 39/40, performance 51/60 (O0) &nbsp;|&nbsp; **优化 Pass**：13 个全部实现 &nbsp;|&nbsp; **运行时库**：已集成
