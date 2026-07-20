@@ -158,8 +158,9 @@ target_link_libraries(test_ir sysy_ir_builder sysy_opt ${ANTLR4_RUNTIME_TARGET})
 # IR pipeline fixtures so a target-code safety fix can be validated in
 # isolation.
 add_executable(test_peephole
-    tests/test_peephole.cpp
+    tests/test_peephole.cppx
 )
+set_source_files_properties(tests/test_peephole.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_peephole PRIVATE include)
 target_link_libraries(test_peephole PRIVATE sysy_opt)
 
