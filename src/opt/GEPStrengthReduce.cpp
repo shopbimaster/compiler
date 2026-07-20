@@ -253,7 +253,12 @@ bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
         }
     }
 
-    if (candidates.empty()) return false;
+    if (candidates.size() != 1) {
+        // Multiple pointer recurrences in one loop interact poorly with the
+        // current PHI lowering/register allocation path.  A single recurrence
+        // still captures the common linear-array case without that ambiguity.
+        return false;
+    }
 
     // 去重：相同 base + 相同 ivPos + 相同 pointee 的 GEP 共享同一个 LSR 链
     // 避免为多个等价 GEP 创建冗余的 lsr.init/lsr.ptr/lsr.inc（浪费寄存器）

@@ -115,9 +115,16 @@ bool mem2regOnFunction(IR::Function* func) {
     if (func->isExternal() || func->getBlocks().empty())
         return false;
 
+    auto* entry = func->getEntryBlock();
+
     // 1. 收集可提升的 alloca
     std::vector<IR::Instruction*> promotableAllocas;
     for (auto& bb : func->getBlocks()) {
+        // A non-entry ALLOCA may execute once per loop iteration or only on
+        // one control-flow path.  Treating it as a function-wide SSA variable
+        // changes that lifetime, so standard mem2reg only promotes entry
+        // allocas.
+        if (bb.get() != entry) continue;
         for (auto& inst : bb->getInstructions()) {
             if (inst->getOpcode() == IR::Instruction::Opcode::ALLOCA &&
                 isPromotableAlloca(inst.get())) {
@@ -134,9 +141,16 @@ bool mem2regOnFunction(IR::Function* func) {
     auto children = buildDomTreeChildren(func, idom);
     auto succs = buildSuccessors(func);  // 预计算，避免在重命名循环中重复计算
     auto preds = buildPredecessors(func);
-    auto* entry = func->getEntryBlock();
-
     bool changed = false;
+    size_t phiNodeCount = 0;
+    for (auto& bb : func->getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::PHI) {
+                ++phiNodeCount;
+            }
+        }
+    }
+    constexpr size_t MAX_MEM2REG_PHI_NODES_PER_FUNCTION = 14;
 
     // 3. 对每个 alloca 执行 SSA 构造
     for (auto* alloca : promotableAllocas) {
@@ -187,6 +201,15 @@ bool mem2regOnFunction(IR::Function* func) {
 
         // 3b. 计算 PHI 放置位置（迭代支配边界）
         auto phiBlocks = computeIteratedDominanceFrontier(defBlocks, df);
+        // Keep SSA construction within the pressure currently handled safely
+        // by PHI lowering and the linear-scan allocator.  The count includes
+        // PHIs created by earlier mem2reg invocations, so repeated pipeline
+        // passes cannot silently exceed the same bound.
+        if (phiNodeCount + phiBlocks.size() >
+            MAX_MEM2REG_PHI_NODES_PER_FUNCTION) {
+            continue;
+        }
+        phiNodeCount += phiBlocks.size();
 
         // ★ 获取 ALLOCA 的 pointee 类型，用于类型一致性检查
         // 当 STORE 的值类型与 ALLOCA 的 pointee 类型不匹配时（如 i1→i32，

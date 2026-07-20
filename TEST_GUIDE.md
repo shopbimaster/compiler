@@ -1,5 +1,28 @@
 # SysY2022 编译器 — 测试指导文档
 
+> **当前权威流程（2026-07-20）**：本文后半部分保留了一些历史路径和脚本说明，
+> 当前应优先使用以下命令。测试框架采用严格模式：`.out` 缺失、stdout/退出值
+> 不一致、编译/链接失败或超时都会返回非零状态。
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+
+bash scripts/build_sylib.sh
+bash scripts/run_tests.sh quick
+bash scripts/run_tests.sh func O0
+bash scripts/run_tests.sh all O1
+```
+
+项目脚本使用仓库相对路径，不再要求项目必须位于
+`/mnt/d/VSCodeProjects/compiler`。当前测试集为 functional 100、
+h_functional 40、performance 60，共 200 个源程序。
+
+截至 2026-07-20，修改后的提交态仅验证了 `h-5-01/02/03` 与
+`crypto-1/2/3` 六个目标用例（6/6 PASS）。修复前官网完整成绩为
+100/100、40/40、54/60；不要在官网重测前记录为 Performance 60/60。
+
 ## 项目目录结构
 
 ```
@@ -111,7 +134,7 @@ make -j$(nproc)           # 构建 compiler 及所有测试程序
 构建运行时库：
 ```bash
 cd /mnt/d/VSCodeProjects/compiler
-bash scripts/build/build_sylib.sh
+bash scripts/build_sylib.sh
 ```
 
 ---
@@ -156,11 +179,11 @@ bash scripts/run_tests.sh all O1
 
 ### 2.3 优化级别
 
-**重要**：测评服务器仅支持 `-O1` 这一个优化选项，编译器将其映射为最高优化级别（OALL = O1+O2+O3）。小写选项仅用于本地逐级调试。
+**重要**：测评服务器仅支持 `-O1` 这一个优化选项，编译器将其映射为最高优化级别（OALL = O1+O2+O3+P0+P3）。小写选项仅用于本地逐级调试。
 
 | 命令行参数 | 内部优化级别 | 说明 |
 |-----------|------------|------|
-| `-O1` | OALL | **测评服务器使用**，全部优化 (O1+O2+O3，不含P0/P3) |
+| `-O1` | OALL | **测评服务器使用**，全部通用优化 (O1+O2+O3+P0+P3) |
 | `-O0` | O0 | 无优化 |
 | `-o0` | O0 | 无优化（本地调试） |
 | `-o1` | O1 | 仅 O1：CF + DCE + CSE + LICM（本地调试） |
@@ -346,7 +369,7 @@ rm -rf src/antlr/
 
 - `build/` — 构建产物
 - `src/antlr/` — ANTLR 生成文件
-- `test/functional/`、`test/h_functional/`、`test/performance/` — 官方测试用例（不提交）
+- `test/functional/`、`test/h_functional/`、`test/performance/` — 官方测试用例；输入与参考输出按原样纳入版本控制
 - `*.o`、`*.obj`、`*.s`、`*.elf` — 编译中间文件
 - `tmp/`、`temp/` — 临时目录
 - `.vscode/`、`.idea/` — IDE 配置
@@ -415,4 +438,5 @@ cd build && cmake .. && make -j$(nproc)
 | 集成测试 | .sy → IR | 23/23 PASSED |
 | Final_Test | functional 批量 | 100/100 |
 | Final_Test | h_functional 批量 | 40/40 |
-| Final_Test | performance 批量 | 60/60 |
+| Final_Test | performance 批量 | 修复前官网 54/60；修改后完整结果待官网确认 |
+| 目标回归 | h-5 ×3 + crypto ×3 | 本地提交态 6/6 PASS |
