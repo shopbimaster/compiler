@@ -1539,7 +1539,11 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 std::string laRd, laSym;
                 if (tryMatch(lines[i], "la", laRd, laSym, imm) && !laSym.empty()) {
                     // 匹配下一行的内存访问指令
-                    static const char* LOAD_OPS[] = {"ld", "lw", "lh", "lb", "lhu", "lbu", "flw", "fld"};
+                    // GNU as can use the integer load destination as the
+                    // temporary address register for symbolic loads.  A
+                    // floating-point destination cannot hold that address,
+                    // so flw/fld must retain the preceding `la`.
+                    static const char* LOAD_OPS[] = {"ld", "lw", "lh", "lb", "lhu", "lbu"};
                     static const char* STORE_OPS[] = {"sd", "sw", "sh", "sb", "fsw", "fsd"};
                     auto parseMemOff = [](const std::string& memOff, std::string& offStr, std::string& baseReg) -> bool {
                         auto parenPos = memOff.find('(');

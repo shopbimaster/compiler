@@ -1,6 +1,6 @@
 #!/bin/bash
 # Ubuntu 24.04 一键部署脚本
-# 用于快速设置 G4 语法测试环境
+# 对齐 2026 技术方案的提交构建环境，并安装本项目所需工具链
 
 set -e
 
@@ -36,30 +36,53 @@ echo -e "\n[3/6] 安装依赖..."
 sudo apt-get install -y -q \
     build-essential \
     cmake \
+    clang-18 \
     git \
+    unzip \
     wget \
-    openjdk-17-jre-headless
+    openjdk-17-jdk-headless \
+    gcc-riscv64-linux-gnu \
+    binutils-riscv64-linux-gnu \
+    qemu-user
 
 echo -e "${GREEN}✓ 基础依赖已安装${NC}"
 
-# ===== 安装 ANTLR4 =====
-echo -e "\n[4/6] 安装 ANTLR4..."
-if ! command -v antlr4 &> /dev/null; then
-    echo "正在下载 ANTLR4..."
-    sudo wget -q -O /usr/local/lib/antlr-4.13.1-complete.jar \
-        https://www.antlr.org/download/antlr-4.13.1-complete.jar
+# ===== 安装 ANTLR4 4.13.1 生成器与 C++ runtime =====
+echo -e "\n[4/6] 安装 ANTLR4 4.13.1..."
+ANTLR_VERSION=4.13.1
+ANTLR_JAR="/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar"
+if [ ! -f "$ANTLR_JAR" ]; then
+    echo "正在下载 ANTLR4 生成器..."
+    sudo wget -q -O "$ANTLR_JAR" \
+        "https://www.antlr.org/download/antlr-${ANTLR_VERSION}-complete.jar"
+fi
 
-    # 创建 antlr4 脚本
-    cat << 'EOF' | sudo tee /usr/local/bin/antlr4 > /dev/null
+cat << 'EOF' | sudo tee /usr/local/bin/antlr4 > /dev/null
 #!/bin/bash
 exec java -jar /usr/local/lib/antlr-4.13.1-complete.jar "$@"
 EOF
-    sudo chmod +x /usr/local/bin/antlr4
+sudo chmod +x /usr/local/bin/antlr4
 
-    echo -e "${GREEN}✓ ANTLR4 已安装${NC}"
+if [ ! -f /usr/local/include/antlr4-runtime/atn/SerializedATNView.h ] ||
+   [ ! -f /usr/local/include/antlr4-runtime/atn/ParserATNSimulatorOptions.h ]; then
+    echo "正在构建 ANTLR4 C++ runtime ${ANTLR_VERSION}..."
+    ANTLR_BUILD_ROOT=$(mktemp -d)
+    trap 'rm -rf "$ANTLR_BUILD_ROOT"' EXIT
+    wget -q -O "$ANTLR_BUILD_ROOT/runtime.zip" \
+        "https://www.antlr.org/download/antlr4-cpp-runtime-${ANTLR_VERSION}-source.zip"
+    unzip -q "$ANTLR_BUILD_ROOT/runtime.zip" -d "$ANTLR_BUILD_ROOT/src"
+    cmake -S "$ANTLR_BUILD_ROOT/src" -B "$ANTLR_BUILD_ROOT/build" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DANTLR_BUILD_CPP_TESTS=OFF
+    cmake --build "$ANTLR_BUILD_ROOT/build" --parallel "$(nproc)"
+    sudo cmake --install "$ANTLR_BUILD_ROOT/build"
+    sudo ldconfig
+    rm -rf "$ANTLR_BUILD_ROOT"
+    trap - EXIT
 else
-    echo -e "${GREEN}✓ ANTLR4 已经安装${NC}"
+    echo -e "${GREEN}✓ ANTLR4 C++ runtime ${ANTLR_VERSION} 已安装${NC}"
 fi
+echo -e "${GREEN}✓ ANTLR4 ${ANTLR_VERSION} 已安装${NC}"
 
 # ===== 验证 =====
 echo -e "\n[5/6] 验证安装..."
@@ -78,8 +101,16 @@ else
     echo -e "${RED}✗${NC}"
 fi
 
+echo -n "  Clang 18: "
+if clang++-18 --version &>/dev/null; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${RED}✗${NC}"
+fi
+
 echo -n "  ANTLR4: "
-if antlr4 -version &>/dev/null; then
+if [ -f /usr/local/include/antlr4-runtime/atn/SerializedATNView.h ] &&
+   [ -f /usr/local/include/antlr4-runtime/atn/ParserATNSimulatorOptions.h ]; then
     echo -e "${GREEN}✓${NC}"
 else
     echo -e "${RED}✗${NC}"
@@ -96,13 +127,11 @@ echo "     cd $SCRIPT_DIR"
 echo "     chmod +x test-grammar.sh"
 echo "     ./test-grammar.sh"
 echo ""
-echo "  2. 或者完整 C++ 测试:"
-echo "     cd $SCRIPT_DIR"
-echo "     mkdir -p build-test && cd build-test"
-echo "     cp ../CMakeLists-test.txt ../CMakeLists.txt"
-echo "     cmake .."
-echo "     make -j4"
-echo "     ./test-grammar ../test/hello.sy"
+echo "  2. 按官方 Ubuntu 24.04 / Clang 18 环境构建:"
+echo "     cd $(cd "$SCRIPT_DIR/../.." && pwd)"
+echo "     cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18"
+echo "     cmake --build build-release --parallel"
+echo "     ctest --test-dir build-release --output-on-failure"
 echo ""
 echo "  3. 详细文档:"
 echo "     查看 DEPLOY_TEST_GUIDE.md"

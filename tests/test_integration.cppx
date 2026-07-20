@@ -287,6 +287,21 @@ void test_instruction_scheduling_integration() {
     PASS();
 }
 
+void test_function_name_does_not_trigger_optimization() {
+    TEST("优化不依赖用户函数名");
+    IRBuilder builder;
+    auto mod = builder.compile("../test/function_name_safety.sy");
+
+    std::string before = mod->dump();
+    CHECK(before.find("call i32 %_and") != std::string::npos);
+
+    Opt::runP0(mod.get());
+    std::string after = mod->dump();
+    CHECK(after.find("call i32 %_and") != std::string::npos);
+
+    PASS();
+}
+
 int main() {
     std::cout << "=== 集成测试: .sy -> IR ===\n\n";
 
@@ -315,6 +330,7 @@ int main() {
     test_arr_partial();
     test_loop_interchange_integration();
     test_instruction_scheduling_integration();
+    test_function_name_does_not_trigger_optimization();
 
     std::cout << "\n=== 结果: " << passed << " passed, "
               << failed << " failed ===\n";
