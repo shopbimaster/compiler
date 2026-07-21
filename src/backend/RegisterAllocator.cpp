@@ -33,6 +33,7 @@ void RegisterAllocator::allocate(IR::Function& func) {
     spillMap.clear();
     floatValues.clear();
     intervals.clear();
+    valToInterval.clear();
     // usedCalleeSaved 不清空 — reserveReg() 在 allocate() 之前调用会预填充
     nextSpillSlot = 0;
     spillSlotSize = 0;
@@ -527,6 +528,13 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
             if (a.end != b.end) return a.end < b.end;
             return a.value->getName() < b.value->getName();
         });
+
+    // ★ 填充 valToInterval：必须在 sort 之后，且此后 intervals 不得再增删。
+    //   coalesceMoves 会原地修改元素的 reg 字段，但不会 push_back，指针保持有效。
+    valToInterval.clear();
+    for (auto& iv : intervals) {
+        valToInterval[iv.value] = &iv;
+    }
 }
 
 void RegisterAllocator::linearScan() {
@@ -626,11 +634,84 @@ void RegisterAllocator::spillAtInterval(LiveInterval& current, std::vector<LiveI
     active.push_back(&current);
 }
 
+// ── 通用 move coalescing 支持函数 ──
+
+LiveInterval* RegisterAllocator::intervalOf(IR::Value* v) {
+    auto it = valToInterval.find(v);
+    return it != valToInterval.end() ? it->second : nullptr;
+}
+
+// 两个值的活跃区间是否重叠（可能同时活跃）。
+// 区间经 buildIntervals 的多处 liveness extension 保守放大，
+// 因此“不重叠”是保守正确的判断——漏合并可接受，错合并不可接受。
+// 任一值无区间（如未提升的 ALLOCA 指针）→ 保守视为重叠，拒绝合并。
+bool RegisterAllocator::intervalsOverlap(IR::Value* a, IR::Value* b) const {
+    auto ia = valToInterval.find(a);
+    auto ib = valToInterval.find(b);
+    if (ia == valToInterval.end() || ib == valToInterval.end()) return true;
+    const LiveInterval* x = ia->second;
+    const LiveInterval* y = ib->second;
+    return x->start <= y->end && y->start <= x->end;
+}
+
+// 物理寄存器 reg 在区间 range 内是否被“第三方”值（≠ self）占用。
+// 用于确保把 self 合并到 reg 后，不会踩踏另一个仍活跃且已占用 reg 的值。
+bool RegisterAllocator::regBusyDuring(const std::string& reg,
+                                      const LiveInterval* range,
+                                      IR::Value* self) const {
+    if (!range) return true;
+    for (const auto& iv : intervals) {
+        if (iv.value == self) continue;
+        if (iv.reg != reg) continue;
+        if (iv.start <= range->end && range->start <= iv.end) return true;
+    }
+    return false;
+}
+
+// 经典 read-modify-write coalescing 判据（旧版逻辑，已在历史用例上验证安全）。
+// 成立条件（全部满足）：
+//   1. incoming 单 use，且唯一 use 是该 PHI；
+//   2. incoming 由某指令定义，该指令以 phi 自身为源操作数（RMW，如 subw s7,s7,s1）；
+//   3. PHI 在 incoming 定义所在 BB 中除该 RMW 指令外无其他 use。
+// 保留此判据作为独立接受路径，确保新版严格包含旧版已验证的安全合并集。
+bool RegisterAllocator::isClassicRmwCoalesce(IR::Value* incoming,
+                                             IR::Instruction* phi,
+                                             const std::string& phiReg) const {
+    (void)phiReg;
+    if (!incoming->hasOneUse()) return false;
+    const auto& uses = incoming->getUses();
+    if (uses.size() != 1) return false;
+    if (uses[0].user != phi) return false;
+
+    auto* defInst = dynamic_cast<IR::Instruction*>(incoming);
+    if (!defInst) return false;
+
+    bool usesPhi = false;
+    for (unsigned j = 0; j < defInst->getNumOperands(); ++j) {
+        if (defInst->getOperand(j) == phi) { usesPhi = true; break; }
+    }
+    if (!usesPhi) return false;
+
+    auto* defBB = defInst->getParent();
+    for (const auto& phiUse : phi->getUses()) {
+        auto* phiUser = dynamic_cast<IR::Instruction*>(phiUse.user);
+        if (!phiUser) continue;
+        if (phiUser == defInst) continue; // read-modify-write 本身
+        if (phiUser->getParent() == defBB) return false; // 同 BB 其他 use → 不安全
+    }
+    return true;
+}
+
 // ================================================================
-// PHI copy coalescing:
-// When a PHI's incoming value is defined by a single instruction
-// whose result is only used by this PHI, we can assign the same
-// register to both, eliminating the "mv" copy instruction.
+// PHI copy coalescing（通用干涉判断版）:
+// 若 PHI 与其某个 incoming 的活跃区间不重叠，且 PHI 的寄存器在
+// incoming 区间内未被第三方占用，则把 incoming 合并到 PHI 的寄存器，
+// 消除 emitPhiMovesForEdge 发射的 mv/fmv.s（该处 phiReg==srcReg 时自动跳过）。
+//
+// 相比旧版的“read-modify-write + 单 use + 无同 BB 其他 use”三条语法限制，
+// 本版改为区间重叠判断：
+//   - PHI 在 incoming 定义点之后仍有 use → 区间覆盖定义点 → 重叠 → 拒绝（等价旧安全检查）
+//   - 但不再要求 incoming 单 use / 必须是 read-modify-write，覆盖面更广。
 //
 // Example (h-5-01 inner loop):
 //   subw s11, s7, s1    # t27 = w - mul
@@ -647,81 +728,40 @@ void RegisterAllocator::coalescePhis(IR::Function& func) {
             auto* phi = inst.get();
             std::string phiReg = getReg(phi);
             if (phiReg.empty()) continue; // PHI spilled, can't coalesce
+            bool phiFloat = floatValues.count(phi) > 0;
 
             for (unsigned i = 0; i + 1 < phi->getNumOperands(); i += 2) {
                 auto* incoming = phi->getOperand(i);
                 if (!incoming) continue;
                 if (dynamic_cast<IR::Constant*>(incoming)) continue;
 
-                // Check: incoming is defined by a single instruction
-                // and only used by this PHI
-                if (!incoming->hasOneUse()) continue;
-                auto& uses = incoming->getUses();
-                if (uses.size() != 1) continue;
-                if (uses[0].user != phi) continue;
-
-                // Check: incoming has a register
+                // incoming 必须已分配到寄存器且尚未与 PHI 同寄存器
                 std::string incomingReg = getReg(incoming);
-                if (incomingReg.empty()) continue; // spilled
+                if (incomingReg.empty()) continue;      // spilled
+                if (incomingReg == phiReg) continue;    // 已合并
 
-                // Already same register? No need to coalesce
-                if (incomingReg == phiReg) continue;
+                // 寄存器类必须一致（int↔int / float↔float）
+                if ((floatValues.count(incoming) > 0) != phiFloat) continue;
 
-                // Check safety: the PHI's register must not be used
-                // by any other active interval at the point of the
-                // incoming value's definition.
-                // The incoming value is only used by the PHI, so
-                // the only use of the PHI's register at the point
-                // of the incoming value's definition is the PHI's
-                // old value (which is being read by the instruction
-                // that defines the incoming value).
-                //
-                // This is safe for read-modify-write operations
-                // (like subw s7, s7, s1 → subw s7, s7, s1).
-                // The instruction reads the old value and writes
-                // the new value to the same register.
+                LiveInterval* inIv = intervalOf(incoming);
+                if (!inIv) continue;                    // 无区间信息，保守放弃
 
-                // Find the definition instruction of the incoming value
-                auto* defInst = dynamic_cast<IR::Instruction*>(incoming);
-                if (!defInst) continue;
-
-                // Verify: the instruction uses the PHI as a source
-                // (read-modify-write pattern), which is always safe
-                // to coalesce.
-                bool usesPhi = false;
-                for (unsigned j = 0; j < defInst->getNumOperands(); ++j) {
-                    if (defInst->getOperand(j) == phi) {
-                        usesPhi = true;
-                        break;
-                    }
-                }
-
-                // Only coalesce if the instruction uses the PHI as a source.
-                // This ensures the instruction is a read-modify-write
-                // (e.g., subw s7, s7, s1) and the PHI's register is not
-                // being used by a different live interval.
-                if (!usesPhi) continue;
-
-                // ★ 安全检查：PHI 在 incoming 定义所在 BB 中不能有其他使用。
-                //   coalescing 后，incoming 定义写入 phiReg。如果 PHI 在同一 BB
-                //   的 incoming 定义之后还有使用，会读到 incoming 的值而非 PHI
-                //   的值，导致语义错误（SEGFAULT/无限循环）。
-                //   使用在其他 BB（body/header）是安全的，因为它们在 latch 之前执行。
-                auto* defBB = defInst->getParent();
-                bool hasOtherUseInDefBB = false;
-                for (auto& phiUse : phi->getUses()) {
-                    auto* phiUser = dynamic_cast<IR::Instruction*>(phiUse.user);
-                    if (!phiUser) continue;
-                    if (phiUser == defInst) continue; // read-modify-write 本身
-                    if (phiUser->getParent() == defBB) {
-                        hasOtherUseInDefBB = true;
-                        break;
-                    }
-                }
-                if (hasOtherUseInDefBB) continue;
+                // ★ 接受路径为两条判据的并集，严格包含旧的已验证安全集：
+                //   (A) 经典 read-modify-write（旧判据，已在历史用例上验证安全）：
+                //       incoming 单 use 于该 PHI、由指令定义、该指令以 PHI 为源、
+                //       且 PHI 在 incoming 定义所在 BB 无其他 use。
+                //   (B) 通用区间不重叠（保守扩展）：incoming 与 phi 区间不重叠，
+                //       且 phiReg 在 incoming 区间内未被第三方占用。
+                //   任一成立即可合并。(B) 因区间只放大不缩小而保守正确。
+                bool acceptRMW = isClassicRmwCoalesce(incoming, phi, phiReg);
+                bool acceptDisjoint =
+                    !intervalsOverlap(incoming, phi)
+                    && !regBusyDuring(phiReg, inIv, incoming);
+                if (!acceptRMW && !acceptDisjoint) continue;
 
                 // Coalesce: assign the PHI's register to the incoming value
                 regMap[incoming] = phiReg;
+                inIv->reg = phiReg;  // 同步区间，供后续 incoming 的 regBusyDuring 判断
             }
         }
     }

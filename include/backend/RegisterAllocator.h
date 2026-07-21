@@ -54,6 +54,23 @@ private:
     void spillAtInterval(LiveInterval& current, std::vector<LiveInterval*>& active);
     void coalescePhis(IR::Function& func);
 
+    // ── 通用 move coalescing 支持 ──
+    // intervalsOverlap: 基于已构造（且经 liveness extension 保守放大）的活跃区间，
+    //   判断两个值是否可能同时活跃。区间只会放大不会缩小，因此“不重叠”判定是
+    //   保守正确的——可能漏合并，但绝不会错合并。
+    // regBusyDuring: 判断物理寄存器 reg 在给定区间内是否被“第三方”值占用。
+    // valToInterval: 值 → intervals 元素指针。⚠️ 不变量：buildIntervals 完成后
+    //   intervals 不得再 push_back（否则指针失效）；仅允许原地修改元素的 reg 字段。
+    bool intervalsOverlap(IR::Value* a, IR::Value* b) const;
+    bool regBusyDuring(const std::string& reg,
+                       const LiveInterval* range, IR::Value* self) const;
+    LiveInterval* intervalOf(IR::Value* v);
+    // 经典 read-modify-write 合并判据（旧版已验证安全逻辑），作为独立接受路径。
+    bool isClassicRmwCoalesce(IR::Value* incoming, IR::Instruction* phi,
+                              const std::string& phiReg) const;
+
+    std::unordered_map<IR::Value*, LiveInterval*> valToInterval;
+
     std::vector<LiveInterval> intervals;
     std::unordered_map<IR::Instruction*, int> instId;
     int maxInstId;
