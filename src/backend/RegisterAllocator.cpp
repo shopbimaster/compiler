@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
-#include <set>
 #include <unordered_set>
 
 namespace Backend {
@@ -97,6 +96,23 @@ int RegisterAllocator::assignInstructionIds(IR::Function& func) {
 }
 
 void RegisterAllocator::buildIntervals(IR::Function& func) {
+    // ================================================================
+    // Collect call instruction IDs (needed for crossesCall analysis)
+    // ================================================================
+    std::vector<int> callIds;
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
+                auto it = instId.find(inst.get());
+                if (it != instId.end()) {
+                    callIds.push_back(it->second);
+                }
+            }
+        }
+    }
+    // Sort for efficient interval checking
+    std::sort(callIds.begin(), callIds.end());
+
     std::unordered_map<IR::Value*, int> firstSeen;
     std::unordered_map<IR::Value*, int> lastSeen;
     // Track all blocks where a value is used (for loop-aware liveness extension)
@@ -507,6 +523,28 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
         valLoopDepth[val] = maxDepth;
     }
 
+    // ================================================================
+    // Compute crossesCall for each value once (before interval creation)
+    // ================================================================
+    std::unordered_map<IR::Value*, bool> valCrossesCall;
+    for (auto it = firstSeen.begin(); it != firstSeen.end(); ++it) {
+        auto* val = it->first;
+        int start = it->second;
+        int end = lastSeen[val];
+        bool crosses = false;
+        // Check if any call falls strictly within (start, end).
+        // Defined AT call (start == callId): the return value does NOT cross its
+        // own call. Last used AT call (end == callId): the value is dead at the
+        // call and does not need to survive it.
+        for (int cid : callIds) {
+            if (start < cid && cid < end) {
+                crosses = true;
+                break;
+            }
+        }
+        valCrossesCall[val] = crosses;
+    }
+
     for (auto it = firstSeen.begin(); it != firstSeen.end(); ++it) {
         LiveInterval interval;
         interval.value = it->first;
@@ -517,6 +555,7 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
         interval.spillSlot = -1;
         interval.useCount = useCount[it->first];
         interval.loopDepth = valLoopDepth[it->first];
+        interval.crossesCall = valCrossesCall[it->first];
         intervals.push_back(interval);
     }
 
@@ -530,33 +569,74 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
 }
 
 void RegisterAllocator::linearScan() {
+    // ================================================================
+    // RA-CALL-1: Call-aware register preference.
+    //
+    // Pool layout (both INT and FLOAT): callee-saved first (12 regs),
+    // caller-saved last.  INT_REGS:  s0-s11 | t3-t6   (12+4)
+    //                     FLOAT_REGS: fs0-fs11 | ft2-ft11 (12+10)
+    //
+    // - crossesCall=true  → prefer callee-saved (s*/fs*), avoid
+    //   caller-save traffic at every call site
+    // - crossesCall=false → prefer caller-saved (t*/ft*), keeping
+    //   callee-saved registers free and reducing prologue traffic
+    //
+    // When the preferred class is exhausted we fall back to the other
+    // class.  A caller-saved register assigned to a call-crossing
+    // value is still correct: getRegsLiveAtCall will save/restore it
+    // around each call.
+    // ================================================================
+    static const size_t CALLEE_COUNT = 12;  // s0-s11 or fs0-fs11
+
     std::vector<LiveInterval*> active;
 
     for (auto& current : intervals) {
         expireOldIntervals(current.start, active);
 
         const auto& regPool = current.isFloat ? FLOAT_REGS : INT_REGS;
-        std::set<std::string> freeRegs(regPool.begin(), regPool.end());
+        const size_t poolSize = regPool.size();
 
-        // 移除已被预留的寄存器
-        for (const auto& r : reservedRegs) {
-            freeRegs.erase(r);
-        }
-
+        // Build active-register set for O(1) lookup
+        std::unordered_set<std::string> activeRegs;
         for (auto* a : active) {
-            if (!a->reg.empty()) {
-                freeRegs.erase(a->reg);
+            if (!a->reg.empty()) activeRegs.insert(a->reg);
+        }
+
+        auto tryAllocate = [&](const std::string& r) -> bool {
+            if (reservedRegs.count(r)) return false;
+            if (activeRegs.count(r)) return false;
+            current.reg = r;
+            regMap[current.value] = r;
+            if (std::find(usedCalleeSaved.begin(), usedCalleeSaved.end(), r)
+                == usedCalleeSaved.end()) {
+                usedCalleeSaved.push_back(r);
+            }
+            return true;
+        };
+
+        bool allocated = false;
+
+        if (current.crossesCall) {
+            // Prefer callee-saved (indices 0..CALLEE_COUNT-1),
+            // fall back to caller-saved (CALLEE_COUNT..poolSize-1).
+            for (size_t i = 0; i < poolSize; ++i) {
+                if (tryAllocate(regPool[i])) { allocated = true; break; }
+            }
+        } else {
+            // Prefer caller-saved first (later pool indices),
+            // fall back to callee-saved (earlier pool indices).
+            for (size_t i = CALLEE_COUNT; i < poolSize; ++i) {
+                if (tryAllocate(regPool[i])) { allocated = true; break; }
+            }
+            if (!allocated) {
+                for (size_t i = 0; i < CALLEE_COUNT; ++i) {
+                    if (tryAllocate(regPool[i])) { allocated = true; break; }
+                }
             }
         }
 
-        if (!freeRegs.empty()) {
-            current.reg = *freeRegs.begin();
-            regMap[current.value] = current.reg;
+        if (allocated) {
             active.push_back(&current);
-            if (std::find(usedCalleeSaved.begin(), usedCalleeSaved.end(), current.reg)
-                == usedCalleeSaved.end()) {
-                usedCalleeSaved.push_back(current.reg);
-            }
         } else {
             spillAtInterval(current, active);
         }

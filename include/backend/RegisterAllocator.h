@@ -18,6 +18,7 @@ struct LiveInterval {
     int spillSlot;
     int useCount;     // number of times this value is used as an operand
     int loopDepth;    // maximum loop nesting depth (0 = outside all loops)
+    bool crossesCall; // true if this interval spans any call instruction
 };
 
 class RegisterAllocator {
