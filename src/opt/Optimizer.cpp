@@ -13,8 +13,19 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
+#include <cstdlib>   // [EXP-SCAFFOLD] std::getenv for GVN A/B switch
+#include <string>
 
 namespace Opt {
+
+// [EXP-SCAFFOLD] OPT_ENABLE_GVN=1 时重新启用被禁用的 GVN。实验用，结束后移除。
+static bool expEnableGVN() {
+    static const bool on = [] {
+        const char* v = std::getenv("OPT_ENABLE_GVN");
+        return v && std::string(v) == "1";
+    }();
+    return on;
+}
 
 // ================================================================
 // O1：基础安全优化（无依赖，总是有益）
@@ -331,19 +342,17 @@ void runO2(IR::Module* mod) {
     }
 
     // 6f. GVN：基于支配树的跨 BB CSE
-    // ★ 禁用：即使限制为仅合并直接支配者的 GEP，跨 BB 合并仍会延长活跃区间，
-    //   增加寄存器压力，导致净性能回退（+1319ms / 60 perf tests）。
-    //   同 BB CSE 已在 6e 中运行，可覆盖大部分冗余。
-    //   根本原因：寄存器分配器对长活跃区间处理不佳，需要改进寄存器分配器
-    //   才能安全启用 GVN。
-    // if (globalValueNumbering(mod)) {
-    //     constantFolding(mod);
-    //     deadCodeElimination(mod);
-    //     if (commonSubexpressionElimination(mod)) {
-    //         constantFolding(mod);
-    //         deadCodeElimination(mod);
-    //     }
-    // }
+    // ★ 历史禁用原因：跨 BB 合并延长活跃区间→寄存器压力增→净回退
+    //   （+1319ms / 60 perf tests）。coalescing 增强（v3.2.0）缩短活跃区间后，
+    //   通过 [EXP-SCAFFOLD] 开关 OPT_ENABLE_GVN=1 做 A/B 实验，验证是否已可安全启用。
+    if (expEnableGVN() && globalValueNumbering(mod)) {   // [EXP-SCAFFOLD]
+        constantFolding(mod);
+        deadCodeElimination(mod);
+        if (commonSubexpressionElimination(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+    }
 }
 
 // ================================================================

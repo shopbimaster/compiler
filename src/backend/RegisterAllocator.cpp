@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cstdlib>   // [EXP-SCAFFOLD] std::getenv for A/B switch
 #include <set>
+#include <string>
 #include <unordered_set>
 
 namespace Backend {
@@ -720,6 +722,12 @@ bool RegisterAllocator::isClassicRmwCoalesce(IR::Value* incoming,
 //   subw s7, s7, s1     # w = w - mul  (no mv needed!)
 // ================================================================
 void RegisterAllocator::coalescePhis(IR::Function& func) {
+    // [EXP-SCAFFOLD] A/B 实验开关：RA_COALESCE_MODE=rmw 时只走判据(A)（等价 v3.1.0），
+    //   默认或 =full 时走 (A)∪(B)（v3.2.0）。实验结束后连同下方判断一并移除。
+    static const bool rmwOnly = [] {
+        const char* m = std::getenv("RA_COALESCE_MODE");
+        return m && std::string(m) == "rmw";
+    }();
     for (auto& bb : func.getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
             if (inst->getOpcode() != IR::Instruction::Opcode::PHI)
@@ -754,8 +762,8 @@ void RegisterAllocator::coalescePhis(IR::Function& func) {
                 //       且 phiReg 在 incoming 区间内未被第三方占用。
                 //   任一成立即可合并。(B) 因区间只放大不缩小而保守正确。
                 bool acceptRMW = isClassicRmwCoalesce(incoming, phi, phiReg);
-                bool acceptDisjoint =
-                    !intervalsOverlap(incoming, phi)
+                bool acceptDisjoint = !rmwOnly    // [EXP-SCAFFOLD] rmw 模式下禁用 (B)
+                    && !intervalsOverlap(incoming, phi)
                     && !regBusyDuring(phiReg, inIv, incoming);
                 if (!acceptRMW && !acceptDisjoint) continue;
 
