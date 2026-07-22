@@ -54,6 +54,16 @@ private:
     void spillAtInterval(LiveInterval& current, std::vector<LiveInterval*>& active);
     void coalescePhis(IR::Function& func);
 
+    // ── 图着色寄存器分配（Chaitin-Briggs，实验性，RA_ALLOCATOR=graph 启用）──
+    // 复用 linearScan 相同的 intervals 输入，只替换“分配决策”这一层：
+    // 用全局干涉图 + 溢出代价函数选择溢出对象，弥补线性扫描“贪心、无全局视野”
+    // 在 GVN 拉长活跃区间后热循环抖动的缺陷。输出接口（regMap/usedCalleeSaved/…）
+    // 与线性扫描完全一致，codegen 无感。
+    void colorAllocate();
+    bool colorRegClass(bool isFloat);   // 对单一寄存器类做一次完整着色，返回是否全部着色成功
+
+    static bool useGraphColoring();     // 图着色开关：默认启用，RA_ALLOCATOR=linear 切回线扫
+
     // ── 通用 move coalescing 支持 ──
     // intervalsOverlap: 基于已构造（且经 liveness extension 保守放大）的活跃区间，
     //   判断两个值是否可能同时活跃。区间只会放大不会缩小，因此“不重叠”判定是
