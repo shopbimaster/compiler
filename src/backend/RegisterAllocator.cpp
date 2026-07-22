@@ -800,6 +800,38 @@ void RegisterAllocator::coalescePhis(IR::Function& func) {
                 }
                 if (hasOtherUseInDefBB) continue;
 
+                // PHI assignments on an edge are parallel.  Coalescing a
+                // read-modify-write incoming value with its destination PHI
+                // overwrites the PHI's old value before the edge copies run.
+                // That is unsafe when a sibling PHI still needs the old value
+                // from this same predecessor, for example:
+                //
+                //   b.next = b + x
+                //   b = phi [b.next, latch]
+                //   c = phi [b,      latch]
+                //
+                // Keep b.next in a distinct register so c receives old b.
+                bool feedsSiblingPhiOnEdge = false;
+                auto* phiBB = phi->getParent();
+                if (phiBB && defBB) {
+                    for (auto& siblingPtr : phiBB->getInstructions()) {
+                        auto* sibling = siblingPtr.get();
+                        if (sibling == phi ||
+                            sibling->getOpcode() != IR::Instruction::Opcode::PHI) {
+                            continue;
+                        }
+                        for (unsigned op = 0; op + 1 < sibling->getNumOperands(); op += 2) {
+                            if (sibling->getOperand(op) == phi &&
+                                sibling->getOperand(op + 1) == defBB) {
+                                feedsSiblingPhiOnEdge = true;
+                                break;
+                            }
+                        }
+                        if (feedsSiblingPhiOnEdge) break;
+                    }
+                }
+                if (feedsSiblingPhiOnEdge) continue;
+
                 // Coalesce: assign the PHI's register to the incoming value
                 regMap[incoming] = phiReg;
             }
