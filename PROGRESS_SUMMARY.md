@@ -279,6 +279,7 @@ make -j$(nproc)
 - **后端**: 代码生成器完整实现（指令选择 + 栈帧 + 线性扫描寄存器分配）
 - **优化**: O1/O2/O3/P0/P3 全部实现，优化流水线完整（含循环交换、循环展开4×、指令调度）
 - **测试用例**: test/ 目录包含 functional (100) + h_functional (40) + performance (60) 共 200 条官方源程序
-- **当前可信结果**: 官网修复前 100/100 + 40/40 + 54/60；本次六个目标用例本地 6/6 PASS
-- **已知风险**: GEP 多递推与 Mem2Reg PHI 保护偏保守，可能影响其他性能用例的优化收益
-- **下一步**: 在官网运行完整 Functional、H_Functional 和 Performance，重点确认正确率、超时及性能分变化
+- **当前稳定基线**: `Commit-Version3.2`（`121266c`）官网 100 分；Functional 100/100、H_Functional 40/40、Performance 60/60，总运行时间 794.8685s
+- **当前开发验证**: `test-gep-lsr-2-v2` 本地寄存器单测通过；固定快速集、h-5 三例及 many_mat_cal/sl/transpose/matmul/conv2d 代表用例共 13 例通过
+- **已知风险**: GEP-LSR-2 会增加循环携带指针的寄存器压力，当前通过“嵌套自然循环内最多 3 链、含调用循环不启用多链”保守限制；完整性能影响尚需官网确认
+- **下一步**: 提交本分支到官网运行完整 Functional、H_Functional 和 Performance，重点观察 many_mat_cal、matmul、conv2d、h-5、sl 与 crypto 的正确性和运行时间
