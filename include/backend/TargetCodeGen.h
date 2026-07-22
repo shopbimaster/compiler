@@ -108,6 +108,7 @@ private:
 
     void computeStackLayout(IR::Function& func);
     int getTypeSize(IR::Type* t);
+    int reserveValueStackSlot(IR::Type* type);
     int getStackOffset(IR::Value* val);
     int allocSlot(IR::Value* val);
 

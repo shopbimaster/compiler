@@ -283,4 +283,9 @@ make -j$(nproc)
 - **相对 Version3.2**: 同为开发板 120，794.8685s → 793.1347s，减少 1.7338s（约 0.22%）；全部 200 个官方用例保持 AC
 - **主要性能结果**: GEP-LSR-2 使 matmul 三例在上一轮官网结果中合计提升约 2.07%；盈利性修正使 shuffle 三例由 5.446539s 恢复至 4.936243s，较修正前提升约 9.37%
 - **已知约束**: GEP-LSR-2 限制嵌套自然循环内最多 3 链、含调用循环不启用多链；多链由外层循环携带时，每条链必须在嵌套循环内使用，以避免地址递推增加寄存器压力和 spill/reload
-- **下一步**: 以 Version3.3 为稳定基线选择下一项独立优化；优先依据热点汇编和目标用例小范围验证，不直接合入 `perf-optimize` 的历史实验提交
+- **已拒绝实验**: RA-LOOP-2 v2（`31cf2db`）官网总时间 821.5363s，较 Version3.3 慢约 3.58%；crypto 三例约慢 183.54%。根因是跨多块的长生命周期值挤出最热循环临时值，并触发大量大偏移 spill/reload；该提交保留在实验分支，不合入 `main`
+- **当前开发候选**: `test-stack-slot-1` 将本地 i32/float SSA 与参数备份槽由统一 8 字节压缩为 4 字节，pointer 仍为 8 字节；outgoing stack arguments、alloca 和调用保存区保持原布局
+- **STACK-SLOT-1 静态证据**: crypto `pseudo_md5` 栈帧 2432→1824，26 处 `li+add+load/store` 大偏移展开全部变为直接 `offset(sp)`，汇编减少 54 行；最终 ELF `.text` 减少 212 字节、机器指令减少 80 条。其余代表用例归一化掉栈偏移后汇编完全一致
+- **STACK-SLOT-1 测试**: 36 个定向 QEMU 用例全部通过；所有 64 位栈访问保持 8 字节对齐、所有函数栈帧保持 16 字节对齐；`test_register_allocator`、`test_integration` 26/26 和 `test_peephole` 通过
+- **STACK-SLOT-1 风险**: crypto-1 本地 QEMU 对照中候选约 0.14～0.15s、基线通常约 0.10s，和静态指令减少相矛盾，可能受 QEMU 翻译块布局影响；不得据此宣称已提速，必须以 BOOM 官网结果决定是否保留
+- **下一步**: 提交 STACK-SLOT-1 到官网运行完整 Functional、H_Functional 和 Performance；重点观察 crypto、h-10、01_mm、many_mat_cal 及总时间，如出现稳定退化则放弃该候选

@@ -3,6 +3,7 @@
 #include <iostream>
 
 #include "backend/RegisterAllocator.h"
+#include "backend/TargetCodeGen.h"
 #include "ir/IR.h"
 
 using namespace IR;
@@ -53,12 +54,46 @@ static bool testPhiCoalescingPreservesSiblingIncoming() {
            allocator.getReg(bPhi) != allocator.getReg(bNext);
 }
 
+// Stack slots for i32 SSA values are accessed with lw/sw and need only four
+// bytes. A long dependency chain keeps register pressure low while still
+// exercising the code generator's slot reservation for every virtual value.
+// With eight-byte slots this crosses the 12-bit stack-immediate boundary and
+// requires a materialized frame adjustment; packed slots stay below it.
+static bool testIntegerVirtualSlotsUseFourBytes() {
+    Module mod;
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "packed_i32_slots");
+    auto* entry = func->createBlock("entry");
+
+    Value* value = ConstantInt::get(IntegerType::I32, 0);
+    for (int i = 0; i < 260; ++i) {
+        auto* next = Instruction::createBinOp(
+            Instruction::Opcode::ADD, IntegerType::I32,
+            "slot." + std::to_string(i), value,
+            ConstantInt::get(IntegerType::I32, i + 1));
+        entry->pushBack(next);
+        value = next;
+    }
+    entry->pushBack(Instruction::createRet(value));
+
+    Backend::TargetCodeGen codegen;
+    std::string assembly = codegen.generate(mod);
+    return assembly.find("sub     sp, sp, t0") == std::string::npos &&
+           assembly.find("addi    sp, sp, -") != std::string::npos;
+}
+
 int main() {
     if (!testPhiCoalescingPreservesSiblingIncoming()) {
         std::cerr << "FAILED: sibling PHI lost its old incoming value\n";
         return 1;
     }
     std::cout << "PASSED: PHI parallel edge-copy coalescing\n";
+
+    if (!testIntegerVirtualSlotsUseFourBytes()) {
+        std::cerr << "FAILED: i32 virtual slots exceeded the compact frame\n";
+        return 1;
+    }
+    std::cout << "PASSED: compact i32 virtual stack slots\n";
     return 0;
 }
 

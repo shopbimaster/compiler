@@ -392,8 +392,7 @@ void TargetCodeGen::computeStackLayout(IR::Function& func) {
                     && !dynamic_cast<IR::Function*>(opVal)
                     && allocaOffset.find(opVal) == allocaOffset.end()
                     && vregStackOffset.find(opVal) == vregStackOffset.end()) {
-                    vregStackOffset[opVal] = stackSize;
-                    stackSize += 8;
+                    vregStackOffset[opVal] = reserveValueStackSlot(opVal->getType());
                 }
             }
 
@@ -403,16 +402,14 @@ void TargetCodeGen::computeStackLayout(IR::Function& func) {
                 && inst->getOpcode() != IR::Instruction::Opcode::STORE
                 && inst->getOpcode() != IR::Instruction::Opcode::ALLOCA
                 && inst->getType() && !inst->getType()->isVoid()) {
-                vregStackOffset[vr] = stackSize;
-                stackSize += 8;
+                vregStackOffset[vr] = reserveValueStackSlot(inst->getType());
             }
         }
     }
 
     for (unsigned i = 0; i < func.getNumArgs(); ++i) {
         auto* arg = func.getArg(i);
-        paramOffsets[arg] = stackSize;
-        stackSize += 8;
+        paramOffsets[arg] = reserveValueStackSlot(arg->getType());
     }
 
     savesRA = false;
@@ -441,6 +438,17 @@ int TargetCodeGen::getTypeSize(IR::Type* t) {
         return at->getNumElements() * getTypeSize(at->getElementType());
     }
     return 8;
+}
+
+int TargetCodeGen::reserveValueStackSlot(IR::Type* type) {
+    // The backend materializes integer and float SSA values with lw/sw or
+    // flw/fsw, so they require four bytes. Pointers use ld/sd and retain
+    // eight-byte size/alignment. Unknown kinds conservatively use eight bytes.
+    int slotSize = (type && (type->isInteger() || type->isFloat())) ? 4 : 8;
+    stackSize = (stackSize + slotSize - 1) & ~(slotSize - 1);
+    int offset = stackSize;
+    stackSize += slotSize;
+    return offset;
 }
 
 // Helper: adjust sp by delta (handles large immediates)
@@ -1416,9 +1424,8 @@ int TargetCodeGen::allocSlot(IR::Value* val) {
     if (vregStackOffset.find(val) != vregStackOffset.end()) {
         return vregStackOffset[val];
     }
-    int offset = stackSize;
+    int offset = reserveValueStackSlot(val ? val->getType() : nullptr);
     vregStackOffset[val] = offset;
-    stackSize += 16;
     return offset;
 }
 
