@@ -13,16 +13,20 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
-#include <cstdlib>   // [EXP-SCAFFOLD] std::getenv for GVN A/B switch
+#include <cstdlib>   // std::getenv for GVN escape hatch
 #include <string>
 
 namespace Opt {
 
-// [EXP-SCAFFOLD] OPT_ENABLE_GVN=1 时重新启用被禁用的 GVN。实验用，结束后移除。
-static bool expEnableGVN() {
+// GVN 默认启用。历史因线性扫描无法处理其拉长的活跃区间而禁用（+1319ms/线扫时代）；
+// 换用 call-aware 图着色分配器后，图着色的全局溢出决策消化了长区间——
+// 图着色下静态实测 GVN 净降指令 -2.7% / 循环加权 spill -264 / 零回退用例，
+// 正确性 60/60。故正式启用。逃生开关 OPT_DISABLE_GVN=1 可关闭（对称于
+// RA_ALLOCATOR=linear），用于平台回退时快速定位。
+static bool gvnEnabled() {
     static const bool on = [] {
-        const char* v = std::getenv("OPT_ENABLE_GVN");
-        return v && std::string(v) == "1";
+        const char* v = std::getenv("OPT_DISABLE_GVN");
+        return !(v && std::string(v) == "1");
     }();
     return on;
 }
@@ -342,10 +346,11 @@ void runO2(IR::Module* mod) {
     }
 
     // 6f. GVN：基于支配树的跨 BB CSE
-    // ★ 历史禁用原因：跨 BB 合并延长活跃区间→寄存器压力增→净回退
-    //   （+1319ms / 60 perf tests）。coalescing 增强（v3.2.0）缩短活跃区间后，
-    //   通过 [EXP-SCAFFOLD] 开关 OPT_ENABLE_GVN=1 做 A/B 实验，验证是否已可安全启用。
-    if (expEnableGVN() && globalValueNumbering(mod)) {   // [EXP-SCAFFOLD]
+    // 历史禁用原因：跨 BB 合并延长活跃区间→线性扫描寄存器压力增→净回退
+    //   （+1319ms / 60 perf tests）。换用 call-aware 图着色分配器后，其全局溢出
+    //   决策消化了长区间，图着色下静态实测 GVN 净降指令/循环 spill、零回退，
+    //   正确性 60/60。故正式启用。OPT_DISABLE_GVN=1 可关闭。
+    if (gvnEnabled() && globalValueNumbering(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
         if (commonSubexpressionElimination(mod)) {
