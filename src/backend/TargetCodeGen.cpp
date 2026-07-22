@@ -1096,18 +1096,28 @@ void TargetCodeGen::emitPhiMovesForEdge(IR::BasicBlock* from, IR::BasicBlock* to
         return;
     }
 
-    // 多个 PHI moves：需要处理并行拷贝（避免循环覆盖）
-    // 收集所有 (destReg, srcReg) 对，其中 srcReg 和 destReg 都在寄存器中
+    // 多个 PHI moves：寄存器和栈位置必须一起按并行拷贝处理。
+    // 只调度 reg->reg 而提前发射 stack->reg 会覆盖仍被其他 move
+    // 读取的旧寄存器值（多条 GEP 递推 PHI 很容易触发该模式）。
     struct MovePair {
         std::string destReg;
         std::string srcReg;
+        int destOffset;
+        int srcOffset;
+        std::string destLoc;
+        std::string srcLoc;
         bool isFloat;
         bool isPointer;
-        IR::Instruction* phi;
         IR::Value* incoming;
+        bool sourceFromScratch = false;
     };
-    std::vector<MovePair> regMoves;
-    std::vector<MovePair> stackMoves;  // 需要通过栈中转的 moves
+    std::vector<MovePair> allMoves;
+
+    auto locationKey = [](const std::string& reg, int offset) {
+        if (!reg.empty()) return std::string("reg:") + reg;
+        if (offset >= 0) return std::string("stack:") + std::to_string(offset);
+        return std::string();
+    };
 
     for (auto& m : moves) {
         auto* phi = m.phi;
@@ -1117,157 +1127,141 @@ void TargetCodeGen::emitPhiMovesForEdge(IR::BasicBlock* from, IR::BasicBlock* to
 
         std::string phiReg = regAlloc.hasReg(phi) ? regAlloc.getReg(phi) : "";
         std::string srcReg = (incoming && regAlloc.hasReg(incoming)) ? regAlloc.getReg(incoming) : "";
+        int destOffset = phiReg.empty() ? getStackOffset(phi) : -1;
+        bool isConstant = dynamic_cast<IR::ConstantInt*>(incoming) ||
+                          dynamic_cast<IR::ConstantFloat*>(incoming);
+        int srcOffset = (srcReg.empty() && !isConstant)
+                            ? getStackOffset(incoming) : -1;
+        std::string destLoc = locationKey(phiReg, destOffset);
+        std::string srcLoc = isConstant ? "" : locationKey(srcReg, srcOffset);
 
-        if (!phiReg.empty() && !srcReg.empty() && phiReg != srcReg) {
-            regMoves.push_back({phiReg, srcReg, isFloat, isPointer, phi, incoming});
-        } else if (!phiReg.empty() && srcReg.empty()) {
-            // PHI 在寄存器，incoming 不在 → 需要特殊处理
-            stackMoves.push_back({phiReg, "", isFloat, isPointer, phi, incoming});
-        } else if (phiReg.empty() && !srcReg.empty()) {
-            // PHI 不在寄存器，incoming 在寄存器 → 存到栈
-            stackMoves.push_back({"", srcReg, isFloat, isPointer, phi, incoming});
-        } else if (phiReg.empty() && srcReg.empty()) {
-            // 两者都不在寄存器 → 通过临时寄存器中转
-            stackMoves.push_back({"", "", isFloat, isPointer, phi, incoming});
+        if (destLoc.empty() || (!isConstant && srcLoc.empty()) ||
+            (!srcLoc.empty() && destLoc == srcLoc)) {
+            continue;
         }
-        // phiReg == srcReg 时无需 move
+        allMoves.push_back({phiReg, srcReg, destOffset, srcOffset,
+                            destLoc, srcLoc, isFloat, isPointer, incoming});
     }
 
-    // 先处理非寄存器 moves（不会产生循环依赖）
-    for (auto& m : stackMoves) {
-        int phiOffset = getStackOffset(m.phi);
-        if (m.destReg.empty() && m.srcReg.empty()) {
-            // 两者都在栈上
-            if (phiOffset < 0) continue;
-            if (auto* ci = dynamic_cast<IR::ConstantInt*>(m.incoming)) {
-                emitter.emitText("  li  t0, " + std::to_string(ci->getValue()));
-                emitter.emitText(emitStackStore("t0", phiOffset, m.isPointer ? "sd" : "sw"));
-            } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(m.incoming)) {
-                union { float f; uint32_t i; } u;
-                u.f = static_cast<float>(cf->getValue());
-                emitter.emitText("  li  t2, " + std::to_string(u.i));
-                emitter.emitText("  fmv.w.x  ft0, t2");
-                emitter.emitText(emitStackStore("ft0", phiOffset, "fsw"));
-            } else {
-                int srcOffset = getStackOffset(m.incoming);
-                if (srcOffset >= 0) {
-                    std::string loadInsn = m.isFloat ? "flw" : (m.isPointer ? "ld" : "lw");
-                    std::string storeInsn = m.isFloat ? "fsw" : (m.isPointer ? "sd" : "sw");
-                    std::string tmpReg = m.isFloat ? "ft0" : "t0";
-                    emitter.emitText(emitStackLoad(tmpReg, srcOffset, loadInsn));
-                    emitter.emitText(emitStackStore(tmpReg, phiOffset, storeInsn));
-                }
-            }
-        } else if (m.destReg.empty()) {
-            // PHI 在栈上，incoming 在寄存器
-            if (phiOffset < 0) continue;
-            std::string storeInsn = m.isFloat ? "fsw" : (m.isPointer ? "sd" : "sw");
-            emitter.emitText(emitStackStore(m.srcReg, phiOffset, storeInsn));
-        } else {
-            // PHI 在寄存器，incoming 不在
-            if (auto* ci = dynamic_cast<IR::ConstantInt*>(m.incoming)) {
-                emitter.emitText("  li  " + m.destReg + ", " + std::to_string(ci->getValue()));
+    if (allMoves.empty()) return;
+
+    auto emitMove = [&](MovePair& m, const std::string& savedScratch,
+                        const std::string& transferScratch) {
+        std::string sourceReg = m.sourceFromScratch ? savedScratch : m.srcReg;
+        std::string loadInsn = m.isFloat ? "flw" : (m.isPointer ? "ld" : "lw");
+        std::string storeInsn = m.isFloat ? "fsw" : (m.isPointer ? "sd" : "sw");
+
+        if (!m.destReg.empty()) {
+            if (!sourceReg.empty()) {
+                emitter.emitText("  " + std::string(m.isFloat ? "fmv.s" : "mv") +
+                                 "  " + m.destReg + ", " + sourceReg);
+            } else if (auto* ci = dynamic_cast<IR::ConstantInt*>(m.incoming)) {
+                emitter.emitText("  li  " + m.destReg + ", " +
+                                 std::to_string(ci->getValue()));
             } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(m.incoming)) {
                 union { float f; uint32_t i; } u;
                 u.f = static_cast<float>(cf->getValue());
                 emitter.emitText("  li  t2, " + std::to_string(u.i));
                 emitter.emitText("  fmv.w.x  " + m.destReg + ", t2");
             } else {
-                int srcOffset = getStackOffset(m.incoming);
-                if (srcOffset >= 0) {
-                    std::string loadInsn = m.isFloat ? "flw" : (m.isPointer ? "ld" : "lw");
-                    emitter.emitText(emitStackLoad(m.destReg, srcOffset, loadInsn));
-                }
+                emitter.emitText(emitStackLoad(m.destReg, m.srcOffset, loadInsn));
             }
+            return;
         }
-    }
 
-    // 处理寄存器-寄存器 moves（可能有循环依赖）
-    // 简单方法：检测循环并使用临时寄存器破环
-    if (regMoves.empty()) return;
+        if (!sourceReg.empty()) {
+            emitter.emitText(emitStackStore(sourceReg, m.destOffset, storeInsn));
+        } else if (auto* ci = dynamic_cast<IR::ConstantInt*>(m.incoming)) {
+            emitter.emitText("  li  " + transferScratch + ", " +
+                             std::to_string(ci->getValue()));
+            emitter.emitText(emitStackStore(transferScratch, m.destOffset, storeInsn));
+        } else if (auto* cf = dynamic_cast<IR::ConstantFloat*>(m.incoming)) {
+            union { float f; uint32_t i; } u;
+            u.f = static_cast<float>(cf->getValue());
+            emitter.emitText("  li  t2, " + std::to_string(u.i));
+            emitter.emitText("  fmv.w.x  " + transferScratch + ", t2");
+            emitter.emitText(emitStackStore(transferScratch, m.destOffset, storeInsn));
+        } else {
+            emitter.emitText(emitStackLoad(transferScratch, m.srcOffset, loadInsn));
+            emitter.emitText(emitStackStore(transferScratch, m.destOffset, storeInsn));
+        }
+    };
 
     // 分离 int 和 float moves
     std::vector<MovePair*> intMoves, floatMoves;
-    for (auto& m : regMoves) {
+    for (auto& m : allMoves) {
         if (m.isFloat) floatMoves.push_back(&m);
         else intMoves.push_back(&m);
     }
 
-    // 处理一类 moves（int 或 float）
-    // 并行拷贝解析：拓扑排序 + 破环
-    // 一个 move i 可以执行当且仅当它的 dest 不是任何 UNDONE move 的 src
-    // （即不会覆盖别人还需要读的值）
-    auto processMoves = [&](std::vector<MovePair*>& moves, const std::string& scratchReg) {
-        if (moves.empty()) return;
+    // 并行拷贝解析：一个 move 只有在其目标位置不再被其他未完成
+    // move 读取时才能执行。环使用保留 scratch 保存一个旧目标值。
+    auto processMoves = [&](std::vector<MovePair*>& moveClass,
+                            const std::string& savedScratch,
+                            const std::string& transferScratch) {
+        if (moveClass.empty()) return;
+        std::vector<bool> done(moveClass.size(), false);
+        int remaining = static_cast<int>(moveClass.size());
 
-        std::vector<bool> done(moves.size(), false);
-        int remaining = static_cast<int>(moves.size());
-        int redirectIdx = -1;  // 破环后需要从 scratch 读取的 move 索引
-
-        // 拓扑扫描：执行不被其他 move 阻塞的 move
-        auto topologicalScan = [&]() -> bool {
+        auto topologicalScan = [&]() {
             bool anyProgress = true;
             while (anyProgress && remaining > 0) {
                 anyProgress = false;
-                for (int i = 0; i < (int)moves.size(); ++i) {
+                for (int i = 0; i < static_cast<int>(moveClass.size()); ++i) {
                     if (done[i]) continue;
                     bool blocked = false;
-                    for (int j = 0; j < (int)moves.size(); ++j) {
+                    for (int j = 0; j < static_cast<int>(moveClass.size()); ++j) {
                         if (i != j && !done[j] &&
-                            moves[j]->srcReg == moves[i]->destReg) {
+                            moveClass[j]->srcLoc == moveClass[i]->destLoc) {
                             blocked = true;
                             break;
                         }
                     }
                     if (!blocked) {
-                        std::string src = (i == redirectIdx) ? scratchReg : moves[i]->srcReg;
-                        emitter.emitText("  " + std::string(moves[i]->isFloat ? "fmv.s" : "mv") +
-                                         "  " + moves[i]->destReg + ", " + src);
+                        emitMove(*moveClass[i], savedScratch, transferScratch);
                         done[i] = true;
                         remaining--;
                         anyProgress = true;
                     }
                 }
             }
-            return anyProgress;
         };
 
-        // Phase 1: 拓扑扫描
         topologicalScan();
-
-        // Phase 2: 破环（处理一个或多个独立循环）
         while (remaining > 0) {
             int start = -1;
-            for (int i = 0; i < (int)moves.size(); ++i) {
+            for (int i = 0; i < static_cast<int>(moveClass.size()); ++i) {
                 if (!done[i]) { start = i; break; }
             }
             if (start < 0) break;
 
-            // 保存 start->dest 到 scratch，然后执行 start
-            emitter.emitText("  " + std::string(moves[start]->isFloat ? "fmv.s" : "mv") +
-                             "  " + scratchReg + ", " + moves[start]->destReg);
-            emitter.emitText("  " + std::string(moves[start]->isFloat ? "fmv.s" : "mv") +
-                             "  " + moves[start]->destReg + ", " + moves[start]->srcReg);
+            auto* startMove = moveClass[start];
+            std::string loadInsn = startMove->isFloat ? "flw" :
+                                   (startMove->isPointer ? "ld" : "lw");
+            if (!startMove->destReg.empty()) {
+                emitter.emitText("  " + std::string(startMove->isFloat ? "fmv.s" : "mv") +
+                                 "  " + savedScratch + ", " + startMove->destReg);
+            } else {
+                emitter.emitText(emitStackLoad(savedScratch,
+                                                startMove->destOffset, loadInsn));
+            }
+            std::string savedLoc = startMove->destLoc;
+            emitMove(*startMove, savedScratch, transferScratch);
             done[start] = true;
             remaining--;
 
-            // 找到读取 start->dest 旧值的 move，标记它从 scratch 读取
-            redirectIdx = -1;
-            for (int j = 0; j < (int)moves.size(); ++j) {
-                if (!done[j] && moves[j]->srcReg == moves[start]->destReg) {
-                    redirectIdx = j;
-                    break;
+            for (int j = 0; j < static_cast<int>(moveClass.size()); ++j) {
+                if (!done[j] && moveClass[j]->srcLoc == savedLoc) {
+                    moveClass[j]->sourceFromScratch = true;
+                    moveClass[j]->srcLoc = std::string("scratch:") + savedScratch;
                 }
             }
-
-            // 重新拓扑扫描，环已断开，剩余的链可按序执行
             topologicalScan();
-            redirectIdx = -1;
         }
     };
 
-    processMoves(intMoves, "t0");
-    processMoves(floatMoves, "ft0");
+    processMoves(intMoves, "t0", "t1");
+    processMoves(floatMoves, "ft0", "ft1");
 }
 
 std::string TargetCodeGen::emitValueToStack(IR::Value* val, int stackOffset, bool isFloat) {
