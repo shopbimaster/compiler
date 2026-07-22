@@ -102,9 +102,11 @@ struct GEPCandidate {
 // ================================================================
 // 对单个循环执行 GEP 强度削弱
 // allHeaders: 函数中所有循环的 header 集合，用于检测嵌套循环
+// nestedLoopBlocks: 当前循环内部所有嵌套循环的基本块，用于盈利性判断
 // ================================================================
 bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
-                      const std::unordered_set<IR::BasicBlock*>& allHeaders) {
+                      const std::unordered_set<IR::BasicBlock*>& allHeaders,
+                      const std::unordered_set<IR::BasicBlock*>& nestedLoopBlocks) {
     auto info = analyzeLoopInduction(loop, func);
     if (!info.var || !info.start || !info.step) return false;
 
@@ -283,6 +285,32 @@ bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
                              cand.gep->getType(), cand.constOffset});
     }
 
+    // A recurrence carried by an outer loop stays live across every nested
+    // loop in its body.  That cost is worthwhile when the pointer is consumed
+    // inside a nested loop (for example, a matrix row base reused by the j/k
+    // loops), but not when it is used only before or after unrelated inner
+    // control flow.  The latter pattern turns cheap indexed accesses into
+    // long-lived pointer PHIs and spill traffic.
+    if (distinctKeys.size() > 1 && !nestedLoopBlocks.empty()) {
+        std::unordered_map<LSRCacheKey, bool, LSRCacheKeyHash> usedInNestedLoop;
+        for (const auto& key : distinctKeys) usedInNestedLoop[key] = false;
+
+        for (auto& cand : candidates) {
+            LSRCacheKey key{cand.gep->getOperand(0), cand.ivPos,
+                            cand.gep->getType(), cand.constOffset};
+            for (auto& use : cand.gep->getUses()) {
+                auto* user = dynamic_cast<IR::Instruction*>(use.user);
+                if (user && nestedLoopBlocks.count(user->getParent())) {
+                    usedInNestedLoop[key] = true;
+                    break;
+                }
+            }
+        }
+        for (const auto& entry : usedInNestedLoop) {
+            if (!entry.second) return false;
+        }
+    }
+
     // Every chain adds a loop-carried pointer PHI.  Count recurrences already
     // created anywhere in this natural loop as well as the new group.  Loops
     // are processed innermost-first, so this preserves the hot inner chains
@@ -445,7 +473,16 @@ bool gepStrengthReduce(IR::Module* mod) {
                 allHeaders.insert(loop.header);
             }
             for (auto& loop : loops) {
-                if (reduceGEPsInLoop(loop, func.get(), allHeaders)) {
+                std::unordered_set<IR::BasicBlock*> nestedLoopBlocks;
+                for (const auto& nested : loops) {
+                    if (nested.header == loop.header ||
+                        !loop.body.count(nested.header)) {
+                        continue;
+                    }
+                    nestedLoopBlocks.insert(nested.body.begin(), nested.body.end());
+                }
+                if (reduceGEPsInLoop(loop, func.get(), allHeaders,
+                                     nestedLoopBlocks)) {
                     iterChanged = true;
                 }
             }

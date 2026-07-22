@@ -280,6 +280,7 @@ make -j$(nproc)
 - **优化**: O1/O2/O3/P0/P3 全部实现，优化流水线完整（含循环交换、循环展开4×、指令调度）
 - **测试用例**: test/ 目录包含 functional (100) + h_functional (40) + performance (60) 共 200 条官方源程序
 - **当前稳定基线**: `Commit-Version3.2`（`121266c`）官网 100 分；Functional 100/100、H_Functional 40/40、Performance 60/60，总运行时间 794.8685s
-- **当前开发验证**: `test-gep-lsr-2-v2` 本地寄存器单测通过；固定快速集、h-5 三例及 many_mat_cal/sl/transpose/matmul/conv2d 代表用例共 13 例通过
-- **已知风险**: GEP-LSR-2 会增加循环携带指针的寄存器压力，当前通过“嵌套自然循环内最多 3 链、含调用循环不启用多链”保守限制；完整性能影响尚需官网确认
-- **下一步**: 提交本分支到官网运行完整 Functional、H_Functional 和 Performance，重点观察 many_mat_cal、matmul、conv2d、h-5、sl 与 crypto 的正确性和运行时间
+- **最新官网候选**: `d939f92` 官网 100 分；Functional 100/100、H_Functional 40/40、Performance 60/60，总运行时间 793.6786s；matmul 三例合计提升约 2.07%，shuffle 三例合计退化约 10.43%
+- **当前开发验证**: shuffle 盈利性修正后，shuffle0/1/2 输出通过且汇编逐字节恢复为 PHI-only 版本；matmul1、many_mat_cal-1、h-5-01、crypto-1、sl1、transpose2 保持 `d939f92` 汇编不变，conv2d-1 仅保存寄存器栈槽顺序变化
+- **已知风险**: GEP-LSR-2 当前限制嵌套自然循环内最多 3 链、含调用循环不启用多链；多链由外层循环携带时，每条链还必须在嵌套循环内使用。shuffle 修正的完整性能影响尚需官网确认
+- **下一步**: 提交 shuffle 盈利性修正到官网运行完整 Functional、H_Functional 和 Performance，重点确认 shuffle 恢复且 matmul、many_mat_cal 收益不回退
