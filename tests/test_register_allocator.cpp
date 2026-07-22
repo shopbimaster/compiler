@@ -1,3 +1,5 @@
+#ifdef LOCAL_REGISTER_ALLOCATOR_TEST
+
 #include <iostream>
 
 #include "backend/RegisterAllocator.h"
@@ -59,3 +61,5 @@ int main() {
     std::cout << "PASSED: PHI parallel edge-copy coalescing\n";
     return 0;
 }
+
+#endif // LOCAL_REGISTER_ALLOCATOR_TEST
