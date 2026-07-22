@@ -616,6 +616,57 @@ bool RegisterAllocator::colorRegClass(bool isFloat) {
     }
     const int K = static_cast<int>(kRegs.size());
 
+    // ── call-aware 偏好支持 ──
+    // 将可用寄存器按 callee-saved / caller-saved 分成两组，保持池内原有相对次序。
+    // 跨调用值（活跃区间包含某 CALL）优先 callee-saved（s*/fs*）：prologue 存一次即可，
+    //   调用间无需在每个 call site 反复保存。
+    // 不跨调用值优先 caller-saved（t*/ft*）：不进 prologue（零 save/restore 成本），
+    //   且因不跨调用，call site 也无需保护它。
+    // 这复刻线性扫描的 RA-CALL 策略——朴素图着色无差别抢 s* 破坏了它，
+    // 导致 knapsack 等深递归/调用密集程序 prologue 膨胀（平台实测 +22.8%）。
+    auto isCalleeSaved = [](const std::string& r) {
+        // s0-s11 / fs0-fs11 为 callee-saved；t*/ft* 为 caller-saved
+        if (r.size() >= 2 && r[0] == 'f' && r[1] == 's') return true;   // fs*
+        if (r[0] == 's') return true;                                    // s*
+        return false;
+    };
+    std::vector<std::string> calleeFirst, callerFirst;
+    for (const auto& r : kRegs) {
+        if (isCalleeSaved(r)) calleeFirst.push_back(r);
+    }
+    for (const auto& r : kRegs) {
+        if (!isCalleeSaved(r)) calleeFirst.push_back(r);
+    }
+    for (const auto& r : kRegs) {
+        if (!isCalleeSaved(r)) callerFirst.push_back(r);
+    }
+    for (const auto& r : kRegs) {
+        if (isCalleeSaved(r)) callerFirst.push_back(r);
+    }
+
+    // 收集所有 CALL 指令的位置（instId），用于判断区间是否跨调用。
+    std::vector<int> callIds;
+    for (const auto& kv : instId) {
+        if (kv.first->getOpcode() == IR::Instruction::Opcode::CALL) {
+            callIds.push_back(kv.second);
+        }
+    }
+    std::sort(callIds.begin(), callIds.end());
+    // 区间 [start,end] 是否严格跨越某 CALL（定义在调用前、使用在调用后）。
+    // 用与 getRegsLiveAtCall 一致的判据：start < callId < end。
+    // [EXP] RA_COLOR_CALLAWARE=0 关闭 call-aware 偏好（退回无差别抢 callee-saved，
+    //   即初版图着色行为），用于 A/B 量化本修复。默认开启。
+    static const bool callAware = [] {
+        const char* v = std::getenv("RA_COLOR_CALLAWARE");
+        return !(v && std::string(v) == "0");
+    }();
+    auto spansCall = [&](const LiveInterval* iv) -> bool {
+        if (!callAware) return true;  // 关闭时一律视为跨调用 → 全走 calleeFirst（旧行为）
+        // 二分：第一个 > start 的 callId，检查它是否 < end
+        auto it = std::upper_bound(callIds.begin(), callIds.end(), iv->start);
+        return it != callIds.end() && *it < iv->end;
+    };
+
     // 收集本寄存器类的待分配节点（该类且尚未染色/溢出的区间）
     std::vector<LiveInterval*> nodes;
     for (auto& iv : intervals) {
@@ -698,7 +749,12 @@ bool RegisterAllocator::colorRegClass(bool isFloat) {
             if (!nodes[nb]->reg.empty()) used.insert(nodes[nb]->reg);
         }
         std::string chosen;
-        for (const auto& r : kRegs) {
+        // call-aware 偏好：跨调用值先试 callee-saved，否则先试 caller-saved。
+        // 两个顺序都覆盖全部 K 个寄存器，只是优先级不同——不影响可着色性，
+        // 只影响“选哪个”，从而最小化 usedCalleeSaved 与 call-site 保护开销。
+        const std::vector<std::string>& tryOrder =
+            spansCall(iv) ? calleeFirst : callerFirst;
+        for (const auto& r : tryOrder) {
             if (!used.count(r)) { chosen = r; break; }
         }
         if (!chosen.empty()) {
