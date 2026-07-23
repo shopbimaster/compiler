@@ -292,4 +292,7 @@ make -j$(nproc)
 - **同版本 A/B 正确性**: sl1、01_mm1、knapsack_naive-1、many_mat_cal-1、03_sort1、crypto-1、h-5-01、h-10-01、92_register_alloc、31_many_indirections、33_multi_branch 共 11 例的默认线性汇编与 STACK-SLOT-1 基线逐字节一致；图着色版本全部编译、链接、QEMU 输出通过
 - **同版本 A/B 静态结果**: 图着色使 sl1 访存 118→105、01_mm1 74→72、many_mat_cal-1 110→98、crypto-1 209→157；knapsack_naive-1 47→53，03_sort1 193→194。说明此前跨分支的 many_mat_cal/03_sort 退化主要混杂了 SSA/GEP 差异，不能直接归因于图着色
 - **QEMU 辅助信号**: 三次取最小值时，sl1 140→135ms、01_mm1 54→53ms、many_mat_cal-1 231→224ms、crypto-1 143→101ms；knapsack_naive-1 938→955ms、03_sort1 104→107ms。QEMU 仅用于方向观察，最终仍以 BOOM 官网测评为准
-- **下一步**: 保持 GVN 和广义 PHI coalescing 独立，先基于 spill/reload、callee-save、跨调用 caller-save 和 move 数量建立函数级静态代价模型，在同一编译器内保守选择线性扫描或图着色
+- **RA-HYBRID-1 第二步**: `RA_ALLOCATOR=auto` 对每个函数分别生成线性和图着色候选，保存完整分配状态；成本模型按 spill 的定义/使用次数、callee-saved 序言结尾、跨调用 caller-saved 保存恢复和 PHI move 计分，成本相同保守选择线性
+- **自动选择结果**: 11 个关键程序、27 个函数中 graph 9 个、linear 18 个；knapsack_naive-1 和 03_sort1 汇编回到线性，sl1、many_mat_cal-1、h-10-01 采用图着色，01_mm1、crypto-1、h-5-01 等按函数混合；11 例 QEMU 全部通过
+- **自动模式开销**: crypto-1 三次编译最小值为 linear 77ms、graph 76ms、auto 79ms，当前规模下双候选成本可接受；`test_register_allocator` 在 graph/auto 两种模式均通过
+- **下一步**: 以独立提交决定 auto 是否成为无环境变量时的官网默认路径，并保持 `RA_ALLOCATOR=linear|graph` 作为回退与诊断开关；GVN 和广义 PHI coalescing 继续保持关闭

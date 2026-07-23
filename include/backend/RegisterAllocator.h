@@ -54,6 +54,8 @@ private:
     void colorAllocate();
     bool colorRegClass(bool isFloat);
     static bool useGraphColoring();
+    static bool useAutoSelection();
+    long long estimateAllocationCost(IR::Function& func) const;
     void expireOldIntervals(int pos, std::vector<LiveInterval*>& active);
     void spillAtInterval(LiveInterval& current, std::vector<LiveInterval*>& active);
     void coalescePhis(IR::Function& func);

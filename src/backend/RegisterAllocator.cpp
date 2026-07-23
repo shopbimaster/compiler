@@ -4,6 +4,7 @@
 #include <cassert>
 #include <climits>
 #include <cstdlib>
+#include <iostream>
 #include <unordered_set>
 
 namespace Backend {
@@ -39,12 +40,86 @@ void RegisterAllocator::allocate(IR::Function& func) {
 
     maxInstId = assignInstructionIds(func);
     buildIntervals(func);
-    if (useGraphColoring()) {
+
+    if (useAutoSelection()) {
+        struct AllocationSnapshot {
+            std::unordered_map<IR::Value*, std::string> regs;
+            std::unordered_map<IR::Value*, int> spills;
+            std::vector<std::string> intervalRegs;
+            std::vector<int> intervalSpills;
+            std::vector<std::string> usedRegs;
+            int nextSlot;
+            int spillSize;
+            long long cost;
+        };
+
+        const auto reservedUsedRegs = usedCalleeSaved;
+        auto resetCandidate = [&]() {
+            regMap.clear();
+            spillMap.clear();
+            usedCalleeSaved = reservedUsedRegs;
+            nextSpillSlot = 0;
+            spillSlotSize = 0;
+            for (auto& interval : intervals) {
+                interval.reg.clear();
+                interval.spillSlot = -1;
+            }
+        };
+        auto captureCandidate = [&](long long cost) {
+            AllocationSnapshot snapshot;
+            snapshot.regs = regMap;
+            snapshot.spills = spillMap;
+            snapshot.usedRegs = usedCalleeSaved;
+            snapshot.nextSlot = nextSpillSlot;
+            snapshot.spillSize = spillSlotSize;
+            snapshot.cost = cost;
+            snapshot.intervalRegs.reserve(intervals.size());
+            snapshot.intervalSpills.reserve(intervals.size());
+            for (const auto& interval : intervals) {
+                snapshot.intervalRegs.push_back(interval.reg);
+                snapshot.intervalSpills.push_back(interval.spillSlot);
+            }
+            return snapshot;
+        };
+        auto restoreCandidate = [&](const AllocationSnapshot& snapshot) {
+            regMap = snapshot.regs;
+            spillMap = snapshot.spills;
+            usedCalleeSaved = snapshot.usedRegs;
+            nextSpillSlot = snapshot.nextSlot;
+            spillSlotSize = snapshot.spillSize;
+            for (size_t i = 0; i < intervals.size(); ++i) {
+                intervals[i].reg = snapshot.intervalRegs[i];
+                intervals[i].spillSlot = snapshot.intervalSpills[i];
+            }
+        };
+
+        resetCandidate();
+        linearScan();
+        coalescePhis(func);
+        auto linear = captureCandidate(estimateAllocationCost(func));
+
+        resetCandidate();
         colorAllocate();
+        coalescePhis(func);
+        auto graph = captureCandidate(estimateAllocationCost(func));
+
+        bool chooseGraph = graph.cost < linear.cost;
+        restoreCandidate(chooseGraph ? graph : linear);
+        const char* debug = std::getenv("RA_DEBUG_SELECTION");
+        if (debug && std::string(debug) == "1") {
+            std::cerr << "[RA] " << func.getName()
+                      << " linear=" << linear.cost
+                      << " graph=" << graph.cost
+                      << " selected=" << (chooseGraph ? "graph" : "linear")
+                      << '\n';
+        }
+    } else if (useGraphColoring()) {
+        colorAllocate();
+        coalescePhis(func);
     } else {
         linearScan();
+        coalescePhis(func);
     }
-    coalescePhis(func);  // 修复安全检查后重新启用
 }
 
 // ★ K1+K2 修复：重建 usedCalleeSaved，移除两种情况下残留的无用寄存器：
@@ -654,6 +729,71 @@ bool RegisterAllocator::useGraphColoring() {
         return allocator && std::string(allocator) == "graph";
     }();
     return enabled;
+}
+
+bool RegisterAllocator::useAutoSelection() {
+    static const bool enabled = [] {
+        const char* allocator = std::getenv("RA_ALLOCATOR");
+        return allocator && std::string(allocator) == "auto";
+    }();
+    return enabled;
+}
+
+long long RegisterAllocator::estimateAllocationCost(IR::Function& func) const {
+    auto isCalleeSaved = [](const std::string& reg) {
+        return reg[0] == 's' ||
+               (reg.size() >= 2 && reg[0] == 'f' && reg[1] == 's');
+    };
+    auto isCallerSaved = [](const std::string& reg) {
+        return reg[0] == 't' ||
+               (reg.size() >= 2 && reg[0] == 'f' && reg[1] == 't');
+    };
+
+    long long memoryOps = 0;
+    long long moves = 0;
+
+    for (const auto& interval : intervals) {
+        if (regMap.find(interval.value) == regMap.end()) {
+            memoryOps += 1 + interval.useCount;
+        }
+    }
+
+    for (const auto& reg : usedCalleeSaved) {
+        if (isCalleeSaved(reg)) {
+            memoryOps += 2;
+        }
+    }
+
+    for (const auto& entry : instId) {
+        auto* inst = entry.first;
+        if (inst->getOpcode() != IR::Instruction::Opcode::CALL) continue;
+        int callId = entry.second;
+        std::unordered_set<std::string> savedAtCall;
+        for (const auto& interval : intervals) {
+            if (!interval.reg.empty() &&
+                interval.start < callId && callId < interval.end &&
+                isCallerSaved(interval.reg)) {
+                savedAtCall.insert(interval.reg);
+            }
+        }
+        memoryOps += 2 * static_cast<long long>(savedAtCall.size());
+    }
+
+    for (const auto& block : func.getBlocks()) {
+        for (const auto& inst : block->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
+            auto dest = regMap.find(inst.get());
+            if (dest == regMap.end()) continue;
+            for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                auto src = regMap.find(inst->getOperand(i));
+                if (src != regMap.end() && src->second != dest->second) {
+                    moves++;
+                }
+            }
+        }
+    }
+
+    return memoryOps * 16 + moves;
 }
 
 void RegisterAllocator::colorAllocate() {
