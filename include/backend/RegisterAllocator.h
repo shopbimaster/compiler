@@ -51,6 +51,9 @@ private:
     int assignInstructionIds(IR::Function& func);
     void buildIntervals(IR::Function& func);
     void linearScan();
+    void colorAllocate();
+    bool colorRegClass(bool isFloat);
+    static bool useGraphColoring();
     void expireOldIntervals(int pos, std::vector<LiveInterval*>& active);
     void spillAtInterval(LiveInterval& current, std::vector<LiveInterval*>& active);
     void coalescePhis(IR::Function& func);

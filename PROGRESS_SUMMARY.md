@@ -288,4 +288,8 @@ make -j$(nproc)
 - **STACK-SLOT-1 静态证据**: crypto `pseudo_md5` 栈帧 2432→1824，26 处 `li+add+load/store` 大偏移展开全部变为直接 `offset(sp)`，汇编减少 54 行；最终 ELF `.text` 减少 212 字节、机器指令减少 80 条。其余代表用例归一化掉栈偏移后汇编完全一致
 - **STACK-SLOT-1 测试**: 36 个定向 QEMU 用例全部通过；所有 64 位栈访问保持 8 字节对齐、所有函数栈帧保持 16 字节对齐；`test_register_allocator`、`test_integration` 26/26 和 `test_peephole` 通过
 - **STACK-SLOT-1 风险**: crypto-1 本地 QEMU 对照中候选约 0.14～0.15s、基线通常约 0.10s，和静态指令减少相矛盾，可能受 QEMU 翻译块布局影响；不得据此宣称已提速，必须以 BOOM 官网结果决定是否保留
-- **下一步**: 提交 STACK-SLOT-1 到官网运行完整 Functional、H_Functional 和 Performance；重点观察 crypto、h-10、01_mm、many_mat_cal 及总时间，如出现稳定退化则放弃该候选
+- **RA-HYBRID-1 第一步**: 在 `test-ra-hybrid-1` 中移植与现有 `RegisterAllocator` 输出接口兼容的 Chaitin-Briggs 图着色核心；显式设置 `RA_ALLOCATOR=graph` 才启用，默认线性扫描和 GVN 关闭状态均保持不变
+- **同版本 A/B 正确性**: sl1、01_mm1、knapsack_naive-1、many_mat_cal-1、03_sort1、crypto-1、h-5-01、h-10-01、92_register_alloc、31_many_indirections、33_multi_branch 共 11 例的默认线性汇编与 STACK-SLOT-1 基线逐字节一致；图着色版本全部编译、链接、QEMU 输出通过
+- **同版本 A/B 静态结果**: 图着色使 sl1 访存 118→105、01_mm1 74→72、many_mat_cal-1 110→98、crypto-1 209→157；knapsack_naive-1 47→53，03_sort1 193→194。说明此前跨分支的 many_mat_cal/03_sort 退化主要混杂了 SSA/GEP 差异，不能直接归因于图着色
+- **QEMU 辅助信号**: 三次取最小值时，sl1 140→135ms、01_mm1 54→53ms、many_mat_cal-1 231→224ms、crypto-1 143→101ms；knapsack_naive-1 938→955ms、03_sort1 104→107ms。QEMU 仅用于方向观察，最终仍以 BOOM 官网测评为准
+- **下一步**: 保持 GVN 和广义 PHI coalescing 独立，先基于 spill/reload、callee-save、跨调用 caller-save 和 move 数量建立函数级静态代价模型，在同一编译器内保守选择线性扫描或图着色

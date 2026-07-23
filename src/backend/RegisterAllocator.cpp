@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cstdlib>
 #include <unordered_set>
 
 namespace Backend {
@@ -38,7 +39,11 @@ void RegisterAllocator::allocate(IR::Function& func) {
 
     maxInstId = assignInstructionIds(func);
     buildIntervals(func);
-    linearScan();
+    if (useGraphColoring()) {
+        colorAllocate();
+    } else {
+        linearScan();
+    }
     coalescePhis(func);  // 修复安全检查后重新启用
 }
 
@@ -641,6 +646,154 @@ void RegisterAllocator::linearScan() {
             spillAtInterval(current, active);
         }
     }
+}
+
+bool RegisterAllocator::useGraphColoring() {
+    static const bool enabled = [] {
+        const char* allocator = std::getenv("RA_ALLOCATOR");
+        return allocator && std::string(allocator) == "graph";
+    }();
+    return enabled;
+}
+
+void RegisterAllocator::colorAllocate() {
+    colorRegClass(false);
+    colorRegClass(true);
+}
+
+bool RegisterAllocator::colorRegClass(bool isFloat) {
+    const auto& regPool = isFloat ? FLOAT_REGS : INT_REGS;
+    std::vector<std::string> availableRegs;
+    for (const auto& reg : regPool) {
+        if (!reservedRegs.count(reg)) {
+            availableRegs.push_back(reg);
+        }
+    }
+    const int colorCount = static_cast<int>(availableRegs.size());
+
+    std::vector<std::string> calleeFirst;
+    std::vector<std::string> callerFirst;
+    auto isCalleeSaved = [](const std::string& reg) {
+        return reg[0] == 's' ||
+               (reg.size() >= 2 && reg[0] == 'f' && reg[1] == 's');
+    };
+    for (const auto& reg : availableRegs) {
+        if (isCalleeSaved(reg)) calleeFirst.push_back(reg);
+    }
+    for (const auto& reg : availableRegs) {
+        if (!isCalleeSaved(reg)) calleeFirst.push_back(reg);
+    }
+    for (const auto& reg : availableRegs) {
+        if (!isCalleeSaved(reg)) callerFirst.push_back(reg);
+    }
+    for (const auto& reg : availableRegs) {
+        if (isCalleeSaved(reg)) callerFirst.push_back(reg);
+    }
+
+    std::vector<LiveInterval*> nodes;
+    for (auto& interval : intervals) {
+        if (interval.isFloat == isFloat && interval.reg.empty()) {
+            nodes.push_back(&interval);
+        }
+    }
+    if (nodes.empty()) return true;
+
+    const int nodeCount = static_cast<int>(nodes.size());
+    std::vector<std::unordered_set<int>> interference(nodeCount);
+    for (int i = 0; i < nodeCount; ++i) {
+        for (int j = i + 1; j < nodeCount; ++j) {
+            if (nodes[i]->start <= nodes[j]->end &&
+                nodes[j]->start <= nodes[i]->end) {
+                interference[i].insert(j);
+                interference[j].insert(i);
+            }
+        }
+    }
+
+    auto spillCost = [](const LiveInterval* interval) -> long long {
+        return static_cast<long long>(interval->loopDepth) * 10000 +
+               static_cast<long long>(interval->useCount) * 100 +
+               (interval->end - interval->start);
+    };
+
+    std::vector<int> degree(nodeCount);
+    std::vector<char> removed(nodeCount, 0);
+    for (int i = 0; i < nodeCount; ++i) {
+        degree[i] = static_cast<int>(interference[i].size());
+    }
+
+    std::vector<int> selectStack;
+    selectStack.reserve(nodeCount);
+    int remaining = nodeCount;
+    while (remaining > 0) {
+        int pick = -1;
+        for (int i = 0; i < nodeCount; ++i) {
+            if (!removed[i] && degree[i] < colorCount) {
+                pick = i;
+                break;
+            }
+        }
+
+        if (pick == -1) {
+            long long lowestCost = LLONG_MAX;
+            for (int i = 0; i < nodeCount; ++i) {
+                if (removed[i]) continue;
+                long long cost = spillCost(nodes[i]);
+                if (cost < lowestCost ||
+                    (cost == lowestCost && pick != -1 &&
+                     nodes[i]->value->getName() <
+                         nodes[pick]->value->getName())) {
+                    lowestCost = cost;
+                    pick = i;
+                }
+            }
+        }
+
+        removed[pick] = 1;
+        selectStack.push_back(pick);
+        for (int neighbor : interference[pick]) {
+            if (!removed[neighbor]) degree[neighbor]--;
+        }
+        remaining--;
+    }
+
+    bool allColored = true;
+    for (auto it = selectStack.rbegin(); it != selectStack.rend(); ++it) {
+        int node = *it;
+        LiveInterval* interval = nodes[node];
+        std::unordered_set<std::string> unavailable;
+        for (int neighbor : interference[node]) {
+            if (!nodes[neighbor]->reg.empty()) {
+                unavailable.insert(nodes[neighbor]->reg);
+            }
+        }
+
+        const auto& preference =
+            interval->crossesCall ? calleeFirst : callerFirst;
+        std::string chosen;
+        for (const auto& reg : preference) {
+            if (!unavailable.count(reg)) {
+                chosen = reg;
+                break;
+            }
+        }
+
+        if (!chosen.empty()) {
+            interval->reg = chosen;
+            regMap[interval->value] = chosen;
+            if (std::find(usedCalleeSaved.begin(), usedCalleeSaved.end(),
+                          chosen) == usedCalleeSaved.end()) {
+                usedCalleeSaved.push_back(chosen);
+            }
+        } else {
+            interval->spillSlot = nextSpillSlot;
+            spillMap[interval->value] = nextSpillSlot;
+            nextSpillSlot += 8;
+            spillSlotSize = std::max(spillSlotSize, nextSpillSlot);
+            allColored = false;
+        }
+    }
+    return allColored;
 }
 
 void RegisterAllocator::expireOldIntervals(int pos, std::vector<LiveInterval*>& active) {
