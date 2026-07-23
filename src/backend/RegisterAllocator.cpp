@@ -348,6 +348,53 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
     }
 
     // ================================================================
+    // Inlined ICMP liveness extension:
+    // TargetCodeGen folds a one-use integer ICMP into its COND_BR user.
+    // When the two instructions are in different basic blocks, the
+    // generated branch reads the ICMP operands at the branch location,
+    // not at the original ICMP location. Model those implicit uses here
+    // so loop-aware liveness below can keep loop-carried operands alive.
+    // ================================================================
+    for (auto& bb : func.getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::COND_BR)
+                continue;
+
+            auto* icmp = dynamic_cast<IR::Instruction*>(inst->getOperand(0));
+            if (!icmp || icmp->getOpcode() != IR::Instruction::Opcode::ICMP)
+                continue;
+            if (!icmp->hasOneUse())
+                continue;
+
+            auto* op0Ty = icmp->getOperand(0)->getType();
+            if (op0Ty && op0Ty->isFloat())
+                continue;
+
+            auto branchIdIt = instId.find(inst.get());
+            if (branchIdIt == instId.end())
+                continue;
+            int branchId = branchIdIt->second;
+
+            for (unsigned i = 0; i < icmp->getNumOperands(); ++i) {
+                auto* opVal = icmp->getOperand(i);
+                if (!opVal) continue;
+                if (dynamic_cast<IR::Constant*>(opVal)) continue;
+                if (dynamic_cast<IR::BasicBlock*>(opVal)) continue;
+                if (dynamic_cast<IR::Function*>(opVal)) continue;
+                if (dynamic_cast<IR::GlobalVariable*>(opVal)) continue;
+
+                auto lastIt = lastSeen.find(opVal);
+                if (lastIt != lastSeen.end()) {
+                    lastIt->second = std::max(lastIt->second, branchId);
+                } else {
+                    lastSeen[opVal] = branchId;
+                }
+                useBlocks[opVal].insert(bb.get());
+            }
+        }
+    }
+
+    // ================================================================
     // Loop-aware liveness extension:
     // Values defined outside a loop body but used inside must have
     // their live intervals extended to cover the entire loop body.

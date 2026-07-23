@@ -300,3 +300,12 @@ make -j$(nproc)
 - **官网候选默认路径**: 无 `RA_ALLOCATOR` 环境变量时使用函数级 auto；`RA_ALLOCATOR=linear|graph` 可分别强制线性或图着色，`RA_ALLOCATOR=auto` 与默认行为一致；GVN 和广义 PHI coalescing 继续保持关闭
 - **默认 auto 验证**: 11 个关键用例的默认与显式 auto 汇编逐字节一致，默认模式全部通过 RISC-V GCC、QEMU 和参考输出；`test_register_allocator`、`test_integration` 26/26、`test_peephole` 通过
 - **下一步**: 提交官网完整 Functional、H_Functional、Performance，重点观察 knapsack、many_mat_cal、03_sort、sl、01_mm、crypto 和总时间；如出现问题可分别用强制 linear/graph 本地复现定位
+
+## 2026-07-23 RA-HYBRID-1 conv2d 正确性修复
+
+- **官网结果**: `693a684` 总时间 711.7276s，Functional 100/100、H_Functional 40/40；Performance 57/60，只有 conv2d-1/2/3 输出哈希不匹配。
+- **根因**: 后端将单一用途的整数 `ICMP` 融合到 `COND_BR`。当两条指令跨基本块时，生成的分支会在较晚位置隐式读取 `ICMP` 操作数，但寄存器分配器仍按原 `ICMP` 位置结束活跃区间。图着色因此在 conv2d 内层循环中将 `rr` 与后续 load 结果同时分配到 `t3`，导致循环第二次迭代开始读取被覆盖的 `rr`。
+- **修复策略**: 在构建活跃区间时，将可内联 `ICMP` 的非常量操作数记录为在 `COND_BR` 所在基本块使用，并把其最后使用点扩展到分支位置；随后由现有循环活跃性逻辑覆盖回边。不关闭图着色，不按用例名特判。
+- **本地验证**: conv2d-1/2/3 在 linear、graph、auto、default 四种模式下共 12/12 通过；寄存器分配关键集 11/11 通过；`test_register_allocator`、`test_integration` 26/26、`test_peephole` 通过。
+- **性能路径检查**: sl、01_mm、many_mat_cal、crypto、h-10 的关键热点函数仍选择 graph；knapsack_naive 与 03_sort 仍保守选择 linear。conv2d 的 linear/graph 静态成本修复后打平，auto 按既有规则选择 linear。
+- **待确认**: 本地仅完成定向回归，完整 Functional、H_Functional 和 Performance 仍需官网重新评测。
