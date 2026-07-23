@@ -51,6 +51,7 @@
 | 2026-07-22 | OpenAI Codex | STACK-SLOT-1: 本地 SSA/参数备份槽按实际后端访问宽度分配，i32/float 使用 4 字节、pointer 使用 8 字节；outgoing arguments、alloca、调用保存区及 16 字节 ABI 对齐保持不变；增加宏保护的紧凑栈帧回归 | 36 个定向 QEMU 用例、寄存器分配回归、26 项集成及 peephole 测试通过；crypto `pseudo_md5` 栈帧 2432→1824，大偏移展开 26→0；本地 QEMU 时间存在反向信号，完整 BOOM 结果待官网确认 |
 | 2026-07-23 | OpenAI Codex | RA-HYBRID-1 第一步：在 Version3.3、SSA-SCALAR、GEP-LSR 和 STACK-SLOT-1 基线上移植 Chaitin-Briggs 图着色核心；复用现有 `crossesCall`，仅在 `RA_ALLOCATOR=graph` 时启用，默认仍为稳定线性扫描；未启用 GVN 或广义 PHI coalescing | 11 个关键用例的默认线性汇编与原基线逐字节一致，图着色版本均通过 RISC-V GCC、QEMU 和参考输出；同版本 A/B 显示 sl1、01_mm1、many_mat_cal-1、crypto-1 访存减少，knapsack_naive-1 访存增加，后续需用通用静态代价模型选择分配器 |
 | 2026-07-23 | OpenAI Codex | RA-HYBRID-1 第二步：增加 `RA_ALLOCATOR=auto` 函数级双候选选择；分别运行线性扫描和图着色，完整保存寄存器、spill、活跃区间与保存寄存器状态，以预估 spill/reload、callee-save、跨调用 caller-save 和 PHI move 的通用静态成本择优 | 11 个关键用例 QEMU 全部通过；27 个函数中选择 graph 9 个、linear 18 个，knapsack/03_sort 回退线性，sl/many_mat_cal/h-10 使用图着色；crypto-1 编译时间最小值 linear 77ms、graph 76ms、auto 79ms；默认仍为线性，官网启用策略待独立决定 |
+| 2026-07-23 | OpenAI Codex | RA-HYBRID-1 第三步：修复寄存器分配输出的两处非确定性；活跃区间在 `start/end/name` 完全同键时增加参数/指令遍历序号作为最终 tie-breaker，并按声明寄存器池顺序规范最终保存寄存器列表 | 03_sort1 的 default、linear、graph、auto 各重复编译 5 次均保持模式内同哈希，三种显式模式 QEMU 输出通过；auto 暂不设为默认 |
 
 AI 辅助内容不会自动视为正确或合规。负责合并的成员需要理解每项修改、运行测试，
 并在提交记录或评审记录中确认人工修改情况。

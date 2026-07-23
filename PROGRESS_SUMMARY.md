@@ -295,4 +295,6 @@ make -j$(nproc)
 - **RA-HYBRID-1 第二步**: `RA_ALLOCATOR=auto` 对每个函数分别生成线性和图着色候选，保存完整分配状态；成本模型按 spill 的定义/使用次数、callee-saved 序言结尾、跨调用 caller-saved 保存恢复和 PHI move 计分，成本相同保守选择线性
 - **自动选择结果**: 11 个关键程序、27 个函数中 graph 9 个、linear 18 个；knapsack_naive-1 和 03_sort1 汇编回到线性，sl1、many_mat_cal-1、h-10-01 采用图着色，01_mm1、crypto-1、h-5-01 等按函数混合；11 例 QEMU 全部通过
 - **自动模式开销**: crypto-1 三次编译最小值为 linear 77ms、graph 76ms、auto 79ms，当前规模下双候选成本可接受；`test_register_allocator` 在 graph/auto 两种模式均通过
-- **下一步**: 以独立提交决定 auto 是否成为无环境变量时的官网默认路径，并保持 `RA_ALLOCATOR=linear|graph` 作为回退与诊断开关；GVN 和广义 PHI coalescing 继续保持关闭
+- **寄存器分配确定性问题**: 默认切换验证中发现 03_sort1 会产生两种汇编：graph 节点在多个区间 `start/end/name` 完全相同时继承 `unordered_map` 顺序，default 的保存寄存器列表也会继承缓存/提升映射顺序。现分别增加参数/指令遍历序号 tie-breaker，并按声明寄存器池顺序规范最终保存列表；不改变值到物理寄存器的分配结果
+- **确定性验证**: 03_sort1 的 default、linear、graph、auto 各重复编译 5 次均保持模式内同一 SHA-256；linear、graph、auto 三种显式模式均通过 RISC-V GCC、QEMU 和参考输出
+- **下一步**: 确定性修复独立提交后，再单独启用默认 auto 并重跑 11 个关键用例

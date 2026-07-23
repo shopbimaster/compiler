@@ -146,6 +146,24 @@ void RegisterAllocator::pruneUnusedCalleeSaved(
             usedCalleeSaved.push_back(reg);
         }
     }
+    auto registerRank = [](const std::string& reg) {
+        auto intIt = std::find(INT_REGS.begin(), INT_REGS.end(), reg);
+        if (intIt != INT_REGS.end()) {
+            return static_cast<int>(intIt - INT_REGS.begin());
+        }
+        auto floatIt = std::find(FLOAT_REGS.begin(), FLOAT_REGS.end(), reg);
+        if (floatIt != FLOAT_REGS.end()) {
+            return static_cast<int>(INT_REGS.size() +
+                                    (floatIt - FLOAT_REGS.begin()));
+        }
+        return INT_MAX;
+    };
+    std::sort(usedCalleeSaved.begin(), usedCalleeSaved.end(),
+        [&](const std::string& lhs, const std::string& rhs) {
+            int lhsRank = registerRank(lhs);
+            int rhsRank = registerRank(rhs);
+            return lhsRank != rhsRank ? lhsRank < rhsRank : lhs < rhs;
+        });
 }
 
 void RegisterAllocator::reserveReg(const std::string& reg) {
@@ -195,6 +213,8 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
 
     std::unordered_map<IR::Value*, int> firstSeen;
     std::unordered_map<IR::Value*, int> lastSeen;
+    std::unordered_map<IR::Value*, int> stableOrder;
+    int nextStableOrder = 0;
     // Track all blocks where a value is used (for loop-aware liveness extension)
     std::unordered_map<IR::Value*, std::unordered_set<IR::BasicBlock*>> useBlocks;
 
@@ -219,6 +239,7 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
         auto* arg = func.getArg(i);
         firstSeen[arg] = 0;
         lastSeen[arg] = 0;
+        stableOrder[arg] = nextStableOrder++;
     }
 
     for (auto& bb : func.getBlocks()) {
@@ -236,6 +257,7 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
                 && ty && !ty->isVoid()) {
                 IR::Value* vr = inst.get();
                 if (!dynamic_cast<IR::Constant*>(vr)) {
+                    stableOrder[vr] = nextStableOrder++;
                     // ★ PHI 的定义点应视为 BB 入口（blockMinId），而非 PHI 指令本身的 ID。
                     // 原因：PHI 在 BB 入口处"并行"执行，语义上在所有非 PHI 指令之前。
                     // 如果 PHI 在 IR 中不在 BB 开头（可能在 mul/add 之后），
@@ -640,11 +662,13 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
     }
 
     std::sort(intervals.begin(), intervals.end(),
-        [](const LiveInterval& a, const LiveInterval& b) {
+        [&stableOrder](const LiveInterval& a, const LiveInterval& b) {
             if (a.start != b.start) return a.start < b.start;
-            // tiebreaker: 确保相同 start 时顺序确定（消除 unordered_map 迭代顺序的非确定性）
             if (a.end != b.end) return a.end < b.end;
-            return a.value->getName() < b.value->getName();
+            if (a.value->getName() != b.value->getName()) {
+                return a.value->getName() < b.value->getName();
+            }
+            return stableOrder.at(a.value) < stableOrder.at(b.value);
         });
 }
 
