@@ -758,7 +758,7 @@ bool RegisterAllocator::useGraphColoring() {
 bool RegisterAllocator::useAutoSelection() {
     static const bool enabled = [] {
         const char* allocator = std::getenv("RA_ALLOCATOR");
-        return allocator && std::string(allocator) == "auto";
+        return !allocator || std::string(allocator) == "auto";
     }();
     return enabled;
 }

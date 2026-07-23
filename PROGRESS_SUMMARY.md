@@ -297,4 +297,6 @@ make -j$(nproc)
 - **自动模式开销**: crypto-1 三次编译最小值为 linear 77ms、graph 76ms、auto 79ms，当前规模下双候选成本可接受；`test_register_allocator` 在 graph/auto 两种模式均通过
 - **寄存器分配确定性问题**: 默认切换验证中发现 03_sort1 会产生两种汇编：graph 节点在多个区间 `start/end/name` 完全相同时继承 `unordered_map` 顺序，default 的保存寄存器列表也会继承缓存/提升映射顺序。现分别增加参数/指令遍历序号 tie-breaker，并按声明寄存器池顺序规范最终保存列表；不改变值到物理寄存器的分配结果
 - **确定性验证**: 03_sort1 的 default、linear、graph、auto 各重复编译 5 次均保持模式内同一 SHA-256；linear、graph、auto 三种显式模式均通过 RISC-V GCC、QEMU 和参考输出
-- **下一步**: 确定性修复独立提交后，再单独启用默认 auto 并重跑 11 个关键用例
+- **官网候选默认路径**: 无 `RA_ALLOCATOR` 环境变量时使用函数级 auto；`RA_ALLOCATOR=linear|graph` 可分别强制线性或图着色，`RA_ALLOCATOR=auto` 与默认行为一致；GVN 和广义 PHI coalescing 继续保持关闭
+- **默认 auto 验证**: 11 个关键用例的默认与显式 auto 汇编逐字节一致，默认模式全部通过 RISC-V GCC、QEMU 和参考输出；`test_register_allocator`、`test_integration` 26/26、`test_peephole` 通过
+- **下一步**: 提交官网完整 Functional、H_Functional、Performance，重点观察 knapsack、many_mat_cal、03_sort、sl、01_mm、crypto 和总时间；如出现问题可分别用强制 linear/graph 本地复现定位

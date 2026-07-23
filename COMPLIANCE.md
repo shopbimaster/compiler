@@ -52,6 +52,7 @@
 | 2026-07-23 | OpenAI Codex | RA-HYBRID-1 第一步：在 Version3.3、SSA-SCALAR、GEP-LSR 和 STACK-SLOT-1 基线上移植 Chaitin-Briggs 图着色核心；复用现有 `crossesCall`，仅在 `RA_ALLOCATOR=graph` 时启用，默认仍为稳定线性扫描；未启用 GVN 或广义 PHI coalescing | 11 个关键用例的默认线性汇编与原基线逐字节一致，图着色版本均通过 RISC-V GCC、QEMU 和参考输出；同版本 A/B 显示 sl1、01_mm1、many_mat_cal-1、crypto-1 访存减少，knapsack_naive-1 访存增加，后续需用通用静态代价模型选择分配器 |
 | 2026-07-23 | OpenAI Codex | RA-HYBRID-1 第二步：增加 `RA_ALLOCATOR=auto` 函数级双候选选择；分别运行线性扫描和图着色，完整保存寄存器、spill、活跃区间与保存寄存器状态，以预估 spill/reload、callee-save、跨调用 caller-save 和 PHI move 的通用静态成本择优 | 11 个关键用例 QEMU 全部通过；27 个函数中选择 graph 9 个、linear 18 个，knapsack/03_sort 回退线性，sl/many_mat_cal/h-10 使用图着色；crypto-1 编译时间最小值 linear 77ms、graph 76ms、auto 79ms；默认仍为线性，官网启用策略待独立决定 |
 | 2026-07-23 | OpenAI Codex | RA-HYBRID-1 第三步：修复寄存器分配输出的两处非确定性；活跃区间在 `start/end/name` 完全同键时增加参数/指令遍历序号作为最终 tie-breaker，并按声明寄存器池顺序规范最终保存寄存器列表 | 03_sort1 的 default、linear、graph、auto 各重复编译 5 次均保持模式内同哈希，三种显式模式 QEMU 输出通过；auto 暂不设为默认 |
+| 2026-07-23 | OpenAI Codex | RA-HYBRID-1 第四步：将已验证的函数级 auto 选择设为无环境变量时的默认模式；保留 `RA_ALLOCATOR=linear`、`RA_ALLOCATOR=graph` 强制回退，`RA_ALLOCATOR=auto` 与默认一致；GVN 和广义 PHI coalescing 继续关闭 | 11 个关键用例的默认与显式 auto 汇编逐字节一致并全部通过 RISC-V GCC、QEMU 和参考输出；寄存器分配回归、26 项集成与 peephole 测试通过；完整 BOOM 结果待官网确认 |
 
 AI 辅助内容不会自动视为正确或合规。负责合并的成员需要理解每项修改、运行测试，
 并在提交记录或评审记录中确认人工修改情况。
