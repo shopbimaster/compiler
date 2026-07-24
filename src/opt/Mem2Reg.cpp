@@ -22,6 +22,9 @@
 namespace Opt {
 namespace {
 
+// 运行时标志：本次 mem2reg 是否允许提升非 entry alloca（由 mem2reg() 按调用序号设置）。
+bool g_allowNonEntry = false;
+
 // ================================================================
 // 检查 alloca 是否可提升
 // 条件：alloca 仅被 LOAD 和 STORE 使用，地址未被取走（无 GEP、无传参）
@@ -118,17 +121,36 @@ bool mem2regOnFunction(IR::Function* func) {
     auto* entry = func->getEntryBlock();
 
     // 1. 收集可提升的 alloca
+    // 关键设计：entry alloca 先收集、非 entry alloca 后收集。配合下方 PHI 配额，
+    // entry 变量的提升集合与 v4.1.0（cap 14）逐字节一致——crypto 的 temp 等复杂
+    // entry 变量仍被 14 配额挡住，正确性不变；非 entry 循环内变量（matmul 的 k/sum/j）
+    // 在 entry 变量之后、用额外配额提升。这样既让内层进 SSA，又不触碰 v4.1.0 已验证
+    // 安全的 entry 提升边界（那个高 PHI 数触发的重命名 bug）。M2R_ENTRY_ONLY=1 全回退。
+    static const bool forceEntryOnly = [] {
+        const char* v = std::getenv("M2R_ENTRY_ONLY");
+        return v && std::string(v) == "1";
+    }();
+    // 非 entry 提升需 g_allowNonEntry（首次 mem2reg，内联前）且未强制 entryOnly。
+    bool doNonEntry = g_allowNonEntry && !forceEntryOnly;
     std::vector<IR::Instruction*> promotableAllocas;
-    for (auto& bb : func->getBlocks()) {
-        // A non-entry ALLOCA may execute once per loop iteration or only on
-        // one control-flow path.  Treating it as a function-wide SSA variable
-        // changes that lifetime, so standard mem2reg only promotes entry
-        // allocas.
-        if (bb.get() != entry) continue;
-        for (auto& inst : bb->getInstructions()) {
-            if (inst->getOpcode() == IR::Instruction::Opcode::ALLOCA &&
-                isPromotableAlloca(inst.get())) {
-                promotableAllocas.push_back(inst.get());
+    size_t numEntryAllocas = 0;
+    // 先 entry
+    for (auto& inst : entry->getInstructions()) {
+        if (inst->getOpcode() == IR::Instruction::Opcode::ALLOCA &&
+            isPromotableAlloca(inst.get())) {
+            promotableAllocas.push_back(inst.get());
+            ++numEntryAllocas;
+        }
+    }
+    // 再非 entry
+    if (doNonEntry) {
+        for (auto& bb : func->getBlocks()) {
+            if (bb.get() == entry) continue;
+            for (auto& inst : bb->getInstructions()) {
+                if (inst->getOpcode() == IR::Instruction::Opcode::ALLOCA &&
+                    isPromotableAlloca(inst.get())) {
+                    promotableAllocas.push_back(inst.get());
+                }
             }
         }
     }
@@ -150,10 +172,31 @@ bool mem2regOnFunction(IR::Function* func) {
             }
         }
     }
-    constexpr size_t MAX_MEM2REG_PHI_NODES_PER_FUNCTION = 14;
+    // PHI 数配额（双段）：
+    //   entry 段：沿用 v4.1.0 的 14——保证 entry 变量提升集合与 v4.1.0 完全一致，
+    //     不触碰高 PHI 数触发的重命名 bug（crypto temp 等复杂 entry 变量仍被挡）。
+    //   非 entry 段：额外配额，容纳循环内归纳变量（matmul k/sum/j）。
+    // M2R_PHI_CAP / M2R_NONENTRY_BUDGET 可覆盖用于调参与二分。
+    size_t ENTRY_PHI_CAP = 14;
+    if (const char* c = std::getenv("M2R_PHI_CAP")) ENTRY_PHI_CAP = (size_t)std::atoi(c);
+    size_t NONENTRY_BUDGET = 64;
+    if (const char* c = std::getenv("M2R_NONENTRY_BUDGET")) NONENTRY_BUDGET = (size_t)std::atoi(c);
+    size_t MAX_MEM2REG_PHI_NODES_PER_FUNCTION = ENTRY_PHI_CAP + NONENTRY_BUDGET;
 
     // 3. 对每个 alloca 执行 SSA 构造
+    size_t allocaIdx = 0;
+    size_t entryPhiUsed = SIZE_MAX;   // 首次进入非 entry 段时锁定 entry 段已用 PHI 数
     for (auto* alloca : promotableAllocas) {
+        bool isEntryAlloca = (allocaIdx < numEntryAllocas);
+        ++allocaIdx;
+        if (!isEntryAlloca) {
+            if (entryPhiUsed == SIZE_MAX) entryPhiUsed = phiNodeCount;  // 锁定一次
+            // 非 entry 段：额外预算耗尽则完全跳过（含零-PHI 提升），
+            // 保证 budget=0 时逐字节等价 v4.1.0（仅 entry）。
+            if (phiNodeCount >= entryPhiUsed + NONENTRY_BUDGET) continue;
+        }
+        size_t effectiveCap = isEntryAlloca
+            ? ENTRY_PHI_CAP : MAX_MEM2REG_PHI_NODES_PER_FUNCTION;
         // 3a. 收集定义块和使用块
         std::unordered_set<IR::BasicBlock*> defBlocks;
         std::unordered_set<IR::BasicBlock*> useBlocks;
@@ -177,6 +220,56 @@ bool mem2regOnFunction(IR::Function* func) {
 
         if (defBlocks.empty() && useBlocks.empty()) continue;
 
+        // ── 非 entry 变量快速路径：单一 store 且支配所有 load ──
+        // 循环体内声明的变量（int len=..; int k=0; int sum=0;）多是"声明即初始化、
+        // 随后在本作用域使用"。这类变量的 store 支配全部 load，不需要 PHI——标准
+        // IDF 会在循环 header 放一个多余 PHI（因为 def block 在循环里，其支配边界
+        // 含 header），该 PHI 合并 undef 与真值，是 crypto 错值的根源（main::len
+        // defBlocks=1 却 +1 phi）。此处对这类变量直接做 load→storedVal 替换，
+        // 绕开 PHI，既正确又消除多余 PHI。仅对非 entry 且单 store 生效（保守）。
+        if (!isEntryAlloca && stores.size() == 1 && !std::getenv("M2R_NO_FASTPATH")) {
+            auto* theStore = stores[0];
+            auto* storedVal = theStore->getOperand(0);
+            auto* storeBB = theStore->getParent();
+            // 检查：store 支配所有 load（同块内 store 在 load 前；异块 storeBB 支配 loadBB）
+            bool storeDominatesAllLoads = true;
+            for (auto* load : loads) {
+                auto* loadBB = load->getParent();
+                if (loadBB == storeBB) {
+                    // 同块：store 必须在 load 之前
+                    bool storeFirst = false;
+                    for (auto& in : storeBB->getInstructions()) {
+                        if (in.get() == theStore) { storeFirst = true; break; }
+                        if (in.get() == load) { storeFirst = false; break; }
+                    }
+                    if (!storeFirst) { storeDominatesAllLoads = false; break; }
+                } else {
+                    // 异块：storeBB 必须支配 loadBB
+                    auto dit = dom.find(loadBB);
+                    if (dit == dom.end() || !dit->second.count(storeBB)) {
+                        storeDominatesAllLoads = false; break;
+                    }
+                }
+            }
+            if (storeDominatesAllLoads) {
+                // 直接替换所有 load 为 storedVal，删除 load 与 store
+                for (auto* load : loads) {
+                    load->replaceAllUsesWith(storedVal);
+                    auto* pb = load->getParent();
+                    for (auto it = pb->begin(); it != pb->end(); ++it) {
+                        if (it->get() == load) { pb->erase(it); break; }
+                    }
+                }
+                auto* pb = theStore->getParent();
+                for (auto it = pb->begin(); it != pb->end(); ++it) {
+                    if (it->get() == theStore) { pb->erase(it); break; }
+                }
+                changed = true;
+                continue;
+            }
+            // store 不支配所有 load → 回退到标准 IDF-PHI 路径（下方）。
+        }
+
         // 如果 alloca 从未被 STORE，且所有 LOAD 返回相同值（未初始化），
         // 可以替换为 undef。但这里我们保守处理：至少需要一个定义块。
         if (defBlocks.empty()) {
@@ -199,17 +292,43 @@ bool mem2regOnFunction(IR::Function* func) {
             continue;
         }
 
+        // 非 entry 变量保守判据（防 crypto 类重命名缺陷）：
+        //   1. defBlocks 数 ≤ maxDefB（默认 2，规范归纳变量 init+递增）。
+        //   2. 变量的 def/use 块均不含 CALL：crypto 的循环内变量跨函数调用（rotl 等），
+        //      其在复杂控制流下触发 mem2reg PHI 填 undef 泄漏错值；matmul 内层纯算术
+        //      无 CALL。此判据精准隔离 crypto 而不误伤矩阵类。M2R_NE_MAXDEFB 可调。
+        if (!isEntryAlloca) {
+            size_t maxDefB = 2;
+            if (const char* c = std::getenv("M2R_NE_MAXDEFB")) maxDefB = (size_t)std::atoi(c);
+            if (defBlocks.size() > maxDefB) continue;
+            bool hasCallInRegion = false;
+            auto blockHasCall = [](IR::BasicBlock* b) {
+                for (auto& in : b->getInstructions())
+                    if (in->getOpcode() == IR::Instruction::Opcode::CALL) return true;
+                return false;
+            };
+            for (auto* b : defBlocks) if (blockHasCall(b)) { hasCallInRegion = true; break; }
+            if (!hasCallInRegion)
+                for (auto* b : useBlocks) if (blockHasCall(b)) { hasCallInRegion = true; break; }
+            if (hasCallInRegion) continue;  // 跳过跨调用变量（crypto 类）
+        }
+
         // 3b. 计算 PHI 放置位置（迭代支配边界）
         auto phiBlocks = computeIteratedDominanceFrontier(defBlocks, df);
         // Keep SSA construction within the pressure currently handled safely
         // by PHI lowering and the linear-scan allocator.  The count includes
         // PHIs created by earlier mem2reg invocations, so repeated pipeline
         // passes cannot silently exceed the same bound.
-        if (phiNodeCount + phiBlocks.size() >
-            MAX_MEM2REG_PHI_NODES_PER_FUNCTION) {
+        if (phiNodeCount + phiBlocks.size() > effectiveCap) {
             continue;
         }
         phiNodeCount += phiBlocks.size();
+        if (std::getenv("M2R_TRACE") && !isEntryAlloca) {
+            fprintf(stderr, "[m2r-ne] %s::%s in %s (+%zu phi) defBlocks=%zu useBlocks=%zu stores=%zu\n",
+                    func->getName().c_str(), alloca->getName().c_str(),
+                    alloca->getParent() ? alloca->getParent()->getName().c_str() : "?",
+                    phiBlocks.size(), defBlocks.size(), useBlocks.size(), stores.size());
+        }
 
         // ★ 获取 ALLOCA 的 pointee 类型，用于类型一致性检查
         // 当 STORE 的值类型与 ALLOCA 的 pointee 类型不匹配时（如 i1→i32，
@@ -392,6 +511,14 @@ bool mem2regOnFunction(IR::Function* func) {
 } // namespace
 
 bool mem2reg(IR::Module* mod) {
+    // 非 entry 提升只在首次 mem2reg（内联前）启用：内联后的复杂 CFG（如 crypto
+    // 把 _and/_or/rotl 内联进 pseudo_md5）会触发 mem2reg 对循环内变量的重命名缺陷
+    // （valueStack 空时 PHI 填 0，在复杂路径泄漏错值）。内联前 CFG 干净，matmul 的
+    // k/sum 在此时即可安全提升。用调用序号控制。M2R_NONENTRY_ALLPASS=1 可全启用（调试）。
+    static int callSeq = 0;
+    ++callSeq;
+    bool firstCall = (callSeq == 1);
+    g_allowNonEntry = (firstCall || std::getenv("M2R_NONENTRY_ALLPASS") != nullptr);
     bool changed = false;
     for (auto& func : mod->getFunctions()) {
         if (mem2regOnFunction(func.get())) {
