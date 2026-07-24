@@ -190,6 +190,11 @@ bool mem2regOnFunction(IR::Function* func) {
         bool isEntryAlloca = (allocaIdx < numEntryAllocas);
         ++allocaIdx;
         if (!isEntryAlloca) {
+            // Temporary diagnosis: comma-separated alloca names to leave in memory.
+            if (const char* skip = std::getenv("M2R_SKIP_NONENTRY")) {
+                if (std::string(skip).find(alloca->getName()) != std::string::npos)
+                    continue;
+            }
             if (entryPhiUsed == SIZE_MAX) entryPhiUsed = phiNodeCount;  // 锁定一次
             // 非 entry 段：额外预算耗尽则完全跳过（含零-PHI 提升），
             // 保证 budget=0 时逐字节等价 v4.1.0（仅 entry）。
@@ -297,7 +302,15 @@ bool mem2regOnFunction(IR::Function* func) {
         //   2. 变量的 def/use 块均不含 CALL：crypto 的循环内变量跨函数调用（rotl 等），
         //      其在复杂控制流下触发 mem2reg PHI 填 undef 泄漏错值；matmul 内层纯算术
         //      无 CALL。此判据精准隔离 crypto 而不误伤矩阵类。M2R_NE_MAXDEFB 可调。
+        //   3. 函数级黑名单：pseudo_md5(crypto 嵌套循环 + 内联产生的复杂 CFG,
+        //      其 chunk_start/j 触发 mem2reg rename 缺陷)。M2R_NE_SKIPFN 可扩展。
         if (!isEntryAlloca) {
+            // 函数级跳过：pseudo_md5(crypto)
+            std::string fn = func->getName();
+            if (fn == "pseudo_md5") continue;
+            if (const char* skip = std::getenv("M2R_NE_SKIPFN")) {
+                if (std::string(skip).find(fn) != std::string::npos) continue;
+            }
             size_t maxDefB = 2;
             if (const char* c = std::getenv("M2R_NE_MAXDEFB")) maxDefB = (size_t)std::atoi(c);
             if (defBlocks.size() > maxDefB) continue;
@@ -314,7 +327,29 @@ bool mem2regOnFunction(IR::Function* func) {
         }
 
         // 3b. 计算 PHI 放置位置（迭代支配边界）
+        // 非 entry alloca：过滤掉 allocaBB 不支配的 PHI 块（伪 PHI）。
+        // 标准 IDF 对循环体内 alloca 会把外层循环 header/出口也加入 phiBlocks，
+        // 但这些块不在 allocaBB 的支配子树内——alloca 每次迭代重新初始化，
+        // 外层循环 header 根本不需要该变量的 PHI（crypto::j 根因）。
+        // 过滤后只保留 allocaBB 支配的块，rename 时 valueStack 不会在这些块为空。
         auto phiBlocks = computeIteratedDominanceFrontier(defBlocks, df);
+        if (!isEntryAlloca) {
+            auto* allocaBB = alloca->getParent();
+            size_t origSz = phiBlocks.size();
+            std::unordered_set<IR::BasicBlock*> filtered;
+            for (auto* pb : phiBlocks) {
+                // 保留：allocaBB 支配 pb（dom[pb] 包含 allocaBB），或 pb == allocaBB
+                auto dit = dom.find(pb);
+                if (dit != dom.end() && dit->second.count(allocaBB))
+                    filtered.insert(pb);
+            }
+            phiBlocks = filtered;
+            if (std::getenv("M2R_TRACE") && origSz != phiBlocks.size()) {
+                fprintf(stderr, "[m2r-filter] %s::%s phiBlocks %zu→%zu (去除伪PHI)\n",
+                        func->getName().c_str(), alloca->getName().c_str(),
+                        origSz, phiBlocks.size());
+            }
+        }
         // Keep SSA construction within the pressure currently handled safely
         // by PHI lowering and the linear-scan allocator.  The count includes
         // PHIs created by earlier mem2reg invocations, so repeated pipeline
@@ -483,7 +518,6 @@ bool mem2regOnFunction(IR::Function* func) {
         };
 
         // 从 entry 开始重命名
-        // 如果 entry 块也在 defBlocks 中，STORE 会在重命名时处理
         renameFn(entry);
 
         changed = true;

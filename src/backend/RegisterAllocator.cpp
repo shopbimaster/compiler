@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>   // [EXP-SCAFFOLD] std::getenv for A/B switch
 #include <set>
 #include <string>
@@ -47,7 +48,9 @@ void RegisterAllocator::allocate(IR::Function& func) {
     } else {
         linearScan();
     }
-    coalescePhis(func);  // 修复安全检查后重新启用
+    if (!std::getenv("DEBUG_DISABLE_PHI_COALESCE")) {
+        coalescePhis(func);  // 修复安全检查后重新启用
+    }
 }
 
 // ★ K1+K2 修复：重建 usedCalleeSaved，移除两种情况下残留的无用寄存器：
@@ -463,10 +466,129 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
     }
 
     // ================================================================
+    // CFG liveness extension
+    //
+    // The allocator represents liveness as one conservative numeric interval,
+    // but block layout order is not execution order. Loop-only heuristics miss
+    // values that cross branches or PHI edges, allowing two simultaneously live
+    // values to receive the same physical register. Compute standard block-level
+    // live-in/live-out sets and widen the numeric intervals to cover every block
+    // in which a value is live. PHI incoming values are uses on predecessor
+    // edges, not uses in the PHI's block.
+    // ================================================================
+    if (!std::getenv("DEBUG_DISABLE_CFG_LIVENESS")) {
+    using ValueSet = std::unordered_set<IR::Value*>;
+    std::unordered_map<IR::BasicBlock*, ValueSet> blockUses;
+    std::unordered_map<IR::BasicBlock*, ValueSet> blockDefs;
+    std::unordered_map<IR::BasicBlock*, ValueSet> phiEdgeUses;
+    std::unordered_map<IR::BasicBlock*, ValueSet> liveIn;
+    std::unordered_map<IR::BasicBlock*, ValueSet> liveOut;
+
+    auto isTracked = [&](IR::Value* value) {
+        return value && firstSeen.find(value) != firstSeen.end();
+    };
+
+    for (auto& bb : func.getBlocks()) {
+        auto* block = bb.get();
+        blockUses[block];
+        blockDefs[block];
+        phiEdgeUses[block];
+        liveIn[block];
+        liveOut[block];
+
+        // PHIs define their results at block entry even if earlier passes have
+        // moved a non-PHI instruction before them in the instruction list.
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::PHI &&
+                isTracked(inst.get())) {
+                blockDefs[block].insert(inst.get());
+            }
+        }
+    }
+
+    if (auto* entry = func.getEntryBlock()) {
+        for (unsigned i = 0; i < func.getNumArgs(); ++i) {
+            auto* arg = func.getArg(i);
+            if (isTracked(arg)) blockDefs[entry].insert(arg);
+        }
+    }
+
+    for (auto& bb : func.getBlocks()) {
+        auto* block = bb.get();
+        auto& defs = blockDefs[block];
+        auto& uses = blockUses[block];
+
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::PHI) {
+                for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                    auto* incoming = inst->getOperand(i);
+                    auto* pred = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+                    if (pred && isTracked(incoming)) {
+                        phiEdgeUses[pred].insert(incoming);
+                    }
+                }
+                continue;
+            }
+
+            for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
+                auto* operand = inst->getOperand(i);
+                if (isTracked(operand) && !defs.count(operand)) {
+                    uses.insert(operand);
+                }
+            }
+            if (isTracked(inst.get())) defs.insert(inst.get());
+        }
+    }
+
+    bool livenessChanged = true;
+    while (livenessChanged) {
+        livenessChanged = false;
+        for (auto it = func.getBlocks().rbegin(); it != func.getBlocks().rend(); ++it) {
+            auto* block = it->get();
+            ValueSet newOut = phiEdgeUses[block];
+            for (auto* succ : succs[block]) {
+                newOut.insert(liveIn[succ].begin(), liveIn[succ].end());
+            }
+
+            ValueSet newIn = blockUses[block];
+            for (auto* value : newOut) {
+                if (!blockDefs[block].count(value)) newIn.insert(value);
+            }
+
+            if (newOut != liveOut[block] || newIn != liveIn[block]) {
+                liveOut[block] = std::move(newOut);
+                liveIn[block] = std::move(newIn);
+                livenessChanged = true;
+            }
+        }
+    }
+
+    for (auto& bb : func.getBlocks()) {
+        auto* block = bb.get();
+        auto minIt = blockMinId.find(block);
+        auto maxIt = blockMaxId.find(block);
+        if (minIt == blockMinId.end() || maxIt == blockMaxId.end() ||
+            minIt->second == INT_MAX || maxIt->second < 0) {
+            continue;
+        }
+
+        auto widenForBlock = [&](IR::Value* value) {
+            auto firstIt = firstSeen.find(value);
+            if (firstIt == firstSeen.end()) return;
+            firstIt->second = std::min(firstIt->second, minIt->second);
+            lastSeen[value] = std::max(lastSeen[value], maxIt->second);
+        };
+        for (auto* value : liveIn[block]) widenForBlock(value);
+        for (auto* value : liveOut[block]) widenForBlock(value);
+    }
+    }
+
+    // ================================================================
     // Compute loop depth for each block
     // Depth = number of loops that contain this block
     // ================================================================
     std::unordered_map<IR::BasicBlock*, int> blockDepth;
+
     for (auto& bb : func.getBlocks()) {
         int depth = 0;
         for (auto& loop : loops) {
@@ -903,6 +1025,18 @@ bool RegisterAllocator::isClassicRmwCoalesce(IR::Value* incoming,
         if (!phiUser) continue;
         if (phiUser == defInst) continue; // read-modify-write 本身
         if (phiUser->getParent() == defBB) return false; // 同 BB 其他 use → 不安全
+
+        // PHI operands are used on predecessor edges. Coalescing the RMW result
+        // into phiReg overwrites the old PHI value at defInst; reject it when a
+        // different PHI still needs that old value on defBB's outgoing edge.
+        // Example: B.next -> B.phi cannot be coalesced when the same edge also
+        // performs C.phi <- B.phi as part of a parallel copy.
+        if (phiUser->getOpcode() == IR::Instruction::Opcode::PHI &&
+            phiUse.operandNo % 2 == 0 &&
+            phiUse.operandNo + 1 < phiUser->getNumOperands() &&
+            phiUser->getOperand(phiUse.operandNo + 1) == defBB) {
+            return false;
+        }
     }
     return true;
 }
@@ -969,6 +1103,14 @@ void RegisterAllocator::coalescePhis(IR::Function& func) {
                     && !intervalsOverlap(incoming, phi)
                     && !regBusyDuring(phiReg, inIv, incoming);
                 if (!acceptRMW && !acceptDisjoint) continue;
+
+                if (std::getenv("RA_COALESCE_TRACE")) {
+                    std::fprintf(stderr,
+                        "[phi-coalesce] %s %s -> %s reg=%s rmw=%d disjoint=%d in=[%d,%d]\n",
+                        func.getName().c_str(), incoming->getName().c_str(),
+                        phi->getName().c_str(), phiReg.c_str(), acceptRMW,
+                        acceptDisjoint, inIv->start, inIv->end);
+                }
 
                 // Coalesce: assign the PHI's register to the incoming value
                 regMap[incoming] = phiReg;

@@ -246,7 +246,9 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
     collectLargeConstants(func);
 
     // 再提升 ALLOCA 到寄存器（跳过已被全局地址缓存占用的寄存器）
-    promoteAllocasInFunction(func);
+    if (!std::getenv("DEBUG_DISABLE_ALLOCA_PROMOTION")) {
+        promoteAllocasInFunction(func);
+    }
 
     computeStackLayout(func);
 
