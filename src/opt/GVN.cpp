@@ -59,16 +59,28 @@ struct GVNKeyHash {
 };
 
 // ---- 判断指令是否适合 GVN ----
-// 安全性：GEP 是纯函数（无副作用），可安全 CSE
-// 寄存器压力：GEP 结果通常立即用于 LOAD/STORE，活跃区间短
-//   算术运算的 CSE 会显著延长活跃区间（如跨分支的 add），增加寄存器溢出
-//   因此只对 GEP 做 GVN，算术运算留给同 BB CSE
+// 扩展：除GEP外，也对纯算术运算做GVN
+// 理由：
+//   1. 图着色寄存器分配器比线性扫描更能处理活跃区间延长
+//   2. 算术运算GVN可以消除跨BB的冗余计算（如循环中的索引计算）
+//   3. 只处理纯函数式指令，确保安全性
 bool canGVN(IR::Instruction* inst) {
     auto op = inst->getOpcode();
 
-    // 只处理 GEP — 这是跨 BB 冗余的主要来源
-    // （内联后同一数组地址在多个 BB 中重复计算）
+    // GEP — 跨 BB 冗余的主要来源
     if (op == Opc::GETELEMENTPTR) return true;
+
+    // 纯整数算术运算 — 无副作用，可以安全GVN
+    // 不包括浮点运算（需要考虑浮点异常和舍入模式）
+    if (op == Opc::ADD || op == Opc::SUB || op == Opc::MUL ||
+        op == Opc::SDIV || op == Opc::SREM ||
+        op == Opc::AND || op == Opc::OR || op == Opc::XOR ||
+        op == Opc::SHL || op == Opc::ASHR || op == Opc::LSHR) {
+        return true;
+    }
+
+    // 整数比较 — 纯函数，可以GVN
+    if (op == Opc::ICMP) return true;
 
     return false;
 }
