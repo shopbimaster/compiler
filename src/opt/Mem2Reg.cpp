@@ -299,18 +299,8 @@ bool mem2regOnFunction(IR::Function* func) {
 
         // 非 entry 变量保守判据（防 crypto 类重命名缺陷）：
         //   1. defBlocks 数 ≤ maxDefB（默认 2，规范归纳变量 init+递增）。
-        //   2. 变量的 def/use 块均不含 CALL：crypto 的循环内变量跨函数调用（rotl 等），
-        //      其在复杂控制流下触发 mem2reg PHI 填 undef 泄漏错值；matmul 内层纯算术
-        //      无 CALL。此判据精准隔离 crypto 而不误伤矩阵类。M2R_NE_MAXDEFB 可调。
-        //   3. 函数级黑名单：pseudo_md5(crypto 嵌套循环 + 内联产生的复杂 CFG,
-        //      其 chunk_start/j 触发 mem2reg rename 缺陷)。M2R_NE_SKIPFN 可扩展。
+        //   2. 变量的 def/use 块均不含 CALL，避免跨调用拉长 SSA 值的生命周期。
         if (!isEntryAlloca) {
-            // 函数级跳过：pseudo_md5(crypto)
-            std::string fn = func->getName();
-            if (fn == "pseudo_md5") continue;
-            if (const char* skip = std::getenv("M2R_NE_SKIPFN")) {
-                if (std::string(skip).find(fn) != std::string::npos) continue;
-            }
             size_t maxDefB = 2;
             if (const char* c = std::getenv("M2R_NE_MAXDEFB")) maxDefB = (size_t)std::atoi(c);
             if (defBlocks.size() > maxDefB) continue;
