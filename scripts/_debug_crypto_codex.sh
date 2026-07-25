@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo=/mnt/c/Users/whoever/Desktop/hust/game/compiler2026-x
-native="$HOME/compiler"
-work=/tmp/codex-crypto-debug
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+repo="$(cd "$script_dir/.." && pwd)"
+build="${BUILD_DIR:-$repo/build}"
+work="${PERF_DEBUG_DIR:-/tmp/compiler-perf-debug}"
+qemu="${QEMU_RISCV64:-qemu-riscv64}"
 
 mkdir -p "$work"
-cp "$repo/src/opt/Mem2Reg.cpp" "$native/src/opt/Mem2Reg.cpp"
-cp "$repo/src/opt/PhiLowering.cpp" "$native/src/opt/PhiLowering.cpp"
-cp "$repo/src/Compiler.cpp" "$native/src/Compiler.cpp"
-cp "$repo/src/backend/TargetCodeGen.cpp" "$native/src/backend/TargetCodeGen.cpp"
-cp "$repo/src/backend/RegisterAllocator.cpp" "$native/src/backend/RegisterAllocator.cpp"
-cmake --build "$native/build" --target compiler -j"$(nproc)"
+cmake --build "$build" --target compiler -j"$(nproc)"
+if [[ ! -f "$build/libsylib.a" ]]; then
+    BUILD_DIR="$build" bash "$repo/scripts/build_sylib.sh"
+fi
 
-compiler="$native/build/compiler"
-sylib="$native/build/libsylib.a"
-perf="$native/test/performance"
+compiler="$build/compiler"
+sylib="$build/libsylib.a"
+perf="$repo/test/performance"
 opt_level="${CODEX_OPT_LEVEL:--O1}"
 
 md5sum "$compiler"
@@ -34,9 +34,9 @@ run_case() {
 
     set +e
     if [[ -f "$perf/$name.in" ]]; then
-        timeout 60 qemu-riscv64-static "$elf" < "$perf/$name.in" > "$raw" 2>/dev/null
+        timeout 120 "$qemu" "$elf" < "$perf/$name.in" > "$raw" 2>/dev/null
     else
-        timeout 60 qemu-riscv64-static "$elf" > "$raw" 2>/dev/null
+        timeout 120 "$qemu" "$elf" > "$raw" 2>/dev/null
     fi
     rc=$?
     set -e
@@ -55,9 +55,12 @@ run_case() {
         verdict=PASS
     fi
 
-    local insn
+    local insn mem calls
     insn=$(grep -cE '^[[:space:]]+[a-z]' "$asm")
-    printf '%-18s %s rc=%s insn=%s\n' "$name" "$verdict" "$rc" "$insn"
+    mem=$(grep -cE '^[[:space:]]+(lw|sw|ld|sd|flw|fsw)[[:space:]]' "$asm" || true)
+    calls=$(grep -cE '^[[:space:]]+call[[:space:]]' "$asm" || true)
+    printf '%-20s %s rc=%s insn=%s mem=%s call=%s\n' \
+        "$name" "$verdict" "$rc" "$insn" "$mem" "$calls"
 }
 
 if [[ "$#" -eq 0 ]]; then
