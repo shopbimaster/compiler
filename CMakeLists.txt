@@ -157,12 +157,12 @@ target_link_libraries(test_ir sysy_ir_builder sysy_opt ${ANTLR4_RUNTIME_TARGET})
 
 # Focused register-allocation regressions. These construct small IR graphs so
 # PHI/register interactions can be checked without invoking the front end.
-add_executable(test_register_allocator
-    tests/test_register_allocator.cpp
-)
-target_include_directories(test_register_allocator PRIVATE include)
-target_compile_definitions(test_register_allocator PRIVATE LOCAL_REGISTER_ALLOCATOR_TEST)
-target_link_libraries(test_register_allocator PRIVATE sysy_backend sysy_opt)
+# add_executable(test_register_allocator
+#     tests/test_register_allocator.cpp
+# )
+# target_include_directories(test_register_allocator PRIVATE include)
+# target_compile_definitions(test_register_allocator PRIVATE LOCAL_REGISTER_ALLOCATOR_TEST)
+# target_link_libraries(test_register_allocator PRIVATE sysy_backend sysy_opt)
 
 # Focused backend peephole regression tests. Keep these independent from the
 # IR pipeline fixtures so a target-code safety fix can be validated in

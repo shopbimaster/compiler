@@ -179,7 +179,7 @@ bool mem2regOnFunction(IR::Function* func) {
     // M2R_PHI_CAP / M2R_NONENTRY_BUDGET 可覆盖用于调参与二分。
     size_t ENTRY_PHI_CAP = 14;
     if (const char* c = std::getenv("M2R_PHI_CAP")) ENTRY_PHI_CAP = (size_t)std::atoi(c);
-    size_t NONENTRY_BUDGET = 64;
+    size_t NONENTRY_BUDGET = 0;  // 方案A：禁用非entry提升，消除crypto/matmul退化
     if (const char* c = std::getenv("M2R_NONENTRY_BUDGET")) NONENTRY_BUDGET = (size_t)std::atoi(c);
     size_t MAX_MEM2REG_PHI_NODES_PER_FUNCTION = ENTRY_PHI_CAP + NONENTRY_BUDGET;
 
