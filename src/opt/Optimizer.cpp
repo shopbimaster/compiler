@@ -345,6 +345,17 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    // 6e2. GEPFolding：合并嵌套 GEP（借鉴 Cpl7）
+    //   GEP(GEP(ptr, i, ...), 0, j, ...) → GEP(ptr, i, ..., j, ...)
+    //   使 codegen 的 collectFoldedGeps 能将结果融合到 LOAD/STORE
+    //   必须在 GVN 之前运行，以便 GVN 能 CSE 合并后的 GEP
+    //   ★ 暂时禁用：IR 级 GEP 合并导致 codegen collectFoldedGeps 行为变化，
+    //     引起 71_full_conn 回归。改用 codegen 级直接移除嵌套 GEP 安全检查。
+    // if (gepFolding(mod)) {
+    //     constantFolding(mod);
+    //     deadCodeElimination(mod);
+    // }
+
     // 6f. GVN：基于支配树的跨 BB CSE
     // 历史禁用原因：跨 BB 合并延长活跃区间→线性扫描寄存器压力增→净回退
     //   （+1319ms / 60 perf tests）。换用 call-aware 图着色分配器后，其全局溢出

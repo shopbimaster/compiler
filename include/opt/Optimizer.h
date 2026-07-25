@@ -162,4 +162,11 @@ bool phiLowering(IR::Module* mod);
 // ================================================================
 bool phiSimplification(IR::Module* mod);
 
+// ================================================================
+// GEPFolding — 嵌套 GEP 合并（借鉴 Cpl7）
+// 合并 GEP(GEP(ptr, i, ...), 0, j, ...) 为 GEP(ptr, i, ..., j, ...)
+// 使 codegen 的 collectFoldedGeps 能将结果融合到 LOAD/STORE
+// ================================================================
+bool gepFolding(IR::Module* mod);
+
 } // namespace Opt

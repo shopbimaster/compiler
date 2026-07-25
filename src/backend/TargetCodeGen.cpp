@@ -690,11 +690,14 @@ void TargetCodeGen::collectFoldedGeps(IR::Function& func) {
                 continue;
 
             // 安全检查：如果 GEP 的基指针（operand 0）本身也是一个 GEP 指令，
-            // 则跳过融合。嵌套 GEP 融合会导致复杂的活跃范围交互，
-            // 可能使寄存器分配器错误地复用寄存器。
+            // 且内层 GEP 有多个使用者（非单使用），则跳过融合。
+            // 单使用的嵌套 GEP 可以安全融合——内层 GEP 的活跃区间等于
+            // 外层 GEP 的输入需求，不会增加额外的寄存器压力。
+            // ★ 借鉴 Cpl7 GEPFolding：允许单使用嵌套 GEP 融合到 LOAD/STORE
             auto* basePtr = inst->getOperand(0);
             if (auto* baseInst = dynamic_cast<IR::Instruction*>(basePtr)) {
-                if (baseInst->getOpcode() == IR::Instruction::Opcode::GETELEMENTPTR)
+                if (baseInst->getOpcode() == IR::Instruction::Opcode::GETELEMENTPTR
+                    && !baseInst->hasOneUse())
                     continue;
             }
 
