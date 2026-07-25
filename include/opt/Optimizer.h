@@ -155,4 +155,11 @@ bool globalValueNumbering(IR::Module* mod);
 // ================================================================
 bool phiLowering(IR::Module* mod);
 
+// ================================================================
+// PhiSimplification — PHI 节点简化
+// 在代码生成前消除冗余 PHI 节点（同值 PHI、单源 PHI、不可达前驱条目）
+// 每个 PHI 节点会在前驱块产生 mv 指令，减少 PHI 直接减少 mv 数量
+// ================================================================
+bool phiSimplification(IR::Module* mod);
+
 } // namespace Opt

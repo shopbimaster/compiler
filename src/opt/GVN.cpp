@@ -142,9 +142,9 @@ bool gvnOnFunction(IR::Function* func) {
 
             if (found != available.end() && found->second != inst) {
                 // ★ 安全检查：只合并来自直接支配者的 GEP
-                // 原因：寄存器分配器对跨多 BB 的长活跃区间处理有 bug。
-                // 限制为直接支配者（idom）可将活跃区间限制在 1 个 BB 边界内。
-                // 来自更远祖先的 GEP 不合并，避免触发寄存器分配器 bug。
+                // 实测验证（2026-07-26）：解除此限制（跨任意支配者合并）导致
+                // 指令数 +267（20025→20292），长活跃区间引发溢出开销超过 GEP
+                // 消除收益。即使图着色 RA 也无法消化跨多 BB 的长区间，故保留限制。
                 auto* existingBB = found->second->getParent();
                 if (existingBB != bb && existingBB != bbIdom) {
                     // 不是同 BB 也不是直接支配者 — 跳过合并

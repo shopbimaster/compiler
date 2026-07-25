@@ -300,7 +300,28 @@ std::string peepholeOptimize(const std::string& asmCode) {
         // 删除后，现有的 j fall-through 模式会自动消除被阻断的 j
         // 典型场景：bXX then; j else; dead_trampoline: j then; else:
         // ★ QEMU 安全：运行在寄存器分配之后，不改变寄存器分配（规则 14）
+        // ★ BUG FIX：函数入口标签（.globl 声明）不能删除！
+        //   main: 等函数入口由 C runtime _start 外部调用，不会被内部 j/bXX 引用，
+        //   但绝不能当作死 trampoline 删除，否则链接报 undefined reference to `main`。
         {
+            // 0. 收集所有 .globl 声明的符号（函数入口/全局变量，不可删除）
+            //    典型格式：.globl main / .globl mm（注意 .globl 后可能有多个空格）
+            std::set<std::string> globalSymbols;
+            for (const auto& line : lines) {
+                auto trimmed = line;
+                while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+                    trimmed = trimmed.substr(1);
+                if (trimmed.substr(0, 7) == ".globl ") {
+                    std::string name = trimmed.substr(7);
+                    // 去除前导和尾随空白（.globl 后可能有多个空格）
+                    while (!name.empty() && (name[0] == ' ' || name[0] == '\t'))
+                        name = name.substr(1);
+                    while (!name.empty() && (name.back() == ' ' || name.back() == '\t'))
+                        name.pop_back();
+                    if (!name.empty()) globalSymbols.insert(name);
+                }
+            }
+
             // 1. 收集所有被引用的 label（从跳转指令中）
             std::set<std::string> referencedLabels;
             for (const auto& line : lines) {
@@ -324,6 +345,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
 
             // 2. 删除无人引用的 trampoline（label: j target）
             // trampoline 模式：label 行后紧跟一条 j target 指令（中间无其他指令）
+            // ★ 保护 .globl 声明的函数入口标签（如 main:），即使未被内部引用
             std::vector<std::string> compact;
             compact.reserve(lines.size());
             for (size_t i = 0; i < lines.size(); ++i) {
@@ -334,6 +356,12 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
                         trimmed = trimmed.substr(1);
                     std::string labelName = trimmed.substr(0, trimmed.size() - 1);
+
+                    // ★ 保护 .globl 声明的符号（函数入口），永远不删除
+                    if (globalSymbols.count(labelName)) {
+                        compact.push_back(lines[i]);
+                        continue;
+                    }
 
                     // 查找下一条非空非注释行
                     size_t j = i + 1;
@@ -356,7 +384,10 @@ std::string peepholeOptimize(const std::string& asmCode) {
             lines = std::move(compact);
         }
 
-        // ★ BB 内冗余 li 消除：维护 reg → known_imm 映射
+        if (std::getenv("DEBUG_PEEP_TRACE")) {
+            std::fprintf(stderr, "=== after trampoline removal ===\n");
+            for (const auto& l : lines) if (l.find("main") != std::string::npos) std::fprintf(stderr, "  %s\n", l.c_str());
+        }
         // 遇到 li rd, imm 时，若 rd 当前已知值 == imm（且期间未被任何指令写），删除该 li
         // 任何写 rd 的指令使 rd 未知；call 杀死 caller-saved 寄存器（t0-t6, a0-a7, ra）
         // 遇到标签时清空整个映射（BB 边界）
@@ -1295,6 +1326,44 @@ std::string peepholeOptimize(const std::string& asmCode) {
                         szRd == mvRd && szRs == mvRd) {
                         std::string opName = extractOpName(lines[i + 1]);
                         result.push_back("  " + opName + "    " + szRd + ", " + mvRs);
+                        ++i;
+                        matched = true;
+                    }
+                }
+            }
+
+            // ★ mv rd, rs; <op> rd, rd, X → <op> rd, rs, X
+            // 前向 copy 传播：mv 后跟一条用 rd 作为（第一个）源操作数的双操作数
+            // 计算指令，且结果写回 rd。mv 定义的 rd 值被 op 立即覆写，故 mv 冗余。
+            // 借鉴 Cpl6 copy propagation。
+            // 安全条件：
+            //   1. mv 和 op 相邻（中间无注释外的指令）
+            //   2. op 的 rd == mv 的 rd（结果写回 mv 的目标）
+            //   3. op 的第一个源 == mv 的 rd（使用 mv 的目标作为源）
+            //   4. mv 的 rd != mv 的 rs（非 self-mv）
+            // 安全性：运行在 RA 之后，仅替换源操作数，不改变寄存器分配（规则 14）。
+            // 可通过 PEEPHOLE_NO_MV_COPYPROP=1 禁用。
+            if (!matched && !getenv("PEEPHOLE_NO_MV_COPYPROP") &&
+                i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {
+                std::string mvRd, mvRs;
+                if (tryMatch(lines[i], "mv", mvRd, mvRs, imm) &&
+                    !mvRs.empty() && mvRd != mvRs) {
+                    std::string opRd, opRs, opImm;
+                    std::string opName = extractOpName(lines[i + 1]);
+                    // 双操作数计算指令（结果写回 rd，两个源操作数）
+                    static const std::set<std::string> BINARY_OPS = {
+                        "add", "sub", "mul", "div", "divu", "rem", "remu",
+                        "and", "or", "xor", "sll", "srl", "sra", "slt", "sltu",
+                        "addw", "subw", "mulw", "sllw", "srlw", "sraw"
+                    };
+                    if (BINARY_OPS.count(opName) &&
+                        tryMatch(lines[i + 1], opName, opRd, opRs, opImm) &&
+                        opRd == mvRd && opRs == mvRd && !opImm.empty()) {
+                        // 替换所有等于 mvRd 的源为 mvRs
+                        // （opImm 可能也是 mvRd，如 mul t1, t1, t1）
+                        std::string newImm = (opImm == mvRd) ? mvRs : opImm;
+                        result.push_back("  " + opName + "    " + opRd + ", " +
+                                         mvRs + ", " + newImm);
                         ++i;
                         matched = true;
                     }
