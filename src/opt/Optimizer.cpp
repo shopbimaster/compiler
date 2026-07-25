@@ -163,6 +163,13 @@ void runO2(IR::Module* mod) {
             phase2Changed = true;
         }
 
+        // 2d. 跳转线程化：消除冗余跳转链 br A -> br B -> br C => br C
+        if (jumpThreading(mod)) {
+            // 跳转线程化可能创造新的SimplifyCFG机会
+            simplifyCFG(mod);
+            phase2Changed = true;
+        }
+
         if (!phase2Changed) break;
     }
     // ================================================================

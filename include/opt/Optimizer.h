@@ -128,6 +128,7 @@ bool simplifyCFG(IR::Module* mod);
 bool copyPropagation(IR::Module* mod);
 bool magicDivision(IR::Module* mod);
 bool basicBlockReordering(IR::Module* mod);
+bool jumpThreading(IR::Module* mod);
 void runP0(IR::Module* mod);
 
 // ================================================================

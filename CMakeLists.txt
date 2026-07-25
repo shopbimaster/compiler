@@ -123,6 +123,7 @@ add_library(sysy_opt STATIC
     src/opt/CopyPropagation.cpp
     src/opt/MagicDivision.cpp
     src/opt/BasicBlockReordering.cpp
+    src/opt/JumpThreading.cpp
     src/opt/ADCE.cpp
     src/opt/PeepholeOptimizer.cpp
     src/opt/InlineExpansion.cpp
