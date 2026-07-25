@@ -44,6 +44,11 @@ DFMap computeDominanceFrontier(IR::Function* func, const DomMap& dom,
 std::unordered_set<IR::GlobalVariable*> readOnlyGlobalAnalysis(IR::Module* mod);
 bool sparseConditionalConstantPropagation(IR::Module* mod);
 
+// PureFuncDect — 纯函数分析（借鉴 Cpl5）
+// 标记不修改外部可见内存且不调用非纯函数的函数为纯函数
+// 用途：LICM 提升 CALL、GVN 跨 CALL 消除
+std::unordered_set<IR::Function*> computePureFunctions(IR::Module* mod);
+
 // ================================================================
 // 自然循环森林 — 共享循环分析
 // ================================================================

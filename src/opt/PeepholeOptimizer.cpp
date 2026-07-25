@@ -504,6 +504,22 @@ std::string peepholeOptimize(const std::string& asmCode) {
             // regLastWritten: reg → 最后一次写入的 compact_index
             std::unordered_map<std::string, size_t> regLastWritten;
             std::regex regRegex("\\b([tsa]\\d+|sp|ra|gp|tp)\\b");
+            // ★ li 复用跟踪：reg → imm（该寄存器当前持有的立即数值）
+            // 当 BB 内多次 li 同一常量时，消除冗余 li 或替换为 mv
+            // 借鉴 Cpl6 立即数加载复用
+            std::unordered_map<std::string, std::string> regToImm;
+            auto invalidateRegImm = [&](const std::string& reg) {
+                regToImm.erase(reg);
+            };
+            // imm 是否可放入 12 位有符号立即数（li 为单条 addi）
+            // 大立即数 li 为 lui+addi 两条，mv 替换可省一条
+            auto immFits12 = [](const std::string& imm) -> bool {
+                if (imm.empty()) return false;
+                try {
+                    long val = std::stol(imm);
+                    return val >= -2048 && val <= 2047;
+                } catch (...) { return false; }
+            };
 
             // ★ 预处理：统计被跳转指令引用的标签
             // 引用计数为 0 的标签是纯 fall-through 目标（无跳转指令跳到它），
@@ -592,6 +608,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     // 被跳转引用的标签：可能从其他路径跳来，清空跟踪
                     lastSeen.clear();
                     regLastWritten.clear();
+                    // ★ li 复用：跳转目标可能从其他路径到达，寄存器值不可信
+                    regToImm.clear();
                     continue;
                 }
                 // 跳过空行、注释、指令
@@ -629,7 +647,63 @@ std::string peepholeOptimize(const std::string& asmCode) {
                             ++it;
                         }
                     }
+                    // ★ li 复用：call 杀死 caller-saved 寄存器的 imm 跟踪
+                    for (auto it = regToImm.begin(); it != regToImm.end(); ) {
+                        char c = it->first[0];
+                        if (c == 't' || c == 'a' || it->first == "ra") {
+                            it = regToImm.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
                     continue;
+                }
+                // ★ li 复用：BB 内相同立即数重复加载时消除或替换为 mv
+                // 借鉴 Cpl6 立即数加载复用。安全性：运行在 RA 之后，仅删指令或替 mv，
+                // 不改变寄存器分配（规则 14）。可通过 PEEPHOLE_NO_LI_REUSE=1 禁用。
+                if (opName == "li" && !getenv("PEEPHOLE_NO_LI_REUSE")) {
+                    std::string liRd, liImm, liDummy;
+                    if (tryMatch(line, "li", liRd, liImm, liDummy) &&
+                        !liRd.empty() && liRd != "x0" && liRd != "zero" && !liImm.empty()) {
+                        // 情况 1: rd 已持有相同 imm → li 冗余，删除
+                        auto rIt = regToImm.find(liRd);
+                        if (rIt != regToImm.end() && rIt->second == liImm) {
+                            continue;  // 消除冗余 li
+                        }
+                        // 情况 2: 另一寄存器 srcReg 持有 imm → 大立即数替换为 mv 省 1 条
+                        // 小立即数 li 与 mv 均为单条，mv 引入依赖不替换
+                        if (!immFits12(liImm)) {
+                            std::string bestSrc;
+                            for (const auto& kv : regToImm) {
+                                if (kv.second == liImm && kv.first != liRd) {
+                                    bestSrc = kv.first;
+                                    break;
+                                }
+                            }
+                            if (!bestSrc.empty()) {
+                                compact.push_back("  mv      " + liRd + ", " + bestSrc);
+                                regLastWritten[liRd] = compact.size() - 1;
+                                for (auto it = lastSeen.begin(); it != lastSeen.end(); ) {
+                                    if (it->second.second == liRd) it = lastSeen.erase(it);
+                                    else ++it;
+                                }
+                                invalidateRegImm(liRd);
+                                regToImm[liRd] = liImm;
+                                continue;
+                            }
+                        }
+                        // 情况 3: 无法复用，保留 li 并更新跟踪
+                        compact.push_back(line);
+                        regLastWritten[liRd] = compact.size() - 1;
+                        for (auto it = lastSeen.begin(); it != lastSeen.end(); ) {
+                            if (it->second.second == liRd) it = lastSeen.erase(it);
+                            else ++it;
+                        }
+                        invalidateRegImm(liRd);
+                        regToImm[liRd] = liImm;
+                        continue;
+                    }
+                    // 解析失败的 li 走默认非缓存路径
                 }
                 // 不可缓存的指令（branch/jump/mv/li/auipc 等）：直接保留
                 if (CACHEABLE.count(opName) == 0) {
@@ -645,6 +719,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
                                 ++it;
                             }
                         }
+                        // ★ li 复用：rd 被覆写，清除其 imm 跟踪
+                        invalidateRegImm(rd2);
                     }
                     continue;
                 }
@@ -701,6 +777,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
                                 // rd 不同，替换为 mv rd, prevRd
                                 compact.push_back("  mv      " + rd + ", " + prevRd);
                                 regLastWritten[rd] = compact.size() - 1;
+                                // ★ li 复用：rd 被 mv 覆写，清除其 imm 跟踪
+                                invalidateRegImm(rd);
                                 redundant = true;
                             }
                         }
@@ -719,6 +797,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     }
                     lastSeen[key] = {curIdx, rd};
                     regLastWritten[rd] = curIdx;
+                    // ★ li 复用：rd 被计算结果覆写，清除其 imm 跟踪
+                    invalidateRegImm(rd);
                 }
             }
             lines = std::move(compact);
