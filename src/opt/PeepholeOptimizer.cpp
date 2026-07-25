@@ -1878,6 +1878,100 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 }
             }
 
+            // ★ branch+j 反转优化：bXX L1; j L2; L1: → bXX_inv L2; L1: (fall-through)
+            // 当分支指令的目标 L1 恰好是 j 之后的下一条标签时，
+            // 反转分支条件使其跳转到 L2，j 被消除（L1 成为 fall-through）。
+            // 典型场景：while 循环的 blt cond, body; j end; body: 模式
+            // 安全条件：
+            //   1. bXX 和 j 在同一基本块内相邻（中间可有空行/注释/.p2align）
+            //   2. j 之后第一个实际标签 == 分支目标 L1（中间只允许空标签/注释/.p2align）
+            //   3. L1 != L2（否则是自循环，不能反转）
+            // ★ QEMU 安全：运行在寄存器分配之后，不改变寄存器分配（规则 14）
+            // ★ 汇编器安全：RISC-V GNU as 支持分支松弛（branch relaxation），
+            //   若反转后的分支目标 L2 超出 ±4KB 范围，as 自动插入 j trampoline，
+            //   退化为原始模式，不会产生错误或回退。
+            if (!matched && !std::getenv("PEEPHOLE_NO_BRANCH_INVERT")) {
+                std::string opName = extractOpName(lines[i]);
+                static const std::unordered_map<std::string, std::string> BR_INVERT = {
+                    {"beq", "bne"}, {"bne", "beq"},
+                    {"blt", "bge"}, {"bge", "blt"},
+                    {"bltu", "bgeu"}, {"bgeu", "bltu"},
+                    {"beqz", "bnez"}, {"bnez", "beqz"}
+                };
+                auto invIt = BR_INVERT.find(opName);
+                if (invIt != BR_INVERT.end()) {
+                    // 提取分支目标 L1
+                    std::string brTarget;
+                    std::string brRs, brLabel;       // for beqz/bnez
+                    std::string brRd, brRs2, brImm;  // for beq/bne/blt/bge/bltu/bgeu
+                    bool isBranchOneReg = (opName == "beqz" || opName == "bnez");
+                    if (isBranchOneReg) {
+                        if (tryMatchBranch(lines[i], opName, brRs, brLabel) && !brLabel.empty())
+                            brTarget = brLabel;
+                    } else {
+                        if (tryMatch(lines[i], opName, brRd, brRs2, brImm) && !brImm.empty())
+                            brTarget = brImm;
+                    }
+
+                    if (!brTarget.empty()) {
+                        // 查找下一条真实指令（必须是 j L2）
+                        size_t jIdx = findNextRealInst(lines, i + 1);
+                        if (jIdx < lines.size()) {
+                            std::string jRd, jRs, jImm;
+                            if (tryMatch(lines[jIdx], "j", jRd, jRs, jImm) && !jRd.empty()
+                                && jRd != brTarget) {
+                                // 查找 j 之后的第一个标签（跳过空行/注释/.p2align）
+                                // 第一个标签必须 == 分支目标 L1（否则不能反转）
+                                bool foundTarget = false;
+                                for (size_t k = jIdx + 1; k < lines.size(); ++k) {
+                                    const std::string& nextLine = lines[k];
+                                    if (nextLine.empty()) continue;
+                                    size_t p = 0;
+                                    while (p < nextLine.size() && (nextLine[p] == ' ' || nextLine[p] == '\t')) ++p;
+                                    if (p >= nextLine.size()) continue;
+                                    char firstChar = nextLine[p];
+                                    if (firstChar == '#') continue;
+                                    if (firstChar == '.') {
+                                        std::string rest = nextLine.substr(p);
+                                        if (rest.size() >= 8 && rest.substr(0, 8) == ".p2align") continue;
+                                        if (rest.size() >= 6 && rest.substr(0, 6) == ".align") continue;
+                                        // 其他 . 开头的可能是 .L 标签（如 .Lxxx:），需检查 ':'
+                                        // 不能 break，继续到下面的标签检查
+                                    }
+                                    // 检查是否是标签行（以冒号结尾）
+                                    std::string trimmed = nextLine;
+                                    while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+                                        trimmed = trimmed.substr(1);
+                                    if (!trimmed.empty() && trimmed.back() == ':') {
+                                        std::string labelName = trimmed.substr(0, trimmed.size() - 1);
+                                        foundTarget = (labelName == brTarget);
+                                        break;  // 第一个标签就停止（不管是否匹配）
+                                    }
+                                    // 非 .p2align/.align 的指令行（如 .word, .size 等）→ 不能 fall-through
+                                    if (firstChar == '.') break;
+                                    break;  // 遇到指令（非 label），停止
+                                }
+                                if (foundTarget) {
+                                    // 反转分支：bXX ... L1 → bXX_inv ... L2
+                                    std::string invOp = invIt->second;
+                                    if (isBranchOneReg) {
+                                        result.push_back("  " + invOp + "    " + brRs + ", " + jRd);
+                                    } else {
+                                        result.push_back("  " + invOp + "    " + brRd + ", " + brRs2 + ", " + jRd);
+                                    }
+                                    // 保留 bXX 和 j 之间的空行/注释/.p2align
+                                    for (size_t k = i + 1; k < jIdx; ++k) {
+                                        result.push_back(lines[k]);
+                                    }
+                                    i = jIdx;  // 跳过 j 行（for 循环的 ++i 会跳到 jIdx + 1）
+                                    matched = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // j label; label: → eliminate j (fall through to label)
             // 跳过中间的空行、注释、.p2align/.align 指令、非目标空 label
             // 典型模式：j .Lxxx; .Lxxx: 或 j .Lxxx; .p2align 4; .Lxxx: 或 j .Lxxx; .Lempty; .Lxxx:
