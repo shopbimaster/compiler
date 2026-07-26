@@ -1497,6 +1497,21 @@ void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
     // 检查条件是否来自已内联的 ICMP 指令
     auto* condVal = inst.getOperand(0);
     auto* icmp = dynamic_cast<IR::Instruction*>(condVal);
+
+    std::string thenLabel = ".L" + currentFunc->getName() + "_" + thenBB->getName();
+    std::string elseLabel = ".L" + currentFunc->getName() + "_" + elseBB->getName();
+
+    // ★ 检查 then 边是否有 PHI moves。若无，直接分支到 thenLabel，
+    //   省去 edgeLabel 和 `j .Lthen`（每条 COND_BR 省 1 条指令）
+    auto thenIt = phiMoveMap.find({currentBB, thenBB});
+    bool thenHasPhiMoves = (thenIt != phiMoveMap.end() && !thenIt->second.empty());
+    std::string edgeLabel;
+    if (thenHasPhiMoves) {
+        edgeLabel = ".L" + currentFunc->getName() + "_edge_" +
+                    std::to_string(labelCounter++);
+    }
+    std::string thenTarget = thenHasPhiMoves ? edgeLabel : thenLabel;
+
     if (icmp && inlinedIcmps.count(icmp)) {
         std::string cond = icmp->getName(); // eq/ne/slt/sle/sgt/sge
         auto* op0 = icmp->getOperand(0);
@@ -1510,16 +1525,13 @@ void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
             r0 = "t0";
         }
 
-        std::string edgeLabel = ".L" + currentFunc->getName() + "_edge_" +
-                                std::to_string(labelCounter++);
-
         // 与常量 0 比较时使用 beqz/bnez
         auto* ci1 = dynamic_cast<IR::ConstantInt*>(op1);
         if (ci1 && ci1->getValue() == 0 && (cond == "eq" || cond == "ne")) {
             if (cond == "eq")
-                code += "  beqz    " + r0 + ", " + edgeLabel + "\n";
+                code += "  beqz    " + r0 + ", " + thenTarget + "\n";
             else
-                code += "  bnez    " + r0 + ", " + edgeLabel + "\n";
+                code += "  bnez    " + r0 + ", " + thenTarget + "\n";
         } else {
             // 两个寄存器操作数的分支指令
             std::string r1 = getValueReg(op1);
@@ -1529,51 +1541,40 @@ void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
                 r1 = "t1";
             }
             if (cond == "eq")
-                code += "  beq     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+                code += "  beq     " + r0 + ", " + r1 + ", " + thenTarget + "\n";
             else if (cond == "ne")
-                code += "  bne     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+                code += "  bne     " + r0 + ", " + r1 + ", " + thenTarget + "\n";
             else if (cond == "slt")
-                code += "  blt     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+                code += "  blt     " + r0 + ", " + r1 + ", " + thenTarget + "\n";
             else if (cond == "sle")
-                code += "  bge     " + r1 + ", " + r0 + ", " + edgeLabel + "\n";
+                code += "  bge     " + r1 + ", " + r0 + ", " + thenTarget + "\n";
             else if (cond == "sgt")
-                code += "  blt     " + r1 + ", " + r0 + ", " + edgeLabel + "\n";
+                code += "  blt     " + r1 + ", " + r0 + ", " + thenTarget + "\n";
             else if (cond == "sge")
-                code += "  bge     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+                code += "  bge     " + r0 + ", " + r1 + ", " + thenTarget + "\n";
             else
-                code += "  bne     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+                code += "  bne     " + r0 + ", " + r1 + ", " + thenTarget + "\n";
         }
 
         emitter.emitText(code);
-
-        // False 分支：PHI moves + 跳转
-        emitPhiMovesForEdge(currentBB, elseBB);
-        emitter.emitText("  j       .L" + currentFunc->getName() + "_" + elseBB->getName());
-
-        // True 分支：标签 + PHI moves + 跳转
-        emitter.emitText(edgeLabel + ":");
-        emitPhiMovesForEdge(currentBB, thenBB);
-        emitter.emitText("  j       .L" + currentFunc->getName() + "_" + thenBB->getName());
-        return;
+    } else {
+        // 一般路径：加载条件到 t0，使用 bnez
+        std::string code;
+        code += loadToReg(inst.getOperand(0), "t0");
+        code += "  bnez    t0, " + thenTarget + "\n";
+        emitter.emitText(code);
     }
 
-    // 一般路径：加载条件到 t0，使用 bnez
-    std::string code;
-    code += loadToReg(inst.getOperand(0), "t0");
-
-    std::string edgeLabel = ".L" + currentFunc->getName() + "_edge_" +
-                            std::to_string(labelCounter++);
-    code += "  bnez    t0, " + edgeLabel + "\n";
-    emitter.emitText(code);
-
-    // False 分支：先发射 PHI moves，再跳转
+    // False 分支：PHI moves + 跳转
     emitPhiMovesForEdge(currentBB, elseBB);
-    emitter.emitText("  j       .L" + currentFunc->getName() + "_" + elseBB->getName());
+    emitter.emitText("  j       " + elseLabel);
 
-    // True 分支：标签 + PHI moves + 跳转
-    emitter.emitText(edgeLabel + ":");
-    emitPhiMovesForEdge(currentBB, thenBB);
-    emitter.emitText("  j       .L" + currentFunc->getName() + "_" + thenBB->getName());
+    // True 分支：若有 PHI moves，发射 edgeLabel + PHI moves + 跳转
+    if (thenHasPhiMoves) {
+        emitter.emitText(edgeLabel + ":");
+        emitPhiMovesForEdge(currentBB, thenBB);
+        emitter.emitText("  j       " + thenLabel);
+    }
 }
 
 std::string TargetCodeGen::getValueReg(IR::Value* val) {
@@ -2121,13 +2122,12 @@ void TargetCodeGen::emitStore(IR::Instruction& inst) {
             }
         } else {
             // 源操作数不在寄存器中，需要先加载
-            if (isFloat) {
-                code += loadToReg(inst.getOperand(0), "ft0");
-                code += "  fmv.s   " + allocaReg + ", ft0\n";
-            } else {
-                code += loadToReg(inst.getOperand(0), "t0");
-                code += "  mv      " + allocaReg + ", t0\n";
-            }
+            // ★ 优化：直接加载到 allocaReg，省去 t0/ft0 中转
+            //   对于常量：原 "li t0, 0; mv s4, t0" → "li s4, 0"（省 1 条 mv）
+            //   对于全局变量：原 "la t0, gv; mv s4, t0" → "la s4, gv"（省 1 条 mv）
+            //   对于栈偏移：原 "addi t0, sp, off; mv s4, t0" → "addi s4, sp, off"（省 1 条 mv）
+            //   安全性：loadToReg 内部使用 t1/t2 作为大立即数 scratch，不与 allocaReg（通常 s0-s11）冲突
+            code += loadToReg(inst.getOperand(0), allocaReg);
         }
         emitter.emitText(code);
         return;
