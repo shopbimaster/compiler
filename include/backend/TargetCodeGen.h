@@ -145,6 +145,10 @@ private:
     std::string emitStackLoad(const std::string& reg, int offset, const std::string& insn);
     std::string emitStackStore(const std::string& reg, int offset, const std::string& insn);
     std::string emitSPAddImm(int delta);
+    // Batched stack ops: compute shared base register once for multiple saves/loads
+    // at large offsets, reducing "li+add+sd" per register to just "sd" with base
+    std::string emitBatchedStackOps(
+        const std::vector<std::tuple<std::string, int, std::string>>& ops);
 
     // 生成 stride 乘法代码：将 srcReg 乘以 stride，结果留在 srcReg
     // 优化：stride 为 2 的幂次时使用 slli（1 cycle），否则使用 mul（3 cycle）

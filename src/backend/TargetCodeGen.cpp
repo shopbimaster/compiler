@@ -488,6 +488,97 @@ std::string TargetCodeGen::emitStackStore(const std::string& reg, int offset, co
     return result;
 }
 
+// ================================================================
+// Batched callee-saved save/restore: when multiple registers need
+// to be saved at offsets > 2047, compute a shared base register
+// once and use small offsets from it.
+//
+// Before (per register, offset > 2047):
+//   li    t2, 2440
+//   add   t2, sp, t2
+//   sd    s1, 0(t2)
+// After (shared base):
+//   li    t2, 2048      # base setup, once
+//   add   t2, sp, t2
+//   sd    s1, 392(t2)   # 2440 - 2048 = 392
+//   sd    s0, 384(t2)   # 2432 - 2048 = 384
+//   ...
+//
+// Savings: ~2 instructions per register after the first.
+// With 11 callee-saved + ra, that's ~22 instructions per function
+// prologue, and the same for epilogue.
+// ================================================================
+std::string TargetCodeGen::emitBatchedStackOps(
+    const std::vector<std::tuple<std::string, int, std::string>>& ops) {
+    std::string result;
+    if (ops.empty()) return result;
+
+    // Find min and max offsets
+    int minOff = std::get<1>(ops[0]);
+    int maxOff = minOff;
+    for (auto& [reg, off, insn] : ops) {
+        minOff = std::min(minOff, off);
+        maxOff = std::max(maxOff, off);
+    }
+
+    // If all offsets fit in imm12, emit directly with sp
+    if (maxOff <= 2047 && minOff >= -2048) {
+        for (auto& [reg, off, insn] : ops) {
+            result += "  " + insn + "      " + reg + ", " + std::to_string(off) + "(sp)\n";
+        }
+        return result;
+    }
+
+    // Range too large for single base? Fall back to individual emission
+    if (maxOff - minOff > 4095) {
+        for (auto& [reg, off, insn] : ops) {
+            result += emitStackStore(reg, off, insn);
+        }
+        return result;
+    }
+
+    // Choose base so all adjusted offsets fit in [-2048, 2047]
+    // Use BASE = minOff so adjusted offsets are in [0, maxOff - minOff]
+    // But we want to avoid negative adjusted offsets, so use minOff rounded
+    // down to keep things simple. If minOff >= 0, BASE = minOff works.
+    // If minOff < 0, we need BASE such that maxOff - BASE <= 2047.
+    int base;
+    if (minOff >= 0) {
+        // Round down to a nice boundary for potential addi use
+        base = (minOff / 2048) * 2048;
+        if (base < 0) base = 0;
+    } else {
+        // For negative offsets, choose base so maxOff - base <= 2047
+        base = maxOff - 2047;
+    }
+
+    // Ensure all adjusted offsets fit
+    int adjMin = minOff - base;
+    int adjMax = maxOff - base;
+    if (adjMin < -2048 || adjMax > 2047) {
+        // Fall back to individual emission
+        for (auto& [reg, off, insn] : ops) {
+            result += emitStackStore(reg, off, insn);
+        }
+        return result;
+    }
+
+    // Set up base register t2 = sp + base
+    if (fitsImm12(base)) {
+        result += "  addi    t2, sp, " + std::to_string(base) + "\n";
+    } else {
+        result += "  li      t2, " + std::to_string(base) + "\n";
+        result += "  add     t2, sp, t2\n";
+    }
+
+    // Emit each op using small offset from t2
+    for (auto& [reg, off, insn] : ops) {
+        int adjOff = off - base;
+        result += "  " + insn + "      " + reg + ", " + std::to_string(adjOff) + "(t2)\n";
+    }
+    return result;
+}
+
 // 生成 stride 乘法代码：将 srcReg 乘以 stride，结果留在 srcReg
 // 优化：stride 为 2 的幂次时使用 slli（1 cycle），否则使用 mul（3 cycle）
 // largeConstReg 用于非 2 的幂次大 stride 的 li 临时寄存器
@@ -525,23 +616,26 @@ void TargetCodeGen::emitPrologue(IR::Function& func) {
     // Adjust stack pointer, handling large stack frames
     emitter.emitText(emitSPAddImm(-stackSize));
 
-    // Save ra only for non-leaf functions (leaf functions don't call anything)
+    // Collect all callee-saved register saves (including ra) for batched emission
+    // This avoids repeated "li t2, OFF; add t2, sp, t2" when offsets > 2047
+    std::vector<std::tuple<std::string, int, std::string>> saves;
     if (savesRA && stackSize > 0) {
-        emitter.emitText(emitStackStore("ra", stackSize - 8, "sd"));
+        saves.push_back({"ra", stackSize - 8, "sd"});
     }
 
-    // Save only callee-saved registers (s*, fs*) in prologue.
-    // Caller-saved registers (t*, ft*) are saved at call sites.
     int csrOffset = stackSize - 8;
     for (auto& reg : regAlloc.getUsedCalleeSaved()) {
         csrOffset -= 8;
         if (!isCalleeSavedReg(reg)) continue;  // Skip caller-saved
         if (reg[0] == 'f') {
-            emitter.emitText(emitStackStore(reg, csrOffset, "fsd"));
+            saves.push_back({reg, csrOffset, "fsd"});
         } else {
-            emitter.emitText(emitStackStore(reg, csrOffset, "sd"));
+            saves.push_back({reg, csrOffset, "sd"});
         }
     }
+
+    // Emit batched saves (uses shared base register when offsets are large)
+    emitter.emitText(emitBatchedStackOps(saves));
 
     auto* ft = func.getFunctionType();
     unsigned iReg = 0;  // Next integer argument register
@@ -646,22 +740,26 @@ void TargetCodeGen::emitPrologue(IR::Function& func) {
 
 void TargetCodeGen::emitEpilogue(IR::Function& func) {
     if (stackSize > 0) {
-        // Restore only callee-saved registers (s*, fs*).
-        // Caller-saved registers were restored at call sites.
+        // Collect all callee-saved register restores (including ra) for batched emission
+        std::vector<std::tuple<std::string, int, std::string>> restores;
         int csrOffset = stackSize - 8;
         for (auto& reg : regAlloc.getUsedCalleeSaved()) {
             csrOffset -= 8;
             if (!isCalleeSavedReg(reg)) continue;  // Skip caller-saved
             if (reg[0] == 'f') {
-                emitter.emitText(emitStackLoad(reg, csrOffset, "fld"));
+                restores.push_back({reg, csrOffset, "fld"});
             } else {
-                emitter.emitText(emitStackLoad(reg, csrOffset, "ld"));
+                restores.push_back({reg, csrOffset, "ld"});
             }
         }
         // Restore ra only for non-leaf functions
         if (savesRA) {
-            emitter.emitText(emitStackLoad("ra", stackSize - 8, "ld"));
+            restores.push_back({"ra", stackSize - 8, "ld"});
         }
+
+        // Emit batched restores (uses shared base register when offsets are large)
+        emitter.emitText(emitBatchedStackOps(restores));
+
         emitter.emitText(emitSPAddImm(stackSize));
     }
     emitter.emitText("  ret");
