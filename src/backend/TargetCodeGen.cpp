@@ -1,4 +1,5 @@
 #include "backend/TargetCodeGen.h"
+#include "backend/PostRAScheduler.h"
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -92,7 +93,9 @@ std::string TargetCodeGen::generate(IR::Module& module) {
     if (!data.empty()) {
         result += data + "\n";
     }
-    result += emitter.getTextSection();
+    // Post-RA 局部指令调度：作用于最终汇编文本（真实物理寄存器），隐藏 load-use
+    // 延迟。未识别助记符/sp,ra 相关块整块跳过，保证正确性。SCHED_OFF=1 关闭。
+    result += postRASchedule(emitter.getTextSection());
     return result;
 }
 
@@ -243,7 +246,9 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
     collectLargeConstants(func);
 
     // 再提升 ALLOCA 到寄存器（跳过已被全局地址缓存占用的寄存器）
-    promoteAllocasInFunction(func);
+    if (!std::getenv("DEBUG_DISABLE_ALLOCA_PROMOTION")) {
+        promoteAllocasInFunction(func);
+    }
 
     computeStackLayout(func);
 
@@ -949,6 +954,9 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
     case Opc::ASHR:
     case Opc::SMULH:
         emitBinOp(inst);
+        break;
+    case Opc::WIDE_SMOD_MUL:
+        emitWideSmodMul(inst);
         break;
     case Opc::ICMP:
         emitIcmp(inst);
@@ -1814,6 +1822,35 @@ void TargetCodeGen::emitBinOp(IR::Instruction& inst) {
 
     if (!rdInReg) {
         code += storeFromReg(&inst, dest);
+    }
+    emitter.emitText(code);
+}
+
+void TargetCodeGen::emitWideSmodMul(IR::Instruction& inst) {
+    std::string code;
+
+    std::string lhsReg = getValueReg(inst.getOperand(0));
+    std::string rhsReg = getValueReg(inst.getOperand(1));
+    std::string destReg = getValueReg(&inst);
+
+    if (lhsReg.empty()) {
+        code += loadToReg(inst.getOperand(0), "t0");
+        lhsReg = "t0";
+    }
+    if (rhsReg.empty()) {
+        code += loadToReg(inst.getOperand(1), "t1");
+        rhsReg = "t1";
+    }
+
+    // Inputs are sign-extended i32 values. A full RV64 multiply preserves the
+    // complete product, unlike mulw, before the signed 64-bit remainder.
+    code += "  mul     t2, " + lhsReg + ", " + rhsReg + "\n";
+    code += loadToReg(inst.getOperand(2), "t1");
+
+    std::string resultReg = destReg.empty() ? "t0" : destReg;
+    code += "  rem     " + resultReg + ", t2, t1\n";
+    if (destReg.empty()) {
+        code += storeFromReg(&inst, resultReg);
     }
     emitter.emitText(code);
 }

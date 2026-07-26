@@ -233,6 +233,17 @@ namespace IR {
         return inst;
     }
 
+    Instruction* Instruction::createTernaryOp(Opcode op, Type* ty,
+                                              const std::string& name,
+                                              Value* first, Value* second,
+                                              Value* third) {
+        auto* inst = new Instruction(op, ty, name, 3);
+        inst->addOperand(first);
+        inst->addOperand(second);
+        inst->addOperand(third);
+        return inst;
+    }
+
     Instruction* Instruction::createAlloca(Type* ty, const std::string& name) {
         auto* inst = new Instruction(Opcode::ALLOCA, PointerType::get(ty), name, 1);
         inst->addOperand(nullptr); // 占位: 对齐/大小信息可在后续处理
@@ -566,6 +577,7 @@ namespace IR {
                         case Instruction::Opcode::SHL:  oss << "shl ";  break;
                         case Instruction::Opcode::ASHR: oss << "ashr "; break;
                         case Instruction::Opcode::SMULH: oss << "smulh "; break;
+                        case Instruction::Opcode::WIDE_SMOD_MUL: oss << "wide_smod_mul "; break;
                         case Instruction::Opcode::ICMP: oss << "icmp "; break;
                         case Instruction::Opcode::FCMP: oss << "fcmp "; break;
                         case Instruction::Opcode::SITOFP: oss << "sitofp "; break;

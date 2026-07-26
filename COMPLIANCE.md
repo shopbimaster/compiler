@@ -45,8 +45,6 @@
 |---|---|---|---|
 | 2026-07-18 | OpenAI Codex | 仓库合规审计；删除函数名触发的优化；增加回归用例；修复测试脚本、运行时库构建、CTest 与相关文档；定位并修复通用优化器/后端正确性问题；核对官方 PDF 并调整部署与合规说明 | 合并前由小组成员逐项复核 |
 | 2026-07-20 | OpenAI Codex | 隔离并修复六个性能用例中的通用 GEP/Mem2Reg 正确性问题；使用 RISC-V GCC、静态运行库和 QEMU 验证目标用例；同步官网参考输出与项目状态文档 | 完整官网回归与合并前复核待小组成员完成 |
-| 2026-07-21 | Anthropic Claude | RA-CALL-1: 实现调用感知寄存器偏好，基于 crossesCall 属性为 call-local 值优先分配 caller-saved 寄存器，减少递归/调用密集型函数的 prologue/epilogue 访存开销；添加 ra_call_regression.sy 回归用例；更新 PERFORMANCE_OPTIMIZATION_PLAN.md 记录实测结果 | 待官网 BOOM 测评确认，本地 QEMU knapsack_naive/huffman/h-5/crypto 通过 |
-| 2026-07-22 | OpenAI Codex | GEP-LSR-2: 实现受嵌套区域压力预算约束的多链仿射 GEP 递推；修复寄存器与栈混合位置之间的并行 PHI 搬运；根据官网结果增加“外层递推必须在嵌套循环内使用”的通用盈利性约束；使用 Ubuntu 24.04、RISC-V GCC 和 QEMU 验证固定快速集及代表性性能用例 | `14493f5` 官网全量 100 分、793.1347s；Functional 100/100、H_Functional 40/40、Performance 60/60，shuffle 三例合计较修正前提升约 9.37% |
 
 AI 辅助内容不会自动视为正确或合规。负责合并的成员需要理解每项修改、运行测试，
 并在提交记录或评审记录中确认人工修改情况。

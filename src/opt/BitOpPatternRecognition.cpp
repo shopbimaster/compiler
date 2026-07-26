@@ -21,7 +21,351 @@
 namespace Opt {
 namespace {
 
-// ---- 判断 Value 的唯一定义指令（穿过 VReg/Instruction） ----
+// Recognize 32-iteration software bit operations without relying on names.
+// Native operations are only used for non-negative inputs; the original loop
+// remains as the exact fallback for signed division/remainder semantics.
+using Opcode = IR::Instruction::Opcode;
+
+bool isIntConstant(IR::Value* value, int64_t expected) {
+    auto* constant = dynamic_cast<IR::ConstantInt*>(value);
+    return constant && constant->getValue() == expected;
+}
+
+IR::Value* getLoadedPointer(IR::Value* value) {
+    auto* load = dynamic_cast<IR::Instruction*>(value);
+    if (!load || load->getOpcode() != Opcode::LOAD ||
+        load->getNumOperands() != 1) {
+        return nullptr;
+    }
+    return load->getOperand(0);
+}
+
+bool containsInstruction(IR::BasicBlock* block, IR::Instruction* target) {
+    if (!block || !target) return false;
+    for (const auto& instruction : block->getInstructions()) {
+        if (instruction.get() == target) return true;
+    }
+    return false;
+}
+
+IR::Instruction* findStoredValue(
+    const std::vector<IR::Instruction*>& instructions,
+    IR::Value* value,
+    IR::Value* pointer = nullptr) {
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() != Opcode::STORE ||
+            instruction->getNumOperands() != 2 ||
+            instruction->getOperand(0) != value) {
+            continue;
+        }
+        if (!pointer || instruction->getOperand(1) == pointer) {
+            return instruction;
+        }
+    }
+    return nullptr;
+}
+
+bool hasConstantStore(const std::vector<IR::Instruction*>& instructions,
+                      IR::Value* pointer, int64_t value) {
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() == Opcode::STORE &&
+            instruction->getNumOperands() == 2 &&
+            instruction->getOperand(1) == pointer &&
+            isIntConstant(instruction->getOperand(0), value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+IR::Instruction* findConditionalBranch(
+    const std::vector<IR::Instruction*>& instructions, IR::Value* condition) {
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() == Opcode::COND_BR &&
+            instruction->getNumOperands() == 3 &&
+            instruction->getOperand(0) == condition) {
+            return instruction;
+        }
+    }
+    return nullptr;
+}
+
+struct SoftwareBitLoop {
+    Opcode nativeOpcode = Opcode::XOR;
+};
+
+bool matchSoftwareBitLoop(IR::Function* function, SoftwareBitLoop& match) {
+    if (!function || function->isExternal() || function->getNumArgs() != 2) {
+        return false;
+    }
+    auto* functionType = function->getFunctionType();
+    if (!functionType ||
+        functionType->getReturnType() != IR::IntegerType::I32 ||
+        function->getArg(0)->getType() != IR::IntegerType::I32 ||
+        function->getArg(1)->getType() != IR::IntegerType::I32) {
+        return false;
+    }
+
+    auto* entry = function->getEntryBlock();
+    if (!entry) return false;
+
+    std::vector<IR::Instruction*> instructions;
+    for (const auto& block : function->getBlocks()) {
+        for (const auto& instruction : block->getInstructions()) {
+            instructions.push_back(instruction.get());
+            if (instruction->getOpcode() == Opcode::CALL) return false;
+            if (instruction->getOpcode() == Opcode::STORE &&
+                instruction->getNumOperands() == 2) {
+                auto* pointer = dynamic_cast<IR::Instruction*>(
+                    instruction->getOperand(1));
+                if (!pointer || pointer->getOpcode() != Opcode::ALLOCA) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    IR::Value* argumentSlots[2] = {nullptr, nullptr};
+    for (int index = 0; index < 2; ++index) {
+        for (const auto& instruction : entry->getInstructions()) {
+            if (instruction->getOpcode() == Opcode::STORE &&
+                instruction->getNumOperands() == 2 &&
+                instruction->getOperand(0) == function->getArg(index)) {
+                argumentSlots[index] = instruction->getOperand(1);
+                break;
+            }
+        }
+        if (!argumentSlots[index]) return false;
+    }
+
+    IR::Value* bitSlots[2] = {nullptr, nullptr};
+    int divideCount = 0;
+    int remainderCount = 0;
+    for (auto* instruction : instructions) {
+        if ((instruction->getOpcode() != Opcode::SDIV &&
+             instruction->getOpcode() != Opcode::SREM) ||
+            instruction->getNumOperands() != 2 ||
+            !isIntConstant(instruction->getOperand(1), 2)) {
+            continue;
+        }
+
+        IR::Value* sourceSlot = getLoadedPointer(instruction->getOperand(0));
+        int argumentIndex = sourceSlot == argumentSlots[0] ? 0 :
+                            sourceSlot == argumentSlots[1] ? 1 : -1;
+        if (argumentIndex < 0) return false;
+
+        auto* store = findStoredValue(instructions, instruction);
+        if (!store) return false;
+        if (instruction->getOpcode() == Opcode::SDIV) {
+            if (store->getOperand(1) != sourceSlot) return false;
+            ++divideCount;
+        } else {
+            if (bitSlots[argumentIndex] &&
+                bitSlots[argumentIndex] != store->getOperand(1)) {
+                return false;
+            }
+            bitSlots[argumentIndex] = store->getOperand(1);
+            ++remainderCount;
+        }
+    }
+    if (divideCount != 2 || remainderCount != 2 ||
+        !bitSlots[0] || !bitSlots[1] || bitSlots[0] == bitSlots[1]) {
+        return false;
+    }
+
+    IR::Value* lengthSlot = nullptr;
+    IR::Value* powerSlot = nullptr;
+    IR::Instruction* resultAdd = nullptr;
+    IR::Value* resultSlot = nullptr;
+
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() == Opcode::SUB &&
+            instruction->getNumOperands() == 2 &&
+            isIntConstant(instruction->getOperand(1), 1)) {
+            IR::Value* slot = getLoadedPointer(instruction->getOperand(0));
+            if (slot && findStoredValue(instructions, instruction, slot) &&
+                hasConstantStore(instructions, slot, 32)) {
+                if (lengthSlot && lengthSlot != slot) return false;
+                lengthSlot = slot;
+            }
+        }
+        if (instruction->getOpcode() == Opcode::MUL &&
+            instruction->getNumOperands() == 2 &&
+            isIntConstant(instruction->getOperand(1), 2)) {
+            IR::Value* slot = getLoadedPointer(instruction->getOperand(0));
+            if (slot && findStoredValue(instructions, instruction, slot) &&
+                hasConstantStore(instructions, slot, 1)) {
+                if (powerSlot && powerSlot != slot) return false;
+                powerSlot = slot;
+            }
+        }
+    }
+    if (!lengthSlot || !powerSlot) return false;
+
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() != Opcode::RET ||
+            instruction->getNumOperands() != 1) {
+            continue;
+        }
+        IR::Value* candidateResult = getLoadedPointer(instruction->getOperand(0));
+        if (!candidateResult ||
+            !hasConstantStore(instructions, candidateResult, 0)) {
+            continue;
+        }
+        for (auto* candidateAdd : instructions) {
+            if (candidateAdd->getOpcode() != Opcode::ADD ||
+                candidateAdd->getNumOperands() != 2 ||
+                !findStoredValue(instructions, candidateAdd, candidateResult)) {
+                continue;
+            }
+            IR::Value* left = getLoadedPointer(candidateAdd->getOperand(0));
+            IR::Value* right = getLoadedPointer(candidateAdd->getOperand(1));
+            if ((left == candidateResult && right == powerSlot) ||
+                (right == candidateResult && left == powerSlot)) {
+                resultSlot = candidateResult;
+                resultAdd = candidateAdd;
+                break;
+            }
+        }
+    }
+    if (!resultSlot || !resultAdd) return false;
+
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() != Opcode::ICMP ||
+            instruction->getName() != "ne" ||
+            instruction->getNumOperands() != 2) {
+            continue;
+        }
+        IR::Value* left = getLoadedPointer(instruction->getOperand(0));
+        IR::Value* right = getLoadedPointer(instruction->getOperand(1));
+        if (!((left == bitSlots[0] && right == bitSlots[1]) ||
+              (left == bitSlots[1] && right == bitSlots[0]))) {
+            continue;
+        }
+        auto* branch = findConditionalBranch(instructions, instruction);
+        auto* trueBlock = branch
+                              ? dynamic_cast<IR::BasicBlock*>(
+                                    branch->getOperand(1))
+                              : nullptr;
+        if (containsInstruction(trueBlock, resultAdd)) {
+            match.nativeOpcode = Opcode::XOR;
+            return true;
+        }
+    }
+
+    IR::Instruction* bitTests[2] = {nullptr, nullptr};
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() != Opcode::ICMP ||
+            instruction->getName() != "eq" ||
+            instruction->getNumOperands() != 2) {
+            continue;
+        }
+        IR::Value* slot = nullptr;
+        if (isIntConstant(instruction->getOperand(1), 1)) {
+            slot = getLoadedPointer(instruction->getOperand(0));
+        } else if (isIntConstant(instruction->getOperand(0), 1)) {
+            slot = getLoadedPointer(instruction->getOperand(1));
+        }
+        if (slot == bitSlots[0]) bitTests[0] = instruction;
+        if (slot == bitSlots[1]) bitTests[1] = instruction;
+    }
+    if (!bitTests[0] || !bitTests[1]) return false;
+
+    IR::Instruction* storedTest = nullptr;
+    IR::Value* temporarySlot = nullptr;
+    int storedIndex = -1;
+    for (int index = 0; index < 2; ++index) {
+        auto* store = findStoredValue(instructions, bitTests[index]);
+        if (store) {
+            storedTest = bitTests[index];
+            temporarySlot = store->getOperand(1);
+            storedIndex = index;
+            break;
+        }
+    }
+    if (!storedTest || !temporarySlot) return false;
+
+    IR::Instruction* finalTest = nullptr;
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() != Opcode::ICMP ||
+            instruction->getName() != "ne" ||
+            instruction->getNumOperands() != 2) {
+            continue;
+        }
+        if ((getLoadedPointer(instruction->getOperand(0)) == temporarySlot &&
+             isIntConstant(instruction->getOperand(1), 0)) ||
+            (getLoadedPointer(instruction->getOperand(1)) == temporarySlot &&
+             isIntConstant(instruction->getOperand(0), 0))) {
+            finalTest = instruction;
+            break;
+        }
+    }
+    auto* finalBranch = findConditionalBranch(instructions, finalTest);
+    auto* resultBlock = finalBranch
+                            ? dynamic_cast<IR::BasicBlock*>(
+                                  finalBranch->getOperand(1))
+                            : nullptr;
+    if (!containsInstruction(resultBlock, resultAdd)) return false;
+
+    int firstIndex = 1 - storedIndex;
+    auto* firstBranch = findConditionalBranch(instructions,
+                                               bitTests[firstIndex]);
+    if (!firstBranch) return false;
+    auto* trueBlock = dynamic_cast<IR::BasicBlock*>(firstBranch->getOperand(1));
+    auto* falseBlock = dynamic_cast<IR::BasicBlock*>(firstBranch->getOperand(2));
+    auto* storedTestBlock = storedTest->getParent();
+
+    if (hasConstantStore(instructions, temporarySlot, 0) &&
+        trueBlock == storedTestBlock) {
+        match.nativeOpcode = Opcode::AND;
+        return true;
+    }
+    if (hasConstantStore(instructions, temporarySlot, 1) &&
+        falseBlock == storedTestBlock) {
+        match.nativeOpcode = Opcode::OR;
+        return true;
+    }
+    return false;
+}
+
+void addGuardedNativeFastPath(IR::Function* function, Opcode nativeOpcode) {
+    auto* slowEntry = function->getEntryBlock();
+    auto* guard = function->insertBlock("bitloop.guard", slowEntry);
+    auto* fast = function->insertBlock("bitloop.fast", slowEntry);
+    auto* zero = IR::ConstantInt::get(IR::IntegerType::I32, 0);
+
+    auto* firstNonNegative = IR::Instruction::createCmp(
+        Opcode::ICMP, function->getArg(0), zero, "sge");
+    auto* secondNonNegative = IR::Instruction::createCmp(
+        Opcode::ICMP, function->getArg(1), zero, "sge");
+    auto* bothNonNegative = IR::Instruction::createBinOp(
+        Opcode::AND, IR::IntegerType::I1, "bitloop.nonnegative",
+        firstNonNegative, secondNonNegative);
+    guard->pushBack(firstNonNegative);
+    guard->pushBack(secondNonNegative);
+    guard->pushBack(bothNonNegative);
+    guard->pushBack(IR::Instruction::createCondBr(
+        bothNonNegative, fast, slowEntry));
+
+    auto* nativeResult = IR::Instruction::createBinOp(
+        nativeOpcode, IR::IntegerType::I32, "bitloop.native",
+        function->getArg(0), function->getArg(1));
+    fast->pushBack(nativeResult);
+    fast->pushBack(IR::Instruction::createRet(nativeResult));
+}
+
+bool recognizeSoftwareBitLoops(IR::Module* module) {
+    bool changed = false;
+    for (auto& function : module->getFunctions()) {
+        SoftwareBitLoop match;
+        if (!matchSoftwareBitLoop(function.get(), match)) continue;
+        addGuardedNativeFastPath(function.get(), match.nativeOpcode);
+        changed = true;
+    }
+    return changed;
+}
+
+// Return an instruction when the value is directly instruction-defined.
 IR::Instruction* getDefiningInst(IR::Value* val) {
     if (!val) return nullptr;
     return dynamic_cast<IR::Instruction*>(val);
@@ -248,7 +592,7 @@ bool tryOptimize(IR::Instruction* inst) {
 // ================================================================
 bool bitOpPatternRecognition(IR::Module* mod) {
     bool changed = true;
-    bool anyChanged = false;
+    bool anyChanged = recognizeSoftwareBitLoops(mod);
     while (changed) {
         changed = false;
         for (auto& func : mod->getFunctions()) {

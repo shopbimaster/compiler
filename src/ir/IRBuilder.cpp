@@ -209,29 +209,7 @@ std::any IRBuilder::visitVarDecl(SysY2022Parser::VarDeclContext* ctx) {
         } else {
             // ===== 局部变量 =====
             auto* alloca = Instruction::createAlloca(varType, name);
-
-            // SSA-SCALAR-1: Place scalar int/float allocas in the entry block
-            // so Mem2Reg can promote them to SSA registers.  This eliminates
-            // per-iteration stack traffic for scalars declared inside loops and
-            // other non-entry blocks.  Arrays and pointer-valued allocas stay
-            // at their original declaration point (conservative path).
-            IR::BasicBlock* entryBB = currentFunc->getEntryBlock();
-            bool isScalar = (varType->isInteger() || varType->isFloat());
-            if (isScalar && entryBB && currentBB != entryBB) {
-                // Insert before the terminator if one exists; otherwise at end
-                auto insertPos = entryBB->end();
-                if (auto* term = entryBB->getTerminator()) {
-                    for (auto it = entryBB->begin(); it != entryBB->end(); ++it) {
-                        if (it->get() == term) {
-                            insertPos = it;
-                            break;
-                        }
-                    }
-                }
-                entryBB->insert(insertPos, alloca);
-            } else {
-                currentBB->pushBack(alloca);
-            }
+            currentBB->pushBack(alloca);
 
             if (defCtx->ASSIGN() && defCtx->initVal()) {
                 auto* initCtx = defCtx->initVal();

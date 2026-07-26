@@ -175,6 +175,31 @@ bool tryFold(IR::Instruction* inst) {
         return true;
     }
 
+    // ---- SELECT 折叠 ----
+    // select i1 cond, T trueVal, T falseVal
+    // 如果 cond 是常量 → 直接用对应分支的值替换
+    // 如果 trueVal == falseVal → 直接用该值替换
+    if (op == Opc::SELECT && inst->getNumOperands() >= 3) {
+        auto* cond = inst->getOperand(0);
+        auto* trueVal = inst->getOperand(1);
+        auto* falseVal = inst->getOperand(2);
+
+        // Case 1: 常量条件
+        if (auto* condInt = dynamic_cast<IR::ConstantInt*>(cond)) {
+            auto* chosen = (condInt->getValue() != 0) ? trueVal : falseVal;
+            inst->replaceAllUsesWith(chosen);
+            inst->dropAllUses();
+            return true;
+        }
+
+        // Case 2: 两个分支相同
+        if (trueVal == falseVal) {
+            inst->replaceAllUsesWith(trueVal);
+            inst->dropAllUses();
+            return true;
+        }
+    }
+
     return false;
 }
 
