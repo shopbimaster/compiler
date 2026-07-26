@@ -1966,6 +1966,86 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 }
             }
 
+            // ★ addi tX, base, K; MEM rt, OFF(tX) → MEM rt, (K+OFF)(base)
+            // 当 tX 在 MEM 之后死亡时，可消除 addi，将偏移量合并到 MEM 指令中
+            // 安全条件：
+            //   1. tX 在 MEM 之后死亡（addi 被消除，tX 不再被定义）
+            //   2. K+OFF 适合 12 位有符号立即数（-2048 到 2047）
+            //   3. MEM 的基址寄存器是 tX（addi 的目标）
+            //   4. 不跨 BB（中间无标签）
+            if (!matched && i + 1 < lines.size()) {
+                std::string addiRd, addiRs, addiImm;
+                if (tryMatch(lines[i], "addi", addiRd, addiRs, addiImm) && !addiRd.empty()) {
+                    // 解析 addi 立即数
+                    int64_t addiK;
+                    try {
+                        addiK = std::stoll(addiImm);
+                    } catch (...) {
+                        addiK = 0;
+                        addiImm = "";  // 标记无效
+                    }
+                    if (!addiImm.empty()) {
+                        // 查找下一条真实指令（跳过空行/注释/汇编指令，但不跳过标签）
+                        size_t memIdx = i + 1;
+                        while (memIdx < lines.size() && isEmptyOrComment(lines[memIdx])) {
+                            memIdx++;
+                        }
+                        if (memIdx < lines.size() && !isLabel(lines[memIdx])) {
+                            // 尝试匹配各种内存访问指令
+                            static const char* MEM_OPS[] = {"ld", "lw", "lh", "lb", "lhu", "lbu",
+                                                              "sd", "sw", "sh", "sb",
+                                                              "flw", "fld", "fsw", "fsd"};
+                            for (const char* op : MEM_OPS) {
+                                std::string memRd, memOff;
+                                if (tryMatch(lines[memIdx], op, memRd, memOff, imm) && !memOff.empty()) {
+                                    // 解析 OFF(base) 格式
+                                    auto parenPos = memOff.find('(');
+                                    if (parenPos != std::string::npos) {
+                                        auto closeParen = memOff.find(')', parenPos);
+                                        if (closeParen != std::string::npos) {
+                                            std::string offStr = memOff.substr(0, parenPos);
+                                            std::string baseReg = memOff.substr(parenPos + 1, closeParen - parenPos - 1);
+                                            if (baseReg == addiRd) {
+                                                // 解析 OFF
+                                                int64_t memOffVal = 0;
+                                                bool offValid = false;
+                                                if (offStr.empty()) {
+                                                    offValid = true;
+                                                    memOffVal = 0;
+                                                } else {
+                                                    try {
+                                                        memOffVal = std::stoll(offStr);
+                                                        offValid = true;
+                                                    } catch (...) {}
+                                                }
+                                                if (offValid) {
+                                                    int64_t totalOff = addiK + memOffVal;
+                                                    if (-2048 <= totalOff && totalOff <= 2047) {
+                                                        // 检查 addiRd 在 MEM 之后死亡
+                                                        if (isRegDeadAware(lines, memIdx + 1, addiRd)) {
+                                                            // 合并：MEM rt, totalOff(base)
+                                                            std::string newOff = (totalOff == 0) ? "" : std::to_string(totalOff);
+                                                            result.push_back("  " + std::string(op) + "      " + memRd + ", " + newOff + "(" + addiRs + ")");
+                                                            // 保留 addi 和 MEM 之间的空行/注释
+                                                            for (size_t j = i + 1; j < memIdx; ++j) {
+                                                                result.push_back(lines[j]);
+                                                            }
+                                                            i = memIdx;
+                                                            matched = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // ld/lw/la rd, addr; mv rd2, rd → ld/lw/la rd2, addr (当 rd 在 mv 后死亡)
             // 消除 load+mv 链：直接将加载目标改为 mv 的目的寄存器
             // 安全条件：rd != rd2，rd 不在地址表达式中，rd 在 mv 后基本块内不再被读取
