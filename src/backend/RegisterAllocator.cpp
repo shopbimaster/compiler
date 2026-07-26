@@ -14,10 +14,15 @@ namespace Backend {
 const std::vector<std::string> RegisterAllocator::INT_REGS = {
     "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
     "s8", "s9", "s10", "s11",
-    "t3", "t4", "t5", "t6"    // caller-saved registers for short-lived values
-    // a0-a7 excluded: using them for allocation causes massive save/restore
-    // overhead at call sites, especially for recursive float-heavy code.
-    // They are reserved for parameter passing and return values.
+    "t3", "t4", "t5", "t6",    // caller-saved registers for short-lived values
+    "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"
+    // ★ 实验性：a0-a7 加入分配池
+    // 安全保障：call-aware coloring 确保跨 CALL 的值不被分配到 a0-a7，
+    //   因为 CALL 会 clobber caller-saved 寄存器。只有不跨 CALL 的短活跃值
+    //   才会分配到 a0-a7，此时 call site 无需 save/restore。
+    // ★ codegen 安全：参数传递使用的 mv a0, src 会在此值已死亡后执行
+    //   （call-aware coloring 保证），不会 clobber 存活值。
+    // ★ 风险：若 call-aware coloring 有 bug，可能导致参数传递 clobber 存活值
 };
 
 const std::vector<std::string> RegisterAllocator::FLOAT_REGS = {
