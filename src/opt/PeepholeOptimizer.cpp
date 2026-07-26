@@ -37,7 +37,14 @@ bool isEmptyOrComment(const std::string& line) {
     auto trimmed = line;
     while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
         trimmed = trimmed.substr(1);
-    return trimmed.empty() || trimmed[0] == '#' || trimmed[0] == '.';
+    if (trimmed.empty() || trimmed[0] == '#') return true;
+    // ★ 标签行（.Lxxx:）以 . 开头但以 : 结尾，是 BB 边界，不能当作空行跳过！
+    // 否则 op+mv 等优化会跨 BB 合并，破坏语义。
+    // 汇编指令（.p2align, .type, .globl 等）以 . 开头但不以 : 结尾，仍当作空行跳过。
+    if (trimmed[0] == '.') {
+        return trimmed.back() != ':';
+    }
+    return false;
 }
 
 std::string extractReg(const std::string& s, size_t pos) {
@@ -238,6 +245,20 @@ bool isRegLocalDead(const std::vector<std::string>& lines, size_t start, const s
         }
     }
     return true;  // 到达文件末尾，局部死亡
+}
+
+// ★ 寄存器类型感知的死亡检查
+// t 寄存器 (t0-t6): 使用 isRegLocalDead（BB 边界=死，因为这些寄存器主要作为 ALU scratch）
+// a/s 寄存器: 使用 isRegDeadInBB（BB 边界=活，保守判断）
+// 原因：a0-a7 已加入寄存器分配池，可能被分配给跨 BB 存活的值；
+//   s0-s11 天然跨 BB 存活。仅 t0-t6 几乎只用于 BB 内 scratch。
+bool isRegDeadAware(const std::vector<std::string>& lines, size_t start, const std::string& reg) {
+    if (reg.empty()) return false;
+    char c = reg[0];
+    if (c == 't') {
+        return isRegLocalDead(lines, start, reg);
+    }
+    return isRegDeadInBB(lines, start, reg);
 }
 
 
@@ -1573,8 +1594,11 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     if (isThreeReg && tryMatch(lines[nextIdx], "mv", mvRd, mvRs, imm)) {
                         if (mvRs == opRd) {
                             // 安全条件：opRd 在 mv 之后必须死亡（合并后 opRd 不再被写入）
-                            // 使用 isRegDeadInBB 正确处理 BB 边界（标签行以 . 开头会被 isEmptyOrComment 误跳过）
-                            if (isRegDeadInBB(lines, nextIdx + 1, opRd)) {
+                            // ★ 寄存器类型感知：caller-saved (t/a) 用 isRegLocalDead（BB 边界=死），
+                            //   callee-saved (s) 用 isRegDeadInBB（BB 边界=活）
+                            // ★ 依赖 isEmptyOrComment 修复：标签行不再被当作空行跳过，
+                            //   确保 nextIdx 不会跨 BB 查找 mv
+                            if (isRegDeadAware(lines, nextIdx + 1, opRd)) {
                                 result.push_back("  " + opName + "    " + mvRd + ", " + opRs + ", " + opRs2);
                                 for (size_t j = i + 1; j < nextIdx; ++j) {
                                     result.push_back(lines[j]);
@@ -1596,7 +1620,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
                             if (tryMatch(lines[nextIdx], "mv", mvRd, mvRs, imm)) {
                                 if (mvRs == opRd) {
                                     // 安全条件：opRd 在 mv 之后必须死亡
-                                    if (isRegDeadInBB(lines, nextIdx + 1, opRd)) {
+                                    // ★ 寄存器类型感知：caller-saved (t/a) 用 isRegLocalDead
+                                    if (isRegDeadAware(lines, nextIdx + 1, opRd)) {
                                         result.push_back("  " + opName + "    " + mvRd + ", " + opRs + ", " + opRs2);
                                         for (size_t j = i + 1; j < nextIdx; ++j) {
                                             result.push_back(lines[j]);
