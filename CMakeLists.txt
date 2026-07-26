@@ -136,6 +136,7 @@ add_library(sysy_opt STATIC
     src/opt/InstructionScheduling.cpp
     src/opt/RecursiveMulToNative.cpp
     src/opt/BitOpPatternRecognition.cpp
+    src/opt/PowerOfTwoDispatch.cpp
     src/opt/GlobalVariablePromotion.cpp
     src/opt/GlobalConstantPropagation.cpp
     src/opt/Mem2Reg.cpp

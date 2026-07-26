@@ -253,7 +253,7 @@ namespace IR {
             ADD, SUB, MUL, SDIV, SREM,
             FADD, FSUB, FMUL, FDIV,
             AND, OR, XOR, SHL, ASHR,
-            SMULH,
+            SMULH, WIDE_SMOD_MUL,
             ICMP, FCMP,
             ALLOCA, LOAD, STORE,
             CALL,
@@ -272,6 +272,8 @@ namespace IR {
         static Instruction* createCondBr(Value* cond, BasicBlock* thenBB, BasicBlock* elseBB);
         static Instruction* createBinOp(Opcode op, Type* ty, const std::string& name,
                                         Value* lhs, Value* rhs);
+        static Instruction* createTernaryOp(Opcode op, Type* ty, const std::string& name,
+                                            Value* first, Value* second, Value* third);
         static Instruction* createAlloca(Type* ty, const std::string& name);
         static Instruction* createLoad(Type* ty, Value* ptr, const std::string& name);
         static Instruction* createStore(Value* val, Value* ptr);
