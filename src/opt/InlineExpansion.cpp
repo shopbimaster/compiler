@@ -220,6 +220,11 @@ IR::Instruction* cloneInstruction(
                op == Opc::SITOFP || op == Opc::FPTOSI) {
         cloned = IR::Instruction::createCast(
             op, src->getType(), lookup(src->getOperand(0)), src->getName() + ".i");
+    } else if (op == Opc::WIDE_SMOD_MUL) {
+        cloned = IR::Instruction::createTernaryOp(
+            op, src->getType(), src->getName() + ".i",
+            lookup(src->getOperand(0)), lookup(src->getOperand(1)),
+            lookup(src->getOperand(2)));
     } else {
         // 通用二元运算
         cloned = IR::Instruction::createBinOp(

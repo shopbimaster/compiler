@@ -56,6 +56,11 @@ void runO2(IR::Module* mod) {
     // 1a. 树摇
     treeShaking(mod);
 
+    if (recursiveModularMulToNative(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     if (bitOpPatternRecognition(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);

@@ -61,6 +61,11 @@ IR::Instruction* cloneInstruction(IR::Instruction* inst,
             return IR::Instruction::createBinOp(op, inst->getType(), newName,
                 newOperands[0], newOperands[1]);
 
+        case Opc::WIDE_SMOD_MUL:
+            return IR::Instruction::createTernaryOp(
+                op, inst->getType(), newName,
+                newOperands[0], newOperands[1], newOperands[2]);
+
         case Opc::ICMP: case Opc::FCMP:
             return IR::Instruction::createCmp(op, newOperands[0], newOperands[1], newName);
 

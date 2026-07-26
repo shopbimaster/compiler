@@ -118,6 +118,7 @@ private:
     void emitBr(IR::Instruction& inst);
     void emitCondBr(IR::Instruction& inst);
     void emitBinOp(IR::Instruction& inst);
+    void emitWideSmodMul(IR::Instruction& inst);
     void emitFBinOp(IR::Instruction& inst);
     void emitIcmp(IR::Instruction& inst);
     void emitFcmp(IR::Instruction& inst);
