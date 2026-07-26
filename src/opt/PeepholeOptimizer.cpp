@@ -1264,6 +1264,39 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 }
             }
 
+            // ★ mv+mv 链合并：mv rd1, rs; mv rd2, rd1 → mv rd2, rs
+            // 安全条件：rd1 在第二条 mv 后死亡，rd1 != rd2，rd1 != rs，rd2 != rs
+            //           （rd2 == rs 时两条 mv 均可消除，但保守起见仅处理 rd2 != rs）
+            // ★ 死亡检查：caller-saved (tX/aX) 用 isRegLocalDead（BB 边界=死），
+            //   callee-saved (sX) 用 isRegDeadInBB（保守，BB 边界=活），
+            //   因为 sX 跨 BB 存活，isRegLocalDead 会误判为死亡。
+            if (!matched && i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {
+                std::string mv1Rd, mv1Rs;
+                if (tryMatch(lines[i], "mv", mv1Rd, mv1Rs, imm) &&
+                    !mv1Rd.empty() && !mv1Rs.empty() && mv1Rd != mv1Rs) {
+                    std::string mv2Rd, mv2Rs;
+                    if (tryMatch(lines[i + 1], "mv", mv2Rd, mv2Rs, imm) &&
+                        mv2Rs == mv1Rd && mv2Rd != mv1Rd) {
+                        // 根据寄存器类选择死亡检查
+                        bool isCallerSaved = (!mv1Rd.empty() &&
+                            (mv1Rd[0] == 't' || mv1Rd[0] == 'a'));
+                        bool rd1Dead = isCallerSaved
+                            ? isRegLocalDead(lines, i + 2, mv1Rd)
+                            : isRegDeadInBB(lines, i + 2, mv1Rd);
+                        if (rd1Dead) {
+                            if (mv2Rd != mv1Rs) {
+                                // mv rd2, rs
+                                result.push_back("  mv      " + mv2Rd + ", " + mv1Rs);
+                            } else {
+                                // mv rd2, rd2 → no-op，跳过两条 mv
+                            }
+                            ++i;
+                            matched = true;
+                        }
+                    }
+                }
+            }
+
             // mv rd, rs; <op> rd3, ..., rd, ... → <op> rd3, ..., rs, ...
             // 通用模式：mv 的目标寄存器 rd 在下一条指令中作为源操作数（非目的、非地址）
             // 安全条件：
