@@ -261,6 +261,152 @@ bool isRegDeadAware(const std::vector<std::string>& lines, size_t start, const s
     return isRegDeadInBB(lines, start, reg);
 }
 
+// ★ 检查寄存器 reg 是否由布尔产生指令（seqz/snez/sltiu rd, rs, 1）设置
+// 从 beforeIdx-1 向前扫描，遇到 BB 边界（label）或 reg 被非布尔指令覆写时停止
+// 返回 true 如果 reg 在附近由布尔产生指令设置且未被覆写
+bool isBoolReg(const std::vector<std::string>& lines, size_t beforeIdx,
+               const std::string& reg, size_t maxScan = 12) {
+    if (reg.empty()) return false;
+    size_t start = (beforeIdx > maxScan) ? beforeIdx - maxScan : 0;
+    for (size_t k = beforeIdx; k > start; --k) {
+        const std::string& line = lines[k - 1];
+        if (line.empty()) continue;
+        if (isLabel(line)) return false;  // BB 边界，无法追溯
+        size_t p = 0;
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+        if (p >= line.size()) continue;
+        if (line[p] == '#') continue;
+        if (line[p] == '.') continue;  // 汇编指令（非标签）
+        std::string rd, rs, imm;
+        if (tryMatch(line, "seqz", rd, rs, imm) && rd == reg) return true;
+        if (tryMatch(line, "snez", rd, rs, imm) && rd == reg) return true;
+        if (tryMatch(line, "sltiu", rd, rs, imm) && rd == reg && imm == "1") return true;
+        // 非布尔产生指令覆写了 reg → reg 不是布尔值
+        if (instrKillsReg(line, reg)) return false;
+    }
+    return false;
+}
+
+
+// ================================================================
+// 局部 Copy Propagation（BB 内）
+// 在单个基本块内跟踪 mv 建立的寄存器拷贝关系，消除冗余 mv：
+//   1. mv A, B; ...; mv C, A  →  mv A, B; ...; mv C, B  （传播源头）
+//   2. mv A, B; ...; mv A, C  →  mv A, C  （A 被覆写，第一个 mv 死亡）
+//   3. mv A, B; ...; <use A>  →  <use B>  （用 B 替换 A 的引用）
+//   4. mv A, A  →  eliminated（自拷贝，无操作）
+// 借鉴 Cpl2 CopyPropagationPass：数据流复写传播，消除冗余 MV 指令
+// 限制：仅 BB 内传播，不跨 BB（避免复杂的数据流分析）
+// ================================================================
+std::vector<std::string> localCopyPropagation(const std::vector<std::string>& lines) {
+    std::vector<std::string> result;
+    result.reserve(lines.size());
+
+    // copyMap[dst] = src 表示 dst 当前持有 src 的拷贝
+    // 当 dst 被覆写时，清除 copyMap[dst] 和所有以 dst 为源的条目
+    std::unordered_map<std::string, std::string> copyMap;
+
+    auto invalidateReg = [&](const std::string& reg) {
+        // 清除 reg 作为目标的条目
+        copyMap.erase(reg);
+        // 清除所有以 reg 作为源的条目（源被覆写，拷贝失效）
+        for (auto it = copyMap.begin(); it != copyMap.end();) {
+            if (it->second == reg) {
+                it = copyMap.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+
+    auto isCallerSaved = [](const std::string& reg) -> bool {
+        if (reg.empty()) return false;
+        char c = reg[0];
+        return c == 't' || c == 'a';
+    };
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string& line = lines[i];
+
+        // 空行/注释/标签：BB 边界，清除 copyMap
+        if (line.empty() || isLabel(line)) {
+            copyMap.clear();
+            result.push_back(line);
+            continue;
+        }
+
+        // 跳过注释和伪指令
+        size_t p = 0;
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+        if (p >= line.size() || line[p] == '#' || line[p] == '.') {
+            result.push_back(line);
+            continue;
+        }
+
+        std::string opName = extractOpName(line);
+
+        // call 指令：杀死所有 caller-saved 寄存器的拷贝
+        if (opName == "call") {
+            for (auto it = copyMap.begin(); it != copyMap.end();) {
+                if (isCallerSaved(it->first) || isCallerSaved(it->second)) {
+                    it = copyMap.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            result.push_back(line);
+            continue;
+        }
+
+        // mv 指令：核心处理
+        if (opName == "mv") {
+            std::string rd, rs, imm;
+            if (tryMatch(line, "mv", rd, rs, imm) && !rd.empty() && !rs.empty()) {
+                // 解析源：如果 rs 是某个拷贝的目标，追溯到原始源
+                std::string effectiveSrc = rs;
+                auto it = copyMap.find(rs);
+                if (it != copyMap.end()) {
+                    effectiveSrc = it->second;
+                }
+
+                // 自拷贝消除：mv A, A → 无操作
+                if (rd == effectiveSrc || rd == rs) {
+                    // 跳过此指令（不输出）
+                    // 但需要更新 copyMap：rd 现在持有 effectiveSrc
+                    invalidateReg(rd);
+                    copyMap[rd] = effectiveSrc;
+                    continue;
+                }
+
+                // 生成优化后的 mv
+                std::string newLine = "  mv      " + rd + ", " + effectiveSrc;
+                result.push_back(newLine);
+
+                // 更新 copyMap
+                invalidateReg(rd);
+                copyMap[rd] = effectiveSrc;
+                continue;
+            }
+        }
+
+        // 其他指令：检查是否杀死/读取寄存器
+        // 先检查目的寄存器（被覆写）
+        // 收集所有被此指令杀死的寄存器
+        // 对于多目标指令（如 divmod），需要特殊处理，但 RISC-V 通常单目标
+        if (!opName.empty()) {
+            // 找到目的寄存器
+            std::string rd, rs, imm;
+            if (tryMatch(line, opName, rd, rs, imm) && !rd.empty()) {
+                invalidateReg(rd);
+            }
+        }
+
+        result.push_back(line);
+    }
+
+    return result;
+}
+
 
 std::string peepholeOptimize(const std::string& asmCode) {
     auto lines = splitLines(asmCode);
@@ -2516,6 +2662,58 @@ std::string peepholeOptimize(const std::string& asmCode) {
             // 仅当 N=1 且测试 == 0 时可用 "bltu tX, 2" 之类的范围检查，但语义不等价。
             // 跳过，专注于 % 2^n 模式。
 
+            // ★ neg+and 优化：seqz/snez rd, ...; neg rd2, rd; and rd3, X, rd2
+            // 当 rd 和 X 都是布尔值（0/1）时，neg 多余：
+            //   and rd3, X, (0|-1) == and rd3, X, (0|1)  当 X ∈ {0,1}
+            // 因为 X & 0 = 0, X & (-1) = X, X & 1 = X&1
+            //   当 X=0: 0&0=0, 0&(-1)=0, 0&1=0 → 相同
+            //   当 X=1: 1&0=0, 1&(-1)=1, 1&1=1 → 相同
+            // 安全条件：negRs 由 seqz/snez/sltiu 设置（布尔），and 的另一操作数也是布尔
+            if (!matched) {
+                std::string negRd, negRs, negImm;
+                if (tryMatch(lines[i], "neg", negRd, negRs, negImm) &&
+                    !negRd.empty() && !negRs.empty() && negRd != negRs) {
+                    // 检查 negRs 是否为布尔值
+                    if (isBoolReg(lines, i, negRs)) {
+                        // 查找下一条真实指令
+                        size_t nextIdx = i + 1;
+                        while (nextIdx < lines.size() && isEmptyOrComment(lines[nextIdx])) ++nextIdx;
+                        if (nextIdx < lines.size() && !isLabel(lines[nextIdx])) {
+                            // 尝试匹配 and/andw rd3, X, rd2 或 and/andw rd3, rd2, X
+                            for (const char* andOp : {"and", "andw"}) {
+                                std::string andRd, andRs1, andRs2;
+                                if (tryMatch(lines[nextIdx], andOp, andRd, andRs1, andRs2) &&
+                                    !andRd.empty()) {
+                                    std::string otherOp;
+                                    bool negRdIsRs2 = (andRs2 == negRd);
+                                    bool negRdIsRs1 = (andRs1 == negRd);
+                                    if (negRdIsRs2) otherOp = andRs1;
+                                    else if (negRdIsRs1) otherOp = andRs2;
+                                    if (!otherOp.empty() && otherOp != negRd) {
+                                        // 检查 otherOp 是否也是布尔值
+                                        // otherOp == negRs 时也视为布尔（同一个布尔源）
+                                        if (otherOp == negRs || isBoolReg(lines, i, otherOp)) {
+                                            // 消除 neg，将 and 中的 negRd 替换为 negRs
+                                            std::string newRs1 = andRs1;
+                                            std::string newRs2 = andRs2;
+                                            if (negRdIsRs1) newRs1 = negRs;
+                                            else newRs2 = negRs;
+                                            std::string newAnd = "  " + std::string(andOp) +
+                                                (andOp == std::string("and") ? "      " : "     ") +
+                                                andRd + ", " + newRs1 + ", " + newRs2;
+                                            result.push_back(newAnd);
+                                            i = nextIdx;
+                                            matched = true;
+                                        }
+                                    }
+                                    break;  // tryMatch 已匹配，不再尝试其他 andOp
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if (!matched) {
                 result.push_back(lines[i]);
             }
@@ -2537,6 +2735,25 @@ std::string peepholeOptimize(const std::string& asmCode) {
             std::string fname = "/tmp/peep_iter" + std::to_string(iter) + ".S";
             std::ofstream f(fname);
             f << joinLines(lines);
+        }
+    }
+
+    // ★ 局部 Copy Propagation（借鉴 Cpl2 CopyPropagationPass）
+    // 在 BB 内跟踪 mv 拷贝关系，消除冗余 mv 指令
+    // 主循环已处理相邻 mv+mv 链，此处处理非相邻的拷贝传播
+    {
+        auto optimized = localCopyPropagation(lines);
+        // 检查是否有变化
+        if (optimized.size() != lines.size()) {
+            lines = std::move(optimized);
+        } else {
+            bool changed = false;
+            for (size_t j = 0; j < lines.size(); ++j) {
+                if (optimized[j] != lines[j]) { changed = true; break; }
+            }
+            if (changed) {
+                lines = std::move(optimized);
+            }
         }
     }
 
