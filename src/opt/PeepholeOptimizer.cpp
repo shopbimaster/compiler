@@ -1582,11 +1582,11 @@ std::string peepholeOptimize(const std::string& asmCode) {
 
                     // 三寄存器操作
                     if (tryThreeRegOp("addw") || tryThreeRegOp("subw") || tryThreeRegOp("sllw") ||
-                        tryThreeRegOp("sraw") || tryThreeRegOp("mulw") || tryThreeRegOp("divw") ||
-                        tryThreeRegOp("remw") || tryThreeRegOp("add")  || tryThreeRegOp("sub")  ||
-                        tryThreeRegOp("sll")  || tryThreeRegOp("sra")  || tryThreeRegOp("or")   ||
-                        tryThreeRegOp("and")  || tryThreeRegOp("xor")  || tryThreeRegOp("slt")  ||
-                        tryThreeRegOp("sltu")) {
+                        tryThreeRegOp("sraw") || tryThreeRegOp("srlw") || tryThreeRegOp("mulw") ||
+                        tryThreeRegOp("divw") || tryThreeRegOp("remw") || tryThreeRegOp("add")  ||
+                        tryThreeRegOp("sub")  || tryThreeRegOp("sll")  || tryThreeRegOp("sra")  ||
+                        tryThreeRegOp("srl")  || tryThreeRegOp("or")   || tryThreeRegOp("and")  ||
+                        tryThreeRegOp("xor")  || tryThreeRegOp("slt")  || tryThreeRegOp("sltu")) {
                         isThreeReg = true;
                         opName = extractOpName(lines[i]);
                     }
@@ -1615,7 +1615,10 @@ std::string peepholeOptimize(const std::string& asmCode) {
                             return tryMatch(lines[i], name, opRd, opRs, opRs2) && !opRs2.empty();
                         };
                         if (tryImmOp("addiw") || tryImmOp("addi") ||
-                            tryImmOp("slli") || tryImmOp("srli") || tryImmOp("srai")) {
+                            tryImmOp("slli") || tryImmOp("srli") || tryImmOp("srai") ||
+                            tryImmOp("slliw") || tryImmOp("srliw") || tryImmOp("sraiw") ||
+                            tryImmOp("andi") || tryImmOp("ori") || tryImmOp("xori") ||
+                            tryImmOp("slti") || tryImmOp("sltiu")) {
                             opName = extractOpName(lines[i]);
                             if (tryMatch(lines[nextIdx], "mv", mvRd, mvRs, imm)) {
                                 if (mvRs == opRd) {
