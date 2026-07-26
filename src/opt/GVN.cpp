@@ -75,7 +75,7 @@ bool canGVN(IR::Instruction* inst) {
     if (op == Opc::ADD || op == Opc::SUB || op == Opc::MUL ||
         op == Opc::SDIV || op == Opc::SREM ||
         op == Opc::AND || op == Opc::OR || op == Opc::XOR ||
-        op == Opc::SHL || op == Opc::ASHR || op == Opc::LSHR) {
+        op == Opc::SHL || op == Opc::ASHR) {
         return true;
     }
 
