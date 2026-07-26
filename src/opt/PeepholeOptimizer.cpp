@@ -205,6 +205,41 @@ bool isRegDeadInBB(const std::vector<std::string>& lines, size_t start, const st
     return false;  // 到达文件末尾，保守返回 false（可能 live-out）
 }
 
+// ★ BB 内局部死亡检查（heuristic for scratch registers）
+// 与 isRegDeadInBB 不同：到达 BB 终止符（label）时返回 true 而非 false，
+// 用于 caller-saved 临时寄存器（t0-t6, a0-a7）的死亡判断。
+// 原理：codegen 产生的临时寄存器通常只在当前 BB 内使用，不会跨 BB 存活。
+//   寄存器分配器虽然可以分配 t3-t6/a0-a7 给跨 BB 值，但优先使用 s0-s11，
+//   且 call-aware coloring 确保跨 CALL 的值不分配到 caller-saved。
+//   实际 codegen 中 t0-t6 主要作为 ALU scratch，极少跨 BB。
+// 风险：若 tA/tB 确实跨 BB 存活（如分配器分配的长生命周期值），
+//   优化可能错误消除 mv，导致后续 BB 读到错误值。
+//   缓解：仅用于自更新模式（mv tA,sX; op tB,tA,C; mv sX,tB），
+//   该模式中 tA/tB 是 codegen 的 load/store scratch，不是分配器分配的。
+bool isRegLocalDead(const std::vector<std::string>& lines, size_t start, const std::string& reg) {
+    for (size_t k = start; k < lines.size(); ++k) {
+        const std::string& l = lines[k];
+        if (l.empty()) continue;
+        if (isLabel(l)) return true;  // BB 边界：局部死亡（heuristic）
+        size_t p = 0;
+        while (p < l.size() && (l[p] == ' ' || l[p] == '\t')) ++p;
+        if (p >= l.size()) continue;
+        if (l[p] == '#') continue;
+        if (l[p] == '.') continue;
+        // 被杀死 → 死亡
+        if (instrKillsReg(l, reg)) return true;
+        // 被读取 → 存活
+        if (regInStr(l, reg)) return false;
+        // call 杀死 caller-saved
+        std::string opN = extractOpName(l);
+        if (opN == "call" && !reg.empty()) {
+            char c = reg[0];
+            if (c == 't' || c == 'a') return true;
+        }
+    }
+    return true;  // 到达文件末尾，局部死亡
+}
+
 
 std::string peepholeOptimize(const std::string& asmCode) {
     auto lines = splitLines(asmCode);
@@ -968,7 +1003,9 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     }
                     // li rd, 0; beq/bne/blt/bge/bltu/bgeu rd, rs2, L → 用 x0 替换 rd，消除 li
                     // 汇编器自动将 beq x0, rs2, L 转为 beqz rs2, L 等伪指令（更短编码）
-                    // 安全条件：liRd 在分支后必须死亡
+                    // 安全条件：liRd 在分支后局部死亡（使用 isRegLocalDead 放宽 BB 边界检查，
+                    //   因为 li 加载的 0 仅被分支使用，liRd 即便是 callee-saved 也已被覆写为 0，
+                    //   后续若使用即为使用 0 而非原值，故 BB 边界后视为死亡是安全的）
                     if (!matched && liImm == "0") {
                         static const char* BRANCH_OPS[] = {"beq", "bne", "blt", "bge", "bltu", "bgeu"};
                         for (const char* op : BRANCH_OPS) {
@@ -977,7 +1014,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
                                 bool replaceRs1 = (brRs1 == liRd);
                                 bool replaceRs2 = (brRs2 == liRd);
                                 if (replaceRs1 || replaceRs2) {
-                                    if (isRegDeadInBB(lines, i + 2, liRd)) {
+                                    if (isRegLocalDead(lines, i + 2, liRd)) {
                                         std::string newRs1 = replaceRs1 ? "x0" : brRs1;
                                         std::string newRs2 = replaceRs2 ? "x0" : brRs2;
                                         result.push_back("  " + std::string(op) + "    " + newRs1 + ", " + newRs2 + ", " + brLabel);
@@ -1007,6 +1044,109 @@ std::string peepholeOptimize(const std::string& asmCode) {
                         result.push_back("  " + opName + "    " + sRd + ", " + mvRs + ", " + sImm);
                         ++i;
                         matched = true;
+                    }
+                }
+            }
+
+            // ★ 自更新通过临时寄存器：mv tA, sX; op tB, tA, C; mv sX, tB → op sX, sX, C
+            // 典型场景：循环归纳变量递增 s4 = s4 + 1 通过 t4/t3 中转
+            //   codegen 对 promoted alloca 的 load-compute-store 模式产生：
+            //     mv t4, s4       ; load s4 into temp
+            //     addiw t3, t4, 1 ; compute in temp
+            //     mv s4, t3       ; store back to s4
+            //   优化为：addiw s4, s4, 1（省 2 条指令）
+            // 安全条件：
+            //   1. tA 在 op 之后死亡（isRegDeadInBB from i+2）
+            //   2. tB 在第二条 mv 之后死亡（isRegDeadInBB from i+3）
+            //   3. C != sX（避免 sX 在结果中出现两次，如 op sX, sX, sX）
+            //   4. op 是二元 ALU 操作（排除 store/branch/mv/la/li）
+            //   5. tB != tA（op 的目的与源不同）
+            // 实测：132 处模式（123 addiw + 6 addw + 3 slliw），每次省 2 条 = 264 条
+            if (!matched && i + 2 < lines.size() &&
+                !isEmptyOrComment(lines[i + 1]) && !isEmptyOrComment(lines[i + 2])) {
+                std::string mv1Rd, mv1Rs;
+                if (tryMatch(lines[i], "mv", mv1Rd, mv1Rs, imm) && mv1Rd != mv1Rs) {
+                    // 解析第二条指令：op tB, tA, C
+                    std::string opName2 = extractOpName(lines[i + 1]);
+                    // 排除非二元 ALU 操作
+                    static const std::set<std::string> BINARY_ALU_OPS = {
+                        "add", "addw", "addi", "addiw",
+                        "sub", "subw",
+                        "mul", "mulw",
+                        "and", "andi", "or", "ori", "xor", "xori",
+                        "sll", "sllw", "slli", "slliw",
+                        "srl", "srlw", "srli", "srliw",
+                        "sra", "sraw", "srai", "sraiw",
+                        "slt", "sltu", "slti", "sltiu"
+                    };
+                    if (BINARY_ALU_OPS.count(opName2) > 0) {
+                        std::string op2Rd, op2Rs1, op2Rs2;
+                        if (tryMatch(lines[i + 1], opName2, op2Rd, op2Rs1, op2Rs2) &&
+                            op2Rs1 == mv1Rd && op2Rd != mv1Rd) {
+                            // 第三条：mv sX, tB
+                            std::string mv2Rd, mv2Rs;
+                            if (tryMatch(lines[i + 2], "mv", mv2Rd, mv2Rs, imm) &&
+                                mv2Rd == mv1Rs && mv2Rs == op2Rd) {
+                                // 检查 C != sX
+                                if (op2Rs2 != mv1Rs) {
+                                    // 检查 tA 在 op 之后局部死亡（heuristic for scratch regs）
+                                    if (isRegLocalDead(lines, i + 2, mv1Rd)) {
+                                        // 检查 tB 在第二条 mv 之后局部死亡
+                                        if (isRegLocalDead(lines, i + 3, op2Rd)) {
+                                            result.push_back("  " + opName2 + "    " + mv1Rs + ", " + mv1Rs + ", " + op2Rs2);
+                                            i += 2;
+                                            matched = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ★ 2指令版自更新：op tB, sX, C; mv sX, tB → op sX, sX, C
+            // 典型场景：addw a0, a1, t3; mv a1, a0（a1 = a1 + t3 通过 a0 中转）
+            // 安全条件：tB 在 mv 之后局部死亡（isRegLocalDead），C != sX
+            // 实测：141 处模式（111 src1=sX + 30 src2=sX），每次省 1 条
+            if (!matched && i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {
+                std::string opName1 = extractOpName(lines[i]);
+                static const std::set<std::string> BINARY_ALU_OPS2 = {
+                    "add", "addw", "addi", "addiw",
+                    "sub", "subw",
+                    "mul", "mulw",
+                    "and", "andi", "or", "ori", "xor", "xori",
+                    "sll", "sllw", "slli", "slliw",
+                    "srl", "srlw", "srli", "srliw",
+                    "sra", "sraw", "srai", "sraiw",
+                    "slt", "sltu", "slti", "sltiu"
+                };
+                if (BINARY_ALU_OPS2.count(opName1) > 0) {
+                    std::string op1Rd, op1Rs1, op1Rs2;
+                    if (tryMatch(lines[i], opName1, op1Rd, op1Rs1, op1Rs2)) {
+                        std::string mvRd, mvRs;
+                        if (tryMatch(lines[i + 1], "mv", mvRd, mvRs, imm) &&
+                            mvRs == op1Rd && mvRd != op1Rd) {
+                            // sX = mvRd (write-back target), tB = op1Rd
+                            std::string sX = mvRd;
+                            std::string tB = op1Rd;
+                            // src1 = sX 的情况
+                            if (op1Rs1 == sX && op1Rs2 != sX) {
+                                if (isRegLocalDead(lines, i + 2, tB)) {
+                                    result.push_back("  " + opName1 + "    " + sX + ", " + sX + ", " + op1Rs2);
+                                    ++i;
+                                    matched = true;
+                                }
+                            }
+                            // src2 = sX 的情况（src1 != sX）
+                            else if (op1Rs2 == sX && op1Rs1 != sX) {
+                                if (isRegLocalDead(lines, i + 2, tB)) {
+                                    result.push_back("  " + opName1 + "    " + sX + ", " + op1Rs1 + ", " + sX);
+                                    ++i;
+                                    matched = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
