@@ -2142,6 +2142,99 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 }
             }
 
+            // ★ 有符号 x % 2^n 立即测试优化（最常见：x % 2 != 0）
+            // 模式（7 条指令）：
+            //   sraiw  tA, tX, 31      ; tA = sign(tX)
+            //   andi   tB, tA, MASK    ; tB = sign & (2^n - 1)
+            //   addw   tA, tB, tX      ; tA = tX + round-adjust
+            //   sraiw  tB, tA, N       ; tB = (tX+adj) >> N = tX / 2^n
+            //   slliw  tA, tB, N       ; tA = (tX/2^n) * 2^n
+            //   subw   tB, tX, tA      ; tB = tX - (tX/2^n)*2^n = tX % 2^n
+            //   bnez/beqz tB, label    ; test (tX % 2^n)
+            // 替换（2 条指令）：
+            //   andi   tB, tX, MASK    ; tB = tX & (2^n - 1)
+            //   bnez/beqz tB, label    ; test (等价：x%2^n!=0 ⟺ x&(2^n-1)!=0)
+            // 原理：对所有 x（正/负/零），x % 2^n != 0  ⟺  x & (2^n - 1) != 0
+            //   - 正数：x % 2^n == x & (2^n-1)，显然等价
+            //   - 负数：x % 2^n ∈ {-(2^n-1),...,-1}（非零 iff x 不是 2^n 的倍数），
+            //           x & (2^n-1) ∈ {1,...,2^n-1}（非零 iff x 不是 2^n 的倍数）
+            //   - 零：两者都为 0
+            // 安全条件：
+            //   1. 7 条指令在同一 BB 内连续（中间无标签/注释/指令）
+            //   2. MASK == (1 << N) - 1
+            //   3. tA（中间寄存器）在 subw 后不再使用（subw 后紧跟 branch，tA 不在 branch 操作数中）
+            //   4. tB 在 branch 后不再使用（branch 是 BB 终结符）
+            // ★ QEMU 安全：运行在寄存器分配之后，不改变寄存器分配（规则 14）
+            // ★ 汇编器安全：RISC-V GNU as，andi+branch 均为合法指令
+            if (!matched && i + 6 < lines.size() &&
+                !isEmptyOrComment(lines[i+1]) && !isEmptyOrComment(lines[i+2]) &&
+                !isEmptyOrComment(lines[i+3]) && !isEmptyOrComment(lines[i+4]) &&
+                !isEmptyOrComment(lines[i+5]) && !isEmptyOrComment(lines[i+6])) {
+                std::string sra1Rd, sra1Rs, sra1Imm;
+                if (tryMatch(lines[i], "sraiw", sra1Rd, sra1Rs, sra1Imm) && sra1Imm == "31") {
+                    std::string andRd, andRs, andImm;
+                    if (tryMatch(lines[i+1], "andi", andRd, andRs, andImm) && andRs == sra1Rd) {
+                        std::string addRd, addRs1, addRs2;
+                        if (tryMatch(lines[i+2], "addw", addRd, addRs1, addRs2) &&
+                            addRd == sra1Rd && addRs1 == andRd && addRs2 == sra1Rs) {
+                            std::string sra2Rd, sra2Rs, sra2Imm;
+                            if (tryMatch(lines[i+3], "sraiw", sra2Rd, sra2Rs, sra2Imm) &&
+                                sra2Rs == addRd && sra2Rd == andRd) {
+                                std::string sllRd, sllRs, sllImm;
+                                if (tryMatch(lines[i+4], "slliw", sllRd, sllRs, sllImm) &&
+                                    sllRs == sra2Rd && sllRd == addRd && sllImm == sra2Imm) {
+                                    std::string subRd, subRs1, subRs2;
+                                    if (tryMatch(lines[i+5], "subw", subRd, subRs1, subRs2) &&
+                                        subRs1 == sra1Rs && subRs2 == sllRd && subRd == sra2Rd) {
+                                        std::string brOp = extractOpName(lines[i+6]);
+                                        std::string brRs, brLabel;
+                                        if ((brOp == "bnez" || brOp == "beqz") &&
+                                            tryMatchBranch(lines[i+6], brOp, brRs, brLabel) &&
+                                            brRs == subRd) {
+                                            // 验证 MASK == (1 << N) - 1
+                                            int n = std::atoi(sra2Imm.c_str());
+                                            int mask = std::atoi(andImm.c_str());
+                                            if (n >= 1 && n <= 30 && mask == ((1 << n) - 1)) {
+                                                // 安全检查：中间寄存器 sra1Rd（=addRd=sllRd）
+                                                // 在 subw 之后不再使用。subw 后紧跟 branch，
+                                                // branch 只读 subRd，不读 sra1Rd。
+                                                // 但需确认 sra1Rd != sra1Rs（否则原值被破坏）。
+                                                if (sra1Rd != sra1Rs) {
+                                                    result.push_back("  andi    " + subRd + ", " + sra1Rs + ", " + andImm);
+                                                    result.push_back("  " + brOp + "    " + subRd + ", " + brLabel);
+                                                    i += 6;  // 跳过 6 条原指令（branch 是第 7 条，一并消费）
+                                                    matched = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ★ 有符号 x % 2^n 计算优化（无 branch，保留 tB = x % 2^n）
+            // 当 x % 2^n 的结果被后续使用（非 branch 测试）时，
+            // 仍可将 6 条指令替换为更高效的序列：
+            //   andi tB, tX, (2^n-1)     ; tB = |x % 2^n|（无符号余数）
+            //   sraiw tA, tX, 31         ; tA = sign
+            //   ...（对负数取负）...
+            // 但这仅在余数被使用时才有意义，且实现复杂。
+            // 暂不实现，仅处理上述 branch 测试场景（最高频）。
+
+            // ★ 有符号 x / 2^n 立即测试优化（x / 2^n == 0 ⟺ -2^n < x < 2^n）
+            // 模式（4 条指令）：
+            //   sraiw  tA, tX, 31
+            //   andi   tB, tA, MASK
+            //   addw   tA, tB, tX
+            //   sraiw  tB, tA, N         ; tB = x / 2^n
+            //   bnez/beqz tB, label      ; test (x / 2^n)
+            // 替换：andi 不行（除法结果不能简化为位运算）
+            // 仅当 N=1 且测试 == 0 时可用 "bltu tX, 2" 之类的范围检查，但语义不等价。
+            // 跳过，专注于 % 2^n 模式。
+
             if (!matched) {
                 result.push_back(lines[i]);
             }
