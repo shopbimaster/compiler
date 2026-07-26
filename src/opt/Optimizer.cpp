@@ -61,6 +61,11 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    if (powerOfTwoDispatchSimplification(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     if (tailRecursionElimination(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
