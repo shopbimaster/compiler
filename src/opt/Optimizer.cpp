@@ -56,7 +56,17 @@ void runO2(IR::Module* mod) {
     // 1a. 树摇
     treeShaking(mod);
 
+    if (recursiveModularMulToNative(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     if (bitOpPatternRecognition(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    if (powerOfTwoDispatchSimplification(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -160,6 +170,13 @@ void runO2(IR::Module* mod) {
         if (simplifyCFG(mod)) {
             constantFolding(mod);
             deadCodeElimination(mod);
+            phase2Changed = true;
+        }
+
+        // 2d. 跳转线程化：消除冗余跳转链 br A -> br B -> br C => br C
+        if (jumpThreading(mod)) {
+            // 跳转线程化可能创造新的SimplifyCFG机会
+            simplifyCFG(mod);
             phase2Changed = true;
         }
 
@@ -355,6 +372,7 @@ void runO2(IR::Module* mod) {
     //     constantFolding(mod);
     //     deadCodeElimination(mod);
     // }
+
 
     // 6f. GVN：基于支配树的跨 BB CSE
     // 历史禁用原因：跨 BB 合并延长活跃区间→线性扫描寄存器压力增→净回退

@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 #include <string>
+#include <iostream>
 
 namespace Opt {
 namespace {
@@ -41,8 +42,14 @@ bool isLeafCall(IR::Function* func) {
 }
 
 unsigned countInstructions(IR::Function* func) {
+    if (!func) {
+        return 0;
+    }
     unsigned n = 0;
     for (auto& bb : func->getBlocks()) {
+        if (!bb) {
+            continue;
+        }
         n += static_cast<unsigned>(bb->getInstructions().size());
     }
     return n;
@@ -220,6 +227,11 @@ IR::Instruction* cloneInstruction(
                op == Opc::SITOFP || op == Opc::FPTOSI) {
         cloned = IR::Instruction::createCast(
             op, src->getType(), lookup(src->getOperand(0)), src->getName() + ".i");
+    } else if (op == Opc::WIDE_SMOD_MUL) {
+        cloned = IR::Instruction::createTernaryOp(
+            op, src->getType(), src->getName() + ".i",
+            lookup(src->getOperand(0)), lookup(src->getOperand(1)),
+            lookup(src->getOperand(2)));
     } else {
         // 通用二元运算
         cloned = IR::Instruction::createBinOp(
@@ -600,9 +612,15 @@ bool tryInlineCall(IR::Instruction* callInst, IR::Function* callee) {
 } // namespace
 
 bool inlineExpansion(IR::Module* mod) {
+    if (!mod) return false;
+
     // 识别可内联的候选函数
     std::unordered_set<IR::Function*> candidates;
-    for (auto& func : mod->getFunctions()) {
+
+    auto& funcs = mod->getFunctions();
+
+    for (auto& func : funcs) {
+        if (!func) continue;
         if (isInlineCandidate(func.get())) {
             candidates.insert(func.get());
         }
@@ -611,39 +629,50 @@ bool inlineExpansion(IR::Module* mod) {
     bool changed = true;
     while (changed) {
         changed = false;
+
+        // 复制函数列表避免迭代器失效
+        std::vector<IR::Function*> funcList;
         for (auto& func : mod->getFunctions()) {
+            funcList.push_back(func.get());
+        }
+
+        for (auto* func : funcList) {
             if (func->isExternal()) continue;
             // 跳过候选函数自身（避免内联到自身）
-            if (candidates.count(func.get())) continue;
+            if (candidates.count(func)) continue;
 
             // 统计当前 caller 中各候选 callee 的调用次数
-            // 多BB函数如果被调用太多次，内联会导致代码膨胀和性能下降
             std::unordered_map<IR::Function*, unsigned> callCount;
+
             for (auto& bb : func->getBlocks()) {
                 for (auto& inst : bb->getInstructions()) {
                     if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
-                        auto* calleeVal = inst->getOperand(0);
-                        auto* calleeFunc = dynamic_cast<IR::Function*>(calleeVal);
-                        if (calleeFunc && candidates.count(calleeFunc)) {
-                            callCount[calleeFunc]++;
+                        if (inst->getNumOperands() >= 1) {
+                            auto* calleeVal = inst->getOperand(0);
+                            if (calleeVal) {
+                                auto* calleeFunc = dynamic_cast<IR::Function*>(calleeVal);
+                                if (calleeFunc && candidates.count(calleeFunc)) {
+                                    callCount[calleeFunc]++;
+                                }
+                            }
                         }
                     }
                 }
             }
-            // 标记需要跳过的多BB函数（被调用次数超过阈值）
-            // 小函数（≤SMALL_FUNCTION_INST_THRESHOLD指令）豁免此限制，
-            // 因为它们内联后的代码膨胀很小，但 CALL 开销消除收益大。
-            // 同时检查总内联指令预算，避免过度膨胀。
+
+            // 标记需要跳过的多BB函数
             std::unordered_set<IR::Function*> skipMultiBB;
             unsigned totalInlineInsts = 0;
-            for (auto& [callee, cnt] : callCount) {
+
+            // 复制callCount到vector避免迭代器问题
+            std::vector<std::pair<IR::Function*, unsigned>> callCountVec(callCount.begin(), callCount.end());
+
+            for (auto& [callee, cnt] : callCountVec) {
                 if (callee->getBlocks().size() > 1) {
                     unsigned calleeInsts = countInstructions(callee);
                     unsigned projectedInsts = calleeInsts * cnt;
-                    // 小函数豁免 call-site 限制，但仍受总预算约束
                     bool tooManyCalls = (cnt > MAX_MULTI_BB_CALL_SITES) &&
                                         (calleeInsts > SMALL_FUNCTION_INST_THRESHOLD);
-                    // 总预算检查：如果内联此函数所有调用点会超出预算，跳过
                     bool budgetExceeded = (totalInlineInsts + projectedInsts) > MAX_TOTAL_INLINE_INSTS;
                     if (tooManyCalls || budgetExceeded) {
                         skipMultiBB.insert(callee);
@@ -653,6 +682,7 @@ bool inlineExpansion(IR::Module* mod) {
                 }
             }
 
+
             for (auto& bb : func->getBlocks()) {
                 for (auto it = bb->begin(); it != bb->end(); ) {
                     auto* inst = it->get();
@@ -660,6 +690,10 @@ bool inlineExpansion(IR::Module* mod) {
                         auto* calleeVal = inst->getOperand(0);
                         auto* calleeFunc = dynamic_cast<IR::Function*>(calleeVal);
                         if (calleeFunc && candidates.count(calleeFunc) && !skipMultiBB.count(calleeFunc)) {
+                            if (std::getenv("DEBUG_INLINE")) {
+                                std::cerr << "[InlineExpansion] Inlining " << calleeFunc->getName()
+                                          << " into " << func->getName() << "\n";
+                            }
                             if (tryInlineCall(inst, calleeFunc)) {
                                 changed = true;
                                 it = bb->begin(); // restart iteration

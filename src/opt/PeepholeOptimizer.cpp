@@ -1464,12 +1464,59 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 }
             }
 
+            // mv rd, rs; <op> rd, [rd|X], [rd|X] → <op> rd, rs', X'  (self-modify 融合)
+            // op 的目的寄存器就是 mv 的目标 rd，且 rd 作为源操作数出现。
+            // 因为 op 重新定义 rd，mv 拷贝的值在 op 执行时即死亡，无需 liveness 检查。
+            // 安全性：rd 的最终值 = op(rs, X)，与原序列 (rd=rs; rd=op(rd,X)) 完全一致；
+            //   rd != rs 保证 mv 非空操作，op 只写 rd 不写 rs，故 rs 值在两种序列中相同。
+            // 典型场景：h-5-01 内层循环 `mv t1, s7; mul t1, t1, s0` → `mul t1, s7, s0`，
+            //   消除每次迭代的一条 mv 并缩短依赖链。
+            if (!matched && i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {
+                std::string mvRd, mvRs;
+                if (tryMatch(lines[i], "mv", mvRd, mvRs, imm) && !mvRd.empty() && !mvRs.empty() && mvRd != mvRs) {
+                    std::string nextLine = lines[i + 1];
+                    std::string opName = extractOpName(nextLine);
+                    static const std::set<std::string> THREE_REG_OPS_SM = {
+                        "add", "addw", "sub", "subw", "mul", "mulw",
+                        "sll", "sllw", "sra", "sraw", "srl", "srlw",
+                        "and", "or", "xor", "slt", "sltu",
+                        "div", "divw", "divu", "divuw",
+                        "rem", "remw", "remu", "remuw", "mulh"
+                    };
+                    static const std::set<std::string> IMM_OPS_SM = {
+                        "addi", "addiw", "slli", "srli", "srai",
+                        "slliw", "srliw", "sraiw", "slti", "sltiu",
+                        "andi", "ori", "xori"
+                    };
+                    bool isThreeReg = THREE_REG_OPS_SM.count(opName) > 0;
+                    bool isImmOp = IMM_OPS_SM.count(opName) > 0;
+                    if (isThreeReg || isImmOp) {
+                        std::string opRd, opRs, opRs2;
+                        if (tryMatch(nextLine, opName, opRd, opRs, opRs2)) {
+                            // op 目的寄存器必须是 mvRd，且 mvRd 作为源操作数出现
+                            bool rdIsSrc = (opRs == mvRd) || (isThreeReg && opRs2 == mvRd);
+                            if (opRd == mvRd && rdIsSrc) {
+                                std::string newRs = (opRs == mvRd) ? mvRs : opRs;
+                                std::string newRs2 = opRs2;
+                                if (isThreeReg && opRs2 == mvRd) newRs2 = mvRs;
+                                std::string newLine = "  " + opName + "    " + opRd + ", " + newRs;
+                                if (!newRs2.empty()) newLine += ", " + newRs2;
+                                result.push_back(newLine);
+                                ++i;
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+            }
+
             // mv rd, rs; <op> rd3, ..., rd, ... → <op> rd3, ..., rs, ...
             // 通用模式：mv 的目标寄存器 rd 在下一条指令中作为源操作数（非目的、非地址）
             // 安全条件：
             //   1. rd 在 op 之后必须死亡（isRegDeadInBB）
             //   2. op 的目的寄存器 rd3 != rs（否则 rs 被覆写，语义改变）
-            //   3. rd 不是 op 的目的寄存器（自修改模式由其他 pattern 处理）
+            //   3. rd 不是 op 的目的寄存器（自修改模式由上方 pattern 处理）
+
             // 支持三寄存器 op：add/addw/sub/subw/mul/mulw/sll/sllw/sra/sraw/srl/srlw/and/or/xor/slt/sltu/div/divw/rem/remw
             // 支持立即数 op：addi/addiw/slli/srli/srai/slti/sltiu/andi/ori/xori
             if (!matched && i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {

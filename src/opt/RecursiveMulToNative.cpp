@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <vector>
 #include <cmath>
+#include <limits>
 
 namespace Opt {
 namespace {
@@ -433,6 +434,248 @@ bool tryConvertFunction(IR::Function* func) {
     return false;
 }
 
+bool isConstantValue(IR::Value* value, int expected) {
+    auto* constant = dynamic_cast<IR::ConstantInt*>(value);
+    return constant && constant->getValue() == expected;
+}
+
+bool isLoadFrom(IR::Value* value, IR::Value* pointer) {
+    auto* load = dynamic_cast<IR::Instruction*>(value);
+    return load && load->getOpcode() == IR::Instruction::Opcode::LOAD &&
+           load->getNumOperands() == 1 && load->getOperand(0) == pointer;
+}
+
+bool isStoredTo(IR::Function* function, IR::Value* value, IR::Value* pointer) {
+    for (auto& block : function->getBlocks()) {
+        for (auto& inst : block->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::STORE &&
+                inst->getNumOperands() == 2 &&
+                inst->getOperand(0) == value &&
+                inst->getOperand(1) == pointer) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool isDirectlyReturned(IR::Function* function, IR::Value* value) {
+    for (auto& block : function->getBlocks()) {
+        for (auto& inst : block->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::RET &&
+                inst->getNumOperands() == 1 &&
+                inst->getOperand(0) == value) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool hasEqualityTest(IR::Function* function, IR::Value* value, int constant) {
+    for (auto& block : function->getBlocks()) {
+        for (auto& inst : block->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::ICMP ||
+                inst->getName() != "eq" || inst->getNumOperands() != 2) {
+                continue;
+            }
+            if ((inst->getOperand(0) == value &&
+                 isConstantValue(inst->getOperand(1), constant)) ||
+                (inst->getOperand(1) == value &&
+                 isConstantValue(inst->getOperand(0), constant))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool hasArgumentEqualityTest(IR::Function* function, IR::Argument* argument,
+                             int constant) {
+    for (auto& block : function->getBlocks()) {
+        for (auto& inst : block->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::ICMP ||
+                inst->getName() != "eq" || inst->getNumOperands() != 2) {
+                continue;
+            }
+            if ((tracesToArg(inst->getOperand(0), argument, function) &&
+                 isConstantValue(inst->getOperand(1), constant)) ||
+                (tracesToArg(inst->getOperand(1), argument, function) &&
+                 isConstantValue(inst->getOperand(0), constant))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Recognize the overflow-safe recursive modular multiplication:
+//   f(a, 0) = 0
+//   f(a, 1) = a % M
+//   cur = f(a, b / 2)
+//   cur = (cur + cur) % M
+//   return b % 2 ? (cur + a) % M : cur
+//
+// This intentionally follows the unoptimized alloca/load/store shape. The
+// strict structure check prevents applying 64-bit arithmetic to an unrelated
+// recursion whose i32 overflow behavior could differ.
+bool matchRecursiveModularMultiply(IR::Function* function, int& modulus) {
+    using Opc = IR::Instruction::Opcode;
+    if (function->isExternal() || function->getNumArgs() != 2 ||
+        function->getFunctionType()->getReturnType() != IR::IntegerType::I32 ||
+        function->getArg(0)->getType() != IR::IntegerType::I32 ||
+        function->getArg(1)->getType() != IR::IntegerType::I32) {
+        return false;
+    }
+
+    std::vector<IR::Instruction*> calls;
+    std::vector<IR::Instruction*> remainders;
+    bool returnsZero = false;
+    for (auto& block : function->getBlocks()) {
+        for (auto& inst : block->getInstructions()) {
+            if (inst->getOpcode() == Opc::CALL) calls.push_back(inst.get());
+            if (inst->getOpcode() == Opc::SREM) remainders.push_back(inst.get());
+            if (inst->getOpcode() == Opc::WIDE_SMOD_MUL) return false;
+            if (inst->getOpcode() == Opc::RET && inst->getNumOperands() == 1 &&
+                isConstantValue(inst->getOperand(0), 0)) {
+                returnsZero = true;
+            }
+        }
+    }
+    if (calls.size() != 1 || remainders.size() != 4 || !returnsZero) return false;
+
+    auto* selfCall = calls.front();
+    if (selfCall->getNumOperands() != 3 ||
+        selfCall->getOperand(0) != static_cast<IR::Value*>(function) ||
+        !tracesToArg(selfCall->getOperand(1), function->getArg(0), function)) {
+        return false;
+    }
+    auto* half = dynamic_cast<IR::Instruction*>(selfCall->getOperand(2));
+    if (!half || half->getOpcode() != Opc::SDIV ||
+        half->getNumOperands() != 2 ||
+        !tracesToArg(half->getOperand(0), function->getArg(1), function) ||
+        !isConstantValue(half->getOperand(1), 2)) {
+        return false;
+    }
+
+    IR::Value* currentSlot = nullptr;
+    for (auto& block : function->getBlocks()) {
+        for (auto& inst : block->getInstructions()) {
+            if (inst->getOpcode() == Opc::STORE &&
+                inst->getNumOperands() == 2 &&
+                inst->getOperand(0) == selfCall) {
+                if (currentSlot) return false;
+                currentSlot = inst->getOperand(1);
+            }
+        }
+    }
+    auto* currentAlloca = dynamic_cast<IR::Instruction*>(currentSlot);
+    if (!currentAlloca || currentAlloca->getOpcode() != Opc::ALLOCA) return false;
+
+    IR::Instruction* parityRemainder = nullptr;
+    std::vector<IR::Instruction*> modularRemainders;
+    int detectedModulus = 0;
+    for (auto* remainder : remainders) {
+        auto* divisor = dynamic_cast<IR::ConstantInt*>(remainder->getOperand(1));
+        if (!divisor) return false;
+        int64_t value = divisor->getValue();
+        if (value == 2 &&
+            tracesToArg(remainder->getOperand(0), function->getArg(1), function)) {
+            if (parityRemainder) return false;
+            parityRemainder = remainder;
+            continue;
+        }
+        if (value <= 1 || value > std::numeric_limits<int>::max() / 2)
+            return false;
+        if (detectedModulus == 0) detectedModulus = static_cast<int>(value);
+        if (detectedModulus != value) return false;
+        modularRemainders.push_back(remainder);
+    }
+    if (!parityRemainder || modularRemainders.size() != 3 ||
+        !hasEqualityTest(function, parityRemainder, 1) ||
+        !hasArgumentEqualityTest(function, function->getArg(1), 0) ||
+        !hasArgumentEqualityTest(function, function->getArg(1), 1)) {
+        return false;
+    }
+
+    bool foundBase = false;
+    bool foundDouble = false;
+    bool foundOdd = false;
+    for (auto* remainder : modularRemainders) {
+        IR::Value* dividend = remainder->getOperand(0);
+        if (tracesToArg(dividend, function->getArg(0), function) &&
+            isDirectlyReturned(function, remainder)) {
+            foundBase = true;
+            continue;
+        }
+
+        auto* add = dynamic_cast<IR::Instruction*>(dividend);
+        if (!add || add->getOpcode() != Opc::ADD ||
+            add->getNumOperands() != 2) {
+            return false;
+        }
+        if (isLoadFrom(add->getOperand(0), currentSlot) &&
+            isLoadFrom(add->getOperand(1), currentSlot) &&
+            isStoredTo(function, remainder, currentSlot)) {
+            foundDouble = true;
+            continue;
+        }
+
+        bool lhsCurrent = isLoadFrom(add->getOperand(0), currentSlot);
+        bool rhsCurrent = isLoadFrom(add->getOperand(1), currentSlot);
+        bool lhsArgument =
+            tracesToArg(add->getOperand(0), function->getArg(0), function);
+        bool rhsArgument =
+            tracesToArg(add->getOperand(1), function->getArg(0), function);
+        if (((lhsCurrent && rhsArgument) || (rhsCurrent && lhsArgument)) &&
+            isDirectlyReturned(function, remainder)) {
+            foundOdd = true;
+            continue;
+        }
+        return false;
+    }
+    if (!foundBase || !foundDouble || !foundOdd) return false;
+
+    modulus = detectedModulus;
+    return true;
+}
+
+void addGuardedWideModularMultiply(IR::Function* function, int modulus) {
+    using Opc = IR::Instruction::Opcode;
+    auto* slowEntry = function->getEntryBlock();
+    auto* guard = function->insertBlock("modmul.guard", slowEntry);
+    auto* fast = function->insertBlock("modmul.fast", slowEntry);
+    auto* zero = IR::ConstantInt::get(IR::IntegerType::I32, 0);
+    auto* modulusValue =
+        IR::ConstantInt::get(IR::IntegerType::I32, modulus);
+
+    auto* firstNonNegative = IR::Instruction::createCmp(
+        Opc::ICMP, function->getArg(0), zero, "sge");
+    auto* firstBelowModulus = IR::Instruction::createCmp(
+        Opc::ICMP, function->getArg(0), modulusValue, "slt");
+    auto* secondNonNegative = IR::Instruction::createCmp(
+        Opc::ICMP, function->getArg(1), zero, "sge");
+    auto* firstInRange = IR::Instruction::createBinOp(
+        Opc::AND, IR::IntegerType::I1, "modmul.first.in.range",
+        firstNonNegative, firstBelowModulus);
+    auto* inputsSafe = IR::Instruction::createBinOp(
+        Opc::AND, IR::IntegerType::I1, "modmul.inputs.safe",
+        firstInRange, secondNonNegative);
+    guard->pushBack(firstNonNegative);
+    guard->pushBack(firstBelowModulus);
+    guard->pushBack(secondNonNegative);
+    guard->pushBack(firstInRange);
+    guard->pushBack(inputsSafe);
+    guard->pushBack(IR::Instruction::createCondBr(
+        inputsSafe, fast, slowEntry));
+
+    auto* nativeResult = IR::Instruction::createTernaryOp(
+        Opc::WIDE_SMOD_MUL, IR::IntegerType::I32, "modmul.wide",
+        function->getArg(0), function->getArg(1), modulusValue);
+    fast->pushBack(nativeResult);
+    fast->pushBack(IR::Instruction::createRet(nativeResult));
+}
+
 } // namespace
 
 // ================================================================
@@ -451,6 +694,17 @@ bool recursiveMulToNative(IR::Module* mod) {
         }
     }
     return anyChanged;
+}
+
+bool recursiveModularMulToNative(IR::Module* mod) {
+    bool changed = false;
+    for (auto& function : mod->getFunctions()) {
+        int modulus = 0;
+        if (!matchRecursiveModularMultiply(function.get(), modulus)) continue;
+        addGuardedWideModularMultiply(function.get(), modulus);
+        changed = true;
+    }
+    return changed;
 }
 
 } // namespace Opt
