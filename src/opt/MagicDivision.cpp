@@ -260,25 +260,14 @@ bool magicDivisionOnFunction(IR::Function* func) {
             auto* n = inst->getOperand(0);
             auto* i32 = IR::IntegerType::I32;
 
-            // 构建商计算序列 q = n / d
-            // 对于 SDIV：直接用 q 替换
-            // 对于 SREM：r = n - q * d
-            IR::Instruction* q = buildQuotientSequence(n, d, i32, inst.get(), toInsert);
-            if (!q) continue; // 无效除数（0, 1, -1, INT32_MIN 由 AlgebraicSimplification 处理）
-
-            if (op == Opc::SDIV) {
-                inst->replaceAllUsesWith(q);
-                toErase.push_back(inst.get());
-                changed = true;
-            } else {
-                // SREM: r = n - q * d
-                // ★ 快速路径：srem x, 2^k 当 x 可证明非负时 → x & (2^k - 1)
-                //   1 条 AND 指令替代 6 条 div.pow2 序列
-                //   安全条件：x >= 0（C 取余符号与被除数相同，非负数取余结果非负）
-                {
-                    uint32_t absD = (d >= 0) ? (uint32_t)d : (uint32_t)(-d);
-                    bool isPow2 = (absD != 0) && ((absD & (absD - 1)) == 0);
-                    if (isPow2 && absD > 1 && canProveNonNegative(n)) {
+            // ★ SREM 快速路径检查（在 buildQuotientSequence 之前，避免生成无用商计算）
+            if (op == Opc::SREM) {
+                uint32_t absD = (d >= 0) ? (uint32_t)d : (uint32_t)(-d);
+                bool isPow2 = (absD != 0) && ((absD & (absD - 1)) == 0);
+                if (isPow2 && absD > 1) {
+                    // 快速路径 1：srem x, 2^k 当 x 可证明非负时 → x & (2^k - 1)
+                    //   安全条件：x >= 0（C 取余符号与被除数相同，非负数取余结果非负）
+                    if (canProveNonNegative(n)) {
                         auto* maskConst = IR::ConstantInt::get(i32, (int32_t)(absD - 1));
                         auto* andInst = IR::Instruction::createBinOp(
                             Opc::AND, i32, "magic.rem.and", n, maskConst);
@@ -296,10 +285,57 @@ bool magicDivisionOnFunction(IR::Function* func) {
                         inst->replaceAllUsesWith(result);
                         toErase.push_back(inst.get());
                         changed = true;
-                        continue;  // 跳过下面的通用 SREM 处理
+                        continue;
+                    }
+
+                    // 快速路径 2：srem x, 2^k 的结果仅用于 icmp eq/ne 0 判零时
+                    //   → and x, 2^k-1（1 条指令替代 6 条 div.pow2 序列）
+                    //   数学等价性：srem x, 2^k == 0 ⟺ x & (2^k-1) == 0（无论 x 符号）
+                    //     因为 srem 的余数 = 0 ⟺ x 被 2^k 整除 ⟺ x 的低 k 位全 0
+                    //   借鉴 Cpl4~Cpl10 调研：有符号除/模 2^n 快速路径
+                    if (inst->hasOneUse()) {
+                        auto& uses = inst->getUses();
+                        auto* soleUser = dynamic_cast<IR::Instruction*>(uses.begin()->user);
+                        if (soleUser && soleUser->getOpcode() == Opc::ICMP) {
+                            const std::string& condName = soleUser->getName();
+                            bool isEqOrNe = (condName == "eq" || condName == "ne");
+                            auto* cmpOp1 = soleUser->getOperand(1);
+                            bool cmpWithZero = false;
+                            if (auto* ci1 = dynamic_cast<IR::ConstantInt*>(cmpOp1)) {
+                                cmpWithZero = (ci1->getValue() == 0);
+                            }
+                            if (!cmpWithZero) {
+                                auto* cmpOp0 = soleUser->getOperand(0);
+                                if (auto* ci0 = dynamic_cast<IR::ConstantInt*>(cmpOp0)) {
+                                    cmpWithZero = (ci0->getValue() == 0);
+                                }
+                            }
+                            if (isEqOrNe && cmpWithZero) {
+                                auto* maskConst = IR::ConstantInt::get(i32, (int32_t)(absD - 1));
+                                auto* andInst = IR::Instruction::createBinOp(
+                                    Opc::AND, i32, "magic.rem.and", n, maskConst);
+                                toInsert.push_back({inst.get(), andInst});
+                                inst->replaceAllUsesWith(andInst);
+                                toErase.push_back(inst.get());
+                                changed = true;
+                                continue;
+                            }
+                        }
                     }
                 }
+            }
 
+            // 构建商计算序列 q = n / d
+            // 对于 SDIV：直接用 q 替换
+            // 对于 SREM：r = n - q * d
+            IR::Instruction* q = buildQuotientSequence(n, d, i32, inst.get(), toInsert);
+            if (!q) continue; // 无效除数（0, 1, -1, INT32_MIN 由 AlgebraicSimplification 处理）
+
+            if (op == Opc::SDIV) {
+                inst->replaceAllUsesWith(q);
+                toErase.push_back(inst.get());
+                changed = true;
+            } else {
                 // 通用 SREM: r = n - q * d
                 // 生成 mul q, d 和 sub n, mul
                 auto* mulConst = IR::ConstantInt::get(i32, d);
