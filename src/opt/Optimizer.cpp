@@ -560,7 +560,11 @@ void runP0(IR::Module* mod) {
     // ★ 必须在代码生成前运行，且在所有可能创建 PHI 的 pass 之后。
     // 安全性：只做语义保持的替换（同值/单源），不破坏 SSA 语义。
     // ================================================================
-    if (phiSimplification(mod)) {
+    static const bool disablePhiSimpl = [] {
+        const char* v = std::getenv("OPT_DISABLE_PHISIMPL");
+        return v && std::string(v) == "1";
+    }();
+    if (!disablePhiSimpl && phiSimplification(mod)) {
         deadCodeElimination(mod);
     }
 }

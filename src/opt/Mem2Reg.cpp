@@ -225,56 +225,6 @@ bool mem2regOnFunction(IR::Function* func) {
 
         if (defBlocks.empty() && useBlocks.empty()) continue;
 
-        // ── 非 entry 变量快速路径：单一 store 且支配所有 load ──
-        // 循环体内声明的变量（int len=..; int k=0; int sum=0;）多是"声明即初始化、
-        // 随后在本作用域使用"。这类变量的 store 支配全部 load，不需要 PHI——标准
-        // IDF 会在循环 header 放一个多余 PHI（因为 def block 在循环里，其支配边界
-        // 含 header），该 PHI 合并 undef 与真值，是 crypto 错值的根源（main::len
-        // defBlocks=1 却 +1 phi）。此处对这类变量直接做 load→storedVal 替换，
-        // 绕开 PHI，既正确又消除多余 PHI。仅对非 entry 且单 store 生效（保守）。
-        if (!isEntryAlloca && stores.size() == 1 && !std::getenv("M2R_NO_FASTPATH")) {
-            auto* theStore = stores[0];
-            auto* storedVal = theStore->getOperand(0);
-            auto* storeBB = theStore->getParent();
-            // 检查：store 支配所有 load（同块内 store 在 load 前；异块 storeBB 支配 loadBB）
-            bool storeDominatesAllLoads = true;
-            for (auto* load : loads) {
-                auto* loadBB = load->getParent();
-                if (loadBB == storeBB) {
-                    // 同块：store 必须在 load 之前
-                    bool storeFirst = false;
-                    for (auto& in : storeBB->getInstructions()) {
-                        if (in.get() == theStore) { storeFirst = true; break; }
-                        if (in.get() == load) { storeFirst = false; break; }
-                    }
-                    if (!storeFirst) { storeDominatesAllLoads = false; break; }
-                } else {
-                    // 异块：storeBB 必须支配 loadBB
-                    auto dit = dom.find(loadBB);
-                    if (dit == dom.end() || !dit->second.count(storeBB)) {
-                        storeDominatesAllLoads = false; break;
-                    }
-                }
-            }
-            if (storeDominatesAllLoads) {
-                // 直接替换所有 load 为 storedVal，删除 load 与 store
-                for (auto* load : loads) {
-                    load->replaceAllUsesWith(storedVal);
-                    auto* pb = load->getParent();
-                    for (auto it = pb->begin(); it != pb->end(); ++it) {
-                        if (it->get() == load) { pb->erase(it); break; }
-                    }
-                }
-                auto* pb = theStore->getParent();
-                for (auto it = pb->begin(); it != pb->end(); ++it) {
-                    if (it->get() == theStore) { pb->erase(it); break; }
-                }
-                changed = true;
-                continue;
-            }
-            // store 不支配所有 load → 回退到标准 IDF-PHI 路径（下方）。
-        }
-
         // 如果 alloca 从未被 STORE，且所有 LOAD 返回相同值（未初始化），
         // 可以替换为 undef。但这里我们保守处理：至少需要一个定义块。
         if (defBlocks.empty()) {
@@ -324,6 +274,117 @@ bool mem2regOnFunction(IR::Function* func) {
             if (!hasCallInRegion)
                 for (auto* b : useBlocks) if (blockHasCall(b)) { hasCallInRegion = true; break; }
             if (hasCallInRegion) continue;  // 跳过跨调用变量（crypto 类）
+
+            // 4. use 块必须在至少一个 def 块的支配子树内。
+            // 当变量的 use 块不被任何 def 块支配时（如循环退出后仍使用循环变量），
+            // PHI 的活跃区间跨越复杂控制流，寄存器分配器的线性扫描活跃区间
+            // 分析会错误缩短其他变量的存活范围，导致寄存器被覆盖→段错误
+            // （shuffle0 的 %p 在 while_end_5 中使用，但 while_end_5 不被任何
+            // def 块支配，导致 hash 索引被错误分配到 t6 而 t6 在路径上被覆盖）。
+            // M2R_NO_DOMCHECK=1 可禁用此检查用于调试。
+            if (!std::getenv("M2R_NO_DOMCHECK")) {
+                bool useOutsideDomSubtree = false;
+                for (auto* useBB : useBlocks) {
+                    bool dominated = false;
+                    auto dit = dom.find(useBB);
+                    if (dit != dom.end()) {
+                        for (auto* defBB : defBlocks) {
+                            if (dit->second.count(defBB)) {
+                                dominated = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!dominated) {
+                        useOutsideDomSubtree = true;
+                        break;
+                    }
+                }
+                if (useOutsideDomSubtree) continue;
+            }
+
+            // 5. store 值不能来自 LOAD 指令（如 p = next[p]）。
+            // 这种变量的 PHI incoming value 是前驱块中 LOAD 的结果，LOAD 需要
+            // 跨块保持活跃。寄存器分配器的活跃区间分析在处理这种 PHI incoming
+            // 时有 bug：它没有正确扩展其他变量（如 hash 索引）在 PHI 前驱块中
+            // 的 live-out，导致寄存器被覆盖→段错误。
+            // shuffle0 的 %p = next[p] 提升后段错误（rc=139）的根因。
+            // conv2d 的循环变量（r=r+1, c=c+1）store 值来自 ADD，不受此限制。
+            if (!std::getenv("M2R_NO_LOADCHECK")) {
+                bool storeFromLoad = false;
+                for (auto* store : stores) {
+                    auto* storedVal = store->getOperand(0);
+                    if (auto* storedInst = dynamic_cast<IR::Instruction*>(storedVal)) {
+                        if (storedInst->getOpcode() == IR::Instruction::Opcode::LOAD) {
+                            storeFromLoad = true;
+                            break;
+                        }
+                    }
+                }
+                if (storeFromLoad) continue;
+            }
+        }
+
+        // ── 非 entry 变量快速路径：单一 store 且支配所有 load ──
+        // 循环体内声明的变量（int len=..; int k=0; int sum=0;）多是"声明即初始化、
+        // 随后在本作用域使用"。这类变量的 store 支配全部 load，不需要 PHI——标准
+        // IDF 会在循环 header 放一个多余 PHI（因为 def block 在循环里，其支配边界
+        // 含 header），该 PHI 合并 undef 与真值，是 crypto 错值的根源（main::len
+        // defBlocks=1 却 +1 phi）。此处对这类变量直接做 load→storedVal 替换，
+        // 绕开 PHI，既正确又消除多余 PHI。仅对非 entry 且单 store 生效（保守）。
+        // ★ 位置：必须在上述保守检查之后！快速路径曾放在保守检查之前，绕过了
+        //   CALL检查、支配子树检查、store-from-load 检查，导致 shuffle0 的 h.i
+        //   （def=1 use=4，跨 4 块活跃）被提升后寄存器分配器活跃区间分析缺陷→段错误。
+        //   移到保守检查后，有害变量先被 continue 跳过，快速路径只处理安全变量。
+        //   实测：此移动同时修复了 shuffle0/1/2（段错误）和 h-9-01/02/03（错值/超时）。
+        if (!isEntryAlloca && stores.size() == 1 && !std::getenv("M2R_NO_FASTPATH") &&
+            useBlocks.size() <= 3) {
+            auto* theStore = stores[0];
+            auto* storedVal = theStore->getOperand(0);
+            auto* storeBB = theStore->getParent();
+            // 检查：store 支配所有 load（同块内 store 在 load 前；异块 storeBB 支配 loadBB）
+            bool storeDominatesAllLoads = true;
+            for (auto* load : loads) {
+                auto* loadBB = load->getParent();
+                if (loadBB == storeBB) {
+                    // 同块：store 必须在 load 之前
+                    bool storeFirst = false;
+                    for (auto& in : storeBB->getInstructions()) {
+                        if (in.get() == theStore) { storeFirst = true; break; }
+                        if (in.get() == load) { storeFirst = false; break; }
+                    }
+                    if (!storeFirst) { storeDominatesAllLoads = false; break; }
+                } else {
+                    // 异块：storeBB 必须支配 loadBB
+                    auto dit = dom.find(loadBB);
+                    if (dit == dom.end() || !dit->second.count(storeBB)) {
+                        storeDominatesAllLoads = false; break;
+                    }
+                }
+            }
+            if (storeDominatesAllLoads) {
+                if (std::getenv("M2R_TRACE")) {
+                    fprintf(stderr, "[m2r-fast] %s::%s in %s defBlocks=%zu useBlocks=%zu loads=%zu\n",
+                            func->getName().c_str(), alloca->getName().c_str(),
+                            storeBB ? storeBB->getName().c_str() : "?",
+                            defBlocks.size(), useBlocks.size(), loads.size());
+                }
+                // 直接替换所有 load 为 storedVal，删除 load 与 store
+                for (auto* load : loads) {
+                    load->replaceAllUsesWith(storedVal);
+                    auto* pb = load->getParent();
+                    for (auto it = pb->begin(); it != pb->end(); ++it) {
+                        if (it->get() == load) { pb->erase(it); break; }
+                    }
+                }
+                auto* pb = theStore->getParent();
+                for (auto it = pb->begin(); it != pb->end(); ++it) {
+                    if (it->get() == theStore) { pb->erase(it); break; }
+                }
+                changed = true;
+                continue;
+            }
+            // store 不支配所有 load → 回退到标准 IDF-PHI 路径（下方）。
         }
 
         // 3b. 计算 PHI 放置位置（迭代支配边界）
@@ -333,7 +394,7 @@ bool mem2regOnFunction(IR::Function* func) {
         // 外层循环 header 根本不需要该变量的 PHI（crypto::j 根因）。
         // 过滤后只保留 allocaBB 支配的块，rename 时 valueStack 不会在这些块为空。
         auto phiBlocks = computeIteratedDominanceFrontier(defBlocks, df);
-        if (!isEntryAlloca) {
+        if (!isEntryAlloca && !std::getenv("M2R_NO_PHIFILTER")) {
             auto* allocaBB = alloca->getParent();
             size_t origSz = phiBlocks.size();
             std::unordered_set<IR::BasicBlock*> filtered;
@@ -349,6 +410,12 @@ bool mem2regOnFunction(IR::Function* func) {
                         func->getName().c_str(), alloca->getName().c_str(),
                         origSz, phiBlocks.size());
             }
+            // ★ PHI 过滤后 phiBlocks 为空 → 跳过提升。
+            // 当 PHI 过滤移除所有 PHI 块时，变量仍有多块 load 但无 PHI 合并，
+            // rename 会对未覆盖的 load 填 undef(0)→错值。
+            // （shuffle0 的 h.i 在 NO_FASTPATH 模式下 phiBlocks 1→0，rename 产生错值）
+            // 安全做法：保持 alloca/load/store，不提升。
+            if (phiBlocks.empty()) continue;
         }
         // Keep SSA construction within the pressure currently handled safely
         // by PHI lowering and the linear-scan allocator.  The count includes

@@ -891,6 +891,18 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     }
                     continue;
                 }
+                // ★ RET/TAIL：函数返回/尾调用，控制流离开当前函数。
+                //   下一指令属于不同函数，所有寄存器跟踪失效（不仅 caller-saved）。
+                //   修复 bug：get_random 的 li t0,65535 经 ret 后未被清除，
+                //   导致 init_matrix 的 li s0,65535 被误替换为 mv s0,t0（t0 已非 65535）。
+                if (opName == "ret" || opName == "tail" || opName == "jr") {
+                    compact.push_back(line);
+                    clearLoadEntries();
+                    lastSeen.clear();
+                    regLastWritten.clear();
+                    regToImm.clear();
+                    continue;
+                }
                 // ★ li 复用：BB 内相同立即数重复加载时消除或替换为 mv
                 // 借鉴 Cpl6 立即数加载复用。安全性：运行在 RA 之后，仅删指令或替 mv，
                 // 不改变寄存器分配（规则 14）。可通过 PEEPHOLE_NO_LI_REUSE=1 禁用。

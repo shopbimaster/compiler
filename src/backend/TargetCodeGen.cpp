@@ -1056,6 +1056,9 @@ void TargetCodeGen::emitInstruction(IR::Instruction& inst) {
     case Opc::SMULH:
         emitBinOp(inst);
         break;
+    case Opc::WIDE_SMOD_MUL:
+        emitWideSmodMul(inst);
+        break;
     case Opc::ICMP:
         emitIcmp(inst);
         break;
@@ -1921,6 +1924,35 @@ void TargetCodeGen::emitBinOp(IR::Instruction& inst) {
 
     if (!rdInReg) {
         code += storeFromReg(&inst, dest);
+    }
+    emitter.emitText(code);
+}
+
+void TargetCodeGen::emitWideSmodMul(IR::Instruction& inst) {
+    std::string code;
+
+    std::string lhsReg = getValueReg(inst.getOperand(0));
+    std::string rhsReg = getValueReg(inst.getOperand(1));
+    std::string destReg = getValueReg(&inst);
+
+    if (lhsReg.empty()) {
+        code += loadToReg(inst.getOperand(0), "t0");
+        lhsReg = "t0";
+    }
+    if (rhsReg.empty()) {
+        code += loadToReg(inst.getOperand(1), "t1");
+        rhsReg = "t1";
+    }
+
+    // 输入为符号扩展的 i32 值。RV64 全乘积保留完整 64 位结果（不同于 mulw），
+    // 随后做有符号 64 位取余，实现 (a * b) % c 的宽模乘。
+    code += "  mul     t2, " + lhsReg + ", " + rhsReg + "\n";
+    code += loadToReg(inst.getOperand(2), "t1");
+
+    std::string resultReg = destReg.empty() ? "t0" : destReg;
+    code += "  rem     " + resultReg + ", t2, t1\n";
+    if (destReg.empty()) {
+        code += storeFromReg(&inst, resultReg);
     }
     emitter.emitText(code);
 }

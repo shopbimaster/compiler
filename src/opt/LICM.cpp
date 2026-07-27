@@ -12,6 +12,8 @@
 #include <unordered_set>
 #include <vector>
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 
 namespace Opt {
 namespace {
@@ -338,7 +340,15 @@ bool loopInvariantCodeMotion(IR::Module* mod) {
     // 计算模块级只读全局变量（一次分析，所有函数复用）
     auto moduleReadOnlyGlobals = readOnlyGlobalAnalysis(mod);
     // ★ PureFuncDect：计算纯函数集合（一次分析，所有函数复用）
-    auto pureFuncs = computePureFunctions(mod);
+    // 逃生开关 OPT_DISABLE_PUREFUNC=1：返回空集，LICM 不提升任何 CALL
+    std::unordered_set<IR::Function*> pureFuncs;
+    static const bool disablePure = [] {
+        const char* v = std::getenv("OPT_DISABLE_PUREFUNC");
+        return v && std::string(v) == "1";
+    }();
+    if (!disablePure) {
+        pureFuncs = computePureFunctions(mod);
+    }
 
     bool changed = true;
     bool anyChanged = false;
