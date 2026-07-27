@@ -509,7 +509,7 @@ bool findFinalReduction(
         }
     }
 
-    if (loads.size() != 1 || stores.size() > 1 ||
+    if (loads.size() != 1 ||
         callsWithMatrix.empty() ||
         loads[0]->getParent()->getParent() != caller) {
         return false;
@@ -672,6 +672,7 @@ bool matrixIsValidLiveIn(
     IR::Function* caller,
     const std::vector<IR::Instruction*>& allowedCalls,
     IR::BasicBlock* loopPreheader) {
+    std::vector<IR::Instruction*> loads;
     std::vector<IR::Instruction*> stores;
     for (auto& function : module->getFunctions()) {
         for (auto& block : function->getBlocks()) {
@@ -679,7 +680,7 @@ bool matrixIsValidLiveIn(
                 if (instruction->getOpcode() == Opc::LOAD &&
                     instruction->getNumOperands() == 1 &&
                     rootGlobal(instruction->getOperand(0)) == matrix) {
-                    return false;
+                    loads.push_back(instruction.get());
                 }
                 if (instruction->getOpcode() == Opc::STORE &&
                     instruction->getNumOperands() == 2 &&
@@ -706,7 +707,6 @@ bool matrixIsValidLiveIn(
         }
     }
 
-    if (stores.size() > 1) return false;
     auto successors = buildSuccessors(caller);
     std::vector<IR::BasicBlock*> worklist = {loopPreheader};
     std::unordered_set<IR::BasicBlock*> reachable = {loopPreheader};
@@ -719,9 +719,12 @@ bool matrixIsValidLiveIn(
             }
         }
     }
-    for (auto* store : stores) {
-        if (store->getParent()->getParent() != caller ||
-            reachable.count(store->getParent())) {
+    std::vector<IR::Instruction*> directAccesses = loads;
+    directAccesses.insert(
+        directAccesses.end(), stores.begin(), stores.end());
+    for (auto* access : directAccesses) {
+        if (access->getParent()->getParent() != caller ||
+            reachable.count(access->getParent())) {
             return false;
         }
     }
