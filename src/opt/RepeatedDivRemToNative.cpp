@@ -283,11 +283,21 @@ bool replaceWithNativeDigitExtraction(IR::Function* function,
     auto* entry = function->getEntryBlock();
     if (!entry) return false;
 
+    // Detach every operand before destroying any instruction.  Later
+    // instructions in the old body may still reference values defined near
+    // the entry, so erasing one instruction at a time can leave dangling
+    // operands for the remaining cleanup.
+    for (auto& block : function->getBlocks()) {
+        for (auto& instruction : block->getInstructions()) {
+            for (unsigned index = 0;
+                 index < instruction->getNumOperands(); ++index) {
+                instruction->setOperand(index, nullptr);
+            }
+        }
+    }
     for (auto& block : function->getBlocks()) {
         while (!block->empty()) {
-            auto it = block->begin();
-            it->get()->dropAllUses();
-            block->erase(it);
+            block->erase(block->begin());
         }
     }
     auto& blocks = function->getBlocks();
