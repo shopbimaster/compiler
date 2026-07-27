@@ -522,6 +522,9 @@ void runP0(IR::Module* mod) {
     if (bitOpPatternRecognition(mod)) {
         p0Changed = true;
     }
+    if (hoistRecursiveCallGuards(mod)) {
+        p0Changed = true;
+    }
     constantFolding(mod);
     deadCodeElimination(mod);
 
