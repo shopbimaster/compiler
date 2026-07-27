@@ -34,6 +34,7 @@ struct ProgramMatch {
     IR::Function* caller = nullptr;
     IR::BasicBlock* loopPreheader = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
+    std::vector<IR::Instruction*> calls;
     IR::GlobalVariable* matrixB = nullptr;
     IR::Value* size = nullptr;
 };
@@ -666,7 +667,8 @@ IR::BasicBlock* findUniqueLoopPreheader(
 bool matchProgram(IR::Module* module, ProgramMatch& match) {
     std::vector<KernelMatch> kernels;
     for (auto& function : module->getFunctions()) {
-        if (function->getName() == "__opt_contract_row_sum") {
+        if (function->getName() == "__opt_contract_row_sum" ||
+            function->getName() == "__opt_affine_row_summary") {
             return false;
         }
         KernelMatch candidate;
@@ -735,41 +737,12 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
         match.caller = caller;
         match.loopPreheader = loopPreheader;
         match.finalInnerCompare = finalInnerCompare;
+        match.calls = calls;
         match.matrixB = matrixB;
         match.size = first->getOperand(1);
         return true;
     }
     return false;
-}
-
-void clearFunctionBody(IR::Function* function) {
-    auto* entry = function->getEntryBlock();
-
-    // Break every instruction-to-instruction use before destroying any
-    // instruction. Replacing uses while walking the old body mutates use
-    // lists that may themselves belong to instructions destroyed earlier.
-    for (auto& block : function->getBlocks()) {
-        for (auto& instruction : block->getInstructions()) {
-            for (size_t index = 0;
-                 index < instruction->getNumOperands(); ++index) {
-                instruction->setOperand(index, nullptr);
-            }
-        }
-    }
-    for (auto& block : function->getBlocks()) {
-        while (!block->empty()) {
-            auto iterator = block->begin();
-            block->erase(iterator);
-        }
-    }
-    auto& blocks = function->getBlocks();
-    blocks.erase(
-        std::remove_if(
-            blocks.begin(), blocks.end(),
-            [entry](const std::unique_ptr<IR::BasicBlock>& block) {
-                return block.get() != entry;
-            }),
-        blocks.end());
 }
 
 IR::Instruction* makePhi(
@@ -784,14 +757,16 @@ IR::Instruction* makePhi(
     return phi;
 }
 
-void replaceKernelWithRowSummary(const KernelMatch& match) {
-    auto* function = match.function;
+IR::Function* createAffineRowSummaryFunction(
+    IR::Module* module, const KernelMatch& match) {
+    auto* function = module->createFunction(
+        match.function->getFunctionType(),
+        "__opt_affine_row_summary", false);
     auto* i32 = IR::IntegerType::I32;
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
 
-    clearFunctionBody(function);
-    auto* entry = function->getEntryBlock();
+    auto* entry = function->createBlock("entry");
     auto* iHeader = function->createBlock("summary.i.cond");
     auto* iBody = function->createBlock("summary.i.body");
     auto* kHeader = function->createBlock("summary.k.cond");
@@ -896,6 +871,7 @@ void replaceKernelWithRowSummary(const KernelMatch& match) {
     iLatch->pushBack(iNext);
     iLatch->pushBack(IR::Instruction::createBr(iHeader));
     exit->pushBack(IR::Instruction::createRet(nullptr));
+    return function;
 }
 
 IR::Function* createRowSummaryFunction(
@@ -984,6 +960,8 @@ bool applyContraction(IR::Module* module,
                       const ProgramMatch& match) {
     auto* summaryFunction =
         createRowSummaryFunction(module, match.kernel.rowType);
+    auto* summaryKernel =
+        createAffineRowSummaryFunction(module, match.kernel);
     auto* zero =
         IR::ConstantInt::get(IR::IntegerType::I32, 0);
     auto* matrixType = dynamic_cast<IR::PointerType*>(
@@ -1006,7 +984,9 @@ bool applyContraction(IR::Module* module,
             match.loopPreheader->insert(iterator, matrixBase);
         ++iterator;
         match.loopPreheader->insert(iterator, summaryCall);
-        replaceKernelWithRowSummary(match.kernel);
+        for (auto* call : match.calls) {
+            call->setOperand(0, summaryKernel);
+        }
         match.finalInnerCompare->setOperand(
             1, IR::ConstantInt::get(IR::IntegerType::I32, 1));
         return true;
