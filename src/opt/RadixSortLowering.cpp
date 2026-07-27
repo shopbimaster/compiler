@@ -1,9 +1,11 @@
 #include "opt/Optimizer.h"
 
 #include <algorithm>
-#include <memory>
+#include <limits>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace Opt {
@@ -12,17 +14,21 @@ namespace {
 using Opc = IR::Instruction::Opcode;
 using ArgumentSlots = std::unordered_map<IR::Value*, IR::Argument*>;
 
-constexpr int kSourceRadix = 16;
 constexpr int kRadixBits = 10;
 constexpr int kRadixSize = 1 << kRadixBits;
 constexpr int kRadixMask = kRadixSize - 1;
 
+struct DigitMatch {
+    int radix = 0;
+    unsigned bitsPerDigit = 0;
+};
+
 struct RadixMatch {
     IR::Function* sortFunction = nullptr;
     IR::Function* digitFunction = nullptr;
-    IR::Instruction* externalCall = nullptr;
-    IR::GlobalVariable* dataGlobal = nullptr;
+    std::vector<IR::Instruction*> externalCalls;
     IR::ArrayType* dataType = nullptr;
+    unsigned bitsPerDigit = 0;
 };
 
 bool isConstant(IR::Value* value, int64_t expected) {
@@ -39,6 +45,19 @@ bool hasConstantOperand(IR::Instruction* instruction, int64_t expected) {
         }
     }
     return false;
+}
+
+bool isPowerOfTwo(int64_t value) {
+    return value > 1 && (value & (value - 1)) == 0;
+}
+
+unsigned exactLog2(int64_t value) {
+    unsigned bits = 0;
+    while (value > 1) {
+        value >>= 1;
+        ++bits;
+    }
+    return bits;
 }
 
 IR::Function* calledFunction(IR::Instruction* instruction) {
@@ -142,29 +161,22 @@ IR::Instruction* rootAlloca(IR::Value* value) {
     return rootAllocaImpl(value, visiting);
 }
 
-IR::GlobalVariable* rootGlobalImpl(
-    IR::Value* value, std::unordered_set<IR::Value*>& visiting) {
-    if (!value || !visiting.insert(value).second) return nullptr;
-    if (auto* global = dynamic_cast<IR::GlobalVariable*>(value)) {
-        visiting.erase(value);
-        return global;
+IR::GlobalVariable* exactGlobalArrayBase(IR::Value* value) {
+    auto* gep = dynamic_cast<IR::Instruction*>(value);
+    if (!gep || gep->getOpcode() != Opc::GETELEMENTPTR ||
+        gep->getNumOperands() < 2) {
+        return nullptr;
     }
-    auto* instruction = dynamic_cast<IR::Instruction*>(value);
-    if (instruction &&
-        instruction->getOpcode() == Opc::GETELEMENTPTR &&
-        instruction->getNumOperands() >= 2) {
-        auto* result =
-            rootGlobalImpl(instruction->getOperand(0), visiting);
-        visiting.erase(value);
-        return result;
+    auto* global =
+        dynamic_cast<IR::GlobalVariable*>(gep->getOperand(0));
+    if (!global) return nullptr;
+    for (unsigned index = 1;
+         index < gep->getNumOperands(); ++index) {
+        if (!isConstant(gep->getOperand(index), 0)) {
+            return nullptr;
+        }
     }
-    visiting.erase(value);
-    return nullptr;
-}
-
-IR::GlobalVariable* rootGlobal(IR::Value* value) {
-    std::unordered_set<IR::Value*> visiting;
-    return rootGlobalImpl(value, visiting);
+    return global;
 }
 
 std::vector<IR::Instruction*> collectCalls(
@@ -182,7 +194,8 @@ std::vector<IR::Instruction*> collectCalls(
     return calls;
 }
 
-bool matchDigitFunction(IR::Function* function) {
+bool matchDigitFunction(
+    IR::Function* function, DigitMatch& match) {
     if (!function || function->isExternal() ||
         function->getNumArgs() != 2) {
         return false;
@@ -208,17 +221,11 @@ bool matchDigitFunction(IR::Function* function) {
             auto* instruction = owned.get();
             switch (instruction->getOpcode()) {
             case Opc::SDIV:
-                if (division ||
-                    !hasConstantOperand(instruction, kSourceRadix)) {
-                    return false;
-                }
+                if (division) return false;
                 division = instruction;
                 break;
             case Opc::SREM:
-                if (remainder ||
-                    !hasConstantOperand(instruction, kSourceRadix)) {
-                    return false;
-                }
+                if (remainder) return false;
                 remainder = instruction;
                 break;
             case Opc::ICMP:
@@ -253,6 +260,22 @@ bool matchDigitFunction(IR::Function* function) {
         return false;
     }
 
+    auto* divisor = division->getNumOperands() == 2
+        ? dynamic_cast<IR::ConstantInt*>(
+              division->getOperand(1))
+        : nullptr;
+    auto* remainderDivisor = remainder->getNumOperands() == 2
+        ? dynamic_cast<IR::ConstantInt*>(
+              remainder->getOperand(1))
+        : nullptr;
+    if (!divisor || !remainderDivisor ||
+        divisor->getValue() != remainderDivisor->getValue() ||
+        !isPowerOfTwo(divisor->getValue()) ||
+        divisor->getValue() >
+            std::numeric_limits<int>::max()) {
+        return false;
+    }
+
     auto* divisionInput =
         dynamic_cast<IR::Instruction*>(division->getOperand(0));
     auto* remainderInput =
@@ -283,12 +306,17 @@ bool matchDigitFunction(IR::Function* function) {
             ++divisionStores;
         }
     }
-    return divisionStores == 1;
+    if (divisionStores != 1) return false;
+    match.radix = static_cast<int>(divisor->getValue());
+    match.bitsPerDigit = exactLog2(divisor->getValue());
+    return match.bitsPerDigit > 0 &&
+           match.bitsPerDigit < 31;
 }
 
 bool matchRecursiveSort(
     IR::Module* module, IR::Function* function,
-    IR::Function* digitFunction, RadixMatch& match) {
+    IR::Function* digitFunction,
+    const DigitMatch& digitMatch, RadixMatch& match) {
     if (!function || function->isExternal() ||
         function->getNumArgs() != 4) {
         return false;
@@ -331,7 +359,8 @@ bool matchRecursiveSort(
                     : nullptr;
                 if (array &&
                     array->getElementType() == IR::IntegerType::I32 &&
-                    array->getNumElements() == kSourceRadix) {
+                    array->getNumElements() ==
+                        static_cast<unsigned>(digitMatch.radix)) {
                     bucketArrays.push_back(instruction);
                 }
             }
@@ -348,7 +377,8 @@ bool matchRecursiveSort(
             }
 
             if (instruction->getOpcode() == Opc::ICMP) {
-                if (hasConstantOperand(instruction, kSourceRadix) &&
+                if (hasConstantOperand(
+                        instruction, digitMatch.radix) &&
                     instruction->getName() == "slt") {
                     ++bucketLoopBounds;
                 }
@@ -403,26 +433,30 @@ bool matchRecursiveSort(
     for (auto* call : calls) {
         if (call != recursive) externalCalls.push_back(call);
     }
-    if (externalCalls.size() != 1) return false;
+    if (externalCalls.empty()) return false;
 
-    auto* external = externalCalls.front();
-    if (external->getNumOperands() != 5 ||
-        !isConstant(external->getOperand(1), 9) ||
-        !isConstant(external->getOperand(3), 0)) {
-        return false;
-    }
-    auto* global = rootGlobal(external->getOperand(2));
-    auto* globalPointer = global
-        ? dynamic_cast<IR::PointerType*>(global->getType())
-        : nullptr;
-    auto* array = globalPointer
-        ? dynamic_cast<IR::ArrayType*>(
-              globalPointer->getPointeeType())
-        : nullptr;
-    if (!array ||
-        array->getElementType() != IR::IntegerType::I32 ||
-        array->getNumElements() < 1024) {
-        return false;
+    IR::ArrayType* array = nullptr;
+    for (auto* external : externalCalls) {
+        if (external->getNumOperands() != 5) return false;
+        auto* global =
+            exactGlobalArrayBase(external->getOperand(2));
+        auto* globalPointer = global
+            ? dynamic_cast<IR::PointerType*>(global->getType())
+            : nullptr;
+        auto* candidate = globalPointer
+            ? dynamic_cast<IR::ArrayType*>(
+                  globalPointer->getPointeeType())
+            : nullptr;
+        if (!candidate ||
+            candidate->getElementType() != IR::IntegerType::I32 ||
+            candidate->getNumElements() < 2 ||
+            candidate->getNumElements() >
+                static_cast<unsigned>(
+                    std::numeric_limits<int32_t>::max()) ||
+            (array && candidate != array)) {
+            return false;
+        }
+        array = candidate;
     }
 
     auto digitCallsAll = collectCalls(module, digitFunction);
@@ -433,9 +467,9 @@ bool matchRecursiveSort(
 
     match.sortFunction = function;
     match.digitFunction = digitFunction;
-    match.externalCall = external;
-    match.dataGlobal = global;
+    match.externalCalls = std::move(externalCalls);
     match.dataType = array;
+    match.bitsPerDigit = digitMatch.bitsPerDigit;
     return true;
 }
 
@@ -447,19 +481,31 @@ bool findMatch(IR::Module* module, RadixMatch& match) {
         }
     }
 
-    std::vector<IR::Function*> digitFunctions;
+    struct DigitCandidate {
+        IR::Function* function = nullptr;
+        DigitMatch match;
+    };
+    std::vector<DigitCandidate> digitFunctions;
     for (auto& function : module->getFunctions()) {
-        if (matchDigitFunction(function.get())) {
-            digitFunctions.push_back(function.get());
+        DigitMatch digitMatch;
+        if (matchDigitFunction(function.get(), digitMatch)) {
+            digitFunctions.push_back(
+                {function.get(), digitMatch});
+        }
+    }
+    for (auto& function : module->getFunctions()) {
+        if (function->getName() == "__opt_radix_slow") {
+            return false;
         }
     }
 
     std::vector<RadixMatch> matches;
-    for (auto* digit : digitFunctions) {
+    for (const auto& digit : digitFunctions) {
         for (auto& function : module->getFunctions()) {
             RadixMatch candidate;
             if (matchRecursiveSort(
-                    module, function.get(), digit, candidate)) {
+                    module, function.get(), digit.function,
+                    digit.match, candidate)) {
                 matches.push_back(candidate);
             }
         }
@@ -467,31 +513,6 @@ bool findMatch(IR::Module* module, RadixMatch& match) {
     if (matches.size() != 1) return false;
     match = matches.front();
     return true;
-}
-
-void clearFunctionBody(IR::Function* function) {
-    auto* entry = function->getEntryBlock();
-    for (auto& block : function->getBlocks()) {
-        for (auto& instruction : block->getInstructions()) {
-            for (unsigned index = 0;
-                 index < instruction->getNumOperands(); ++index) {
-                instruction->setOperand(index, nullptr);
-            }
-        }
-    }
-    for (auto& block : function->getBlocks()) {
-        while (!block->empty()) {
-            block->erase(block->begin());
-        }
-    }
-    auto& blocks = function->getBlocks();
-    blocks.erase(
-        std::remove_if(
-            blocks.begin(), blocks.end(),
-            [entry](const std::unique_ptr<IR::BasicBlock>& block) {
-                return block.get() != entry;
-            }),
-        blocks.end());
 }
 
 IR::Instruction* makePhi(
@@ -513,20 +534,22 @@ IR::Instruction* elementAddress(
 }
 
 void buildIterativeRadix(
+    IR::Function* function,
+    IR::Function* slowFunction,
     const RadixMatch& match,
     IR::GlobalVariable* scratchGlobal,
     IR::GlobalVariable* countsGlobal,
     IR::ArrayType* countsType) {
-    auto* function = match.sortFunction;
     auto* i32 = IR::IntegerType::I32;
+    auto* i1 = IR::IntegerType::I1;
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
+    auto* trueValue = IR::ConstantInt::get(i1, 1);
     auto* radixSize = IR::ConstantInt::get(i32, kRadixSize);
     auto* radixMask = IR::ConstantInt::get(i32, kRadixMask);
     auto* radixBits = IR::ConstantInt::get(i32, kRadixBits);
 
-    clearFunctionBody(function);
-    auto* entry = function->getEntryBlock();
+    auto* entry = function->createBlock("entry");
     auto* maxHeader = function->createBlock("radix.max.cond");
     auto* maxBody = function->createBlock("radix.max.body");
     auto* setup = function->createBlock("radix.setup");
@@ -544,6 +567,7 @@ void buildIterativeRadix(
     auto* copyHeader = function->createBlock("radix.copy.cond");
     auto* copyBody = function->createBlock("radix.copy.body");
     auto* exit = function->createBlock("radix.exit");
+    auto* slow = function->createBlock("radix.slow");
 
     auto* length = IR::Instruction::createBinOp(
         Opc::SUB, i32, "radix.length",
@@ -561,7 +585,30 @@ void buildIterativeRadix(
     entry->pushBack(dataBase);
     entry->pushBack(scratchBase);
     entry->pushBack(countsBase);
-    entry->pushBack(IR::Instruction::createBr(maxHeader));
+    auto* leftNonnegative = IR::Instruction::createCmp(
+        Opc::ICMP, function->getArg(2), zero, "sge");
+    auto* rangeOrdered = IR::Instruction::createCmp(
+        Opc::ICMP, function->getArg(3),
+        function->getArg(2), "sge");
+    auto* withinArray = IR::Instruction::createCmp(
+        Opc::ICMP, function->getArg(3),
+        IR::ConstantInt::get(
+            i32, static_cast<int32_t>(
+                match.dataType->getNumElements())),
+        "sle");
+    auto* lowerBoundsSafe = IR::Instruction::createBinOp(
+        Opc::AND, i1, "radix.bounds.lower",
+        leftNonnegative, rangeOrdered);
+    auto* boundsSafe = IR::Instruction::createBinOp(
+        Opc::AND, i1, "radix.bounds.safe",
+        lowerBoundsSafe, withinArray);
+    entry->pushBack(leftNonnegative);
+    entry->pushBack(rangeOrdered);
+    entry->pushBack(withinArray);
+    entry->pushBack(lowerBoundsSafe);
+    entry->pushBack(boundsSafe);
+    entry->pushBack(IR::Instruction::createCondBr(
+        boundsSafe, maxHeader, slow));
 
     auto* maxIndexNext = IR::Instruction::createBinOp(
         Opc::ADD, i32, "radix.max.i.next", nullptr, one);
@@ -573,9 +620,16 @@ void buildIterativeRadix(
     auto* maximum = makePhi(
         i32, "radix.max", zero, entry,
         maxNext, maxBody);
+    auto* nonnegativeNext = IR::Instruction::createBinOp(
+        Opc::AND, i1, "radix.nonnegative.next",
+        nullptr, nullptr);
+    auto* allNonnegative = makePhi(
+        i1, "radix.nonnegative", trueValue, entry,
+        nonnegativeNext, maxBody);
     maxIndexNext->setOperand(0, maxIndex);
     maxHeader->pushBack(maxIndex);
     maxHeader->pushBack(maximum);
+    maxHeader->pushBack(allNonnegative);
     auto* maxCompare = IR::Instruction::createCmp(
         Opc::ICMP, maxIndex, length, "slt");
     maxHeader->pushBack(maxCompare);
@@ -588,13 +642,19 @@ void buildIterativeRadix(
         i32, scanAddress, "radix.max.value");
     auto* greater = IR::Instruction::createCmp(
         Opc::ICMP, scanValue, maximum, "sgt");
+    auto* valueNonnegative = IR::Instruction::createCmp(
+        Opc::ICMP, scanValue, zero, "sge");
     maxNext->setOperand(0, greater);
     maxNext->setOperand(1, scanValue);
     maxNext->setOperand(2, maximum);
+    nonnegativeNext->setOperand(0, allNonnegative);
+    nonnegativeNext->setOperand(1, valueNonnegative);
     maxBody->pushBack(scanAddress);
     maxBody->pushBack(scanValue);
     maxBody->pushBack(greater);
+    maxBody->pushBack(valueNonnegative);
     maxBody->pushBack(maxNext);
+    maxBody->pushBack(nonnegativeNext);
     maxBody->pushBack(maxIndexNext);
     maxBody->pushBack(IR::Instruction::createBr(maxHeader));
 
@@ -621,7 +681,41 @@ void buildIterativeRadix(
     setup->pushBack(remainingPasses);
     setup->pushBack(below10);
     setup->pushBack(passCount);
-    setup->pushBack(IR::Instruction::createBr(passHeader));
+
+    IR::Value* requiredRound = zero;
+    int requiredDigit = 1;
+    int64_t threshold = 1LL << match.bitsPerDigit;
+    while (threshold <= std::numeric_limits<int32_t>::max()) {
+        auto* reachesThreshold = IR::Instruction::createCmp(
+            Opc::ICMP, maximum,
+            IR::ConstantInt::get(i32, threshold), "sge");
+        auto* nextRequiredRound =
+            IR::Instruction::createSelect(
+                reachesThreshold,
+                IR::ConstantInt::get(i32, requiredDigit),
+                requiredRound, "radix.required.round");
+        setup->pushBack(reachesThreshold);
+        setup->pushBack(nextRequiredRound);
+        requiredRound = nextRequiredRound;
+
+        if (threshold >
+            std::numeric_limits<int32_t>::max() /
+                (1LL << match.bitsPerDigit)) {
+            break;
+        }
+        threshold <<= match.bitsPerDigit;
+        ++requiredDigit;
+    }
+    auto* roundEnough = IR::Instruction::createCmp(
+        Opc::ICMP, function->getArg(0),
+        requiredRound, "sge");
+    auto* canUseFastPath = IR::Instruction::createBinOp(
+        Opc::AND, i1, "radix.fast.path",
+        allNonnegative, roundEnough);
+    setup->pushBack(roundEnough);
+    setup->pushBack(canUseFastPath);
+    setup->pushBack(IR::Instruction::createCondBr(
+        canUseFastPath, passHeader, slow));
 
     auto* passNext = IR::Instruction::createBinOp(
         Opc::ADD, i32, "radix.pass.next", nullptr, one);
@@ -829,6 +923,12 @@ void buildIterativeRadix(
     copyBody->pushBack(IR::Instruction::createBr(copyHeader));
 
     exit->pushBack(IR::Instruction::createRet(nullptr));
+    slow->pushBack(IR::Instruction::createCall(
+        slowFunction->getFunctionType(), slowFunction,
+        {function->getArg(0), function->getArg(1),
+         function->getArg(2), function->getArg(3)},
+        ""));
+    slow->pushBack(IR::Instruction::createRet(nullptr));
 }
 
 } // namespace
@@ -845,8 +945,19 @@ bool radixSortLowering(IR::Module* module) {
     auto* counts = module->createGlobalVariable(
         IR::PointerType::get(countsType),
         "__opt_radix_counts", false);
+
+    auto* slowFunction = match.sortFunction;
+    auto* functionType = slowFunction->getFunctionType();
+    auto originalName = slowFunction->getName();
+    slowFunction->setName("__opt_radix_slow");
+    auto* fastFunction = module->createFunction(
+        functionType, originalName, false);
+    for (auto* call : match.externalCalls) {
+        call->setOperand(0, fastFunction);
+    }
     buildIterativeRadix(
-        match, scratch, counts, countsType);
+        fastFunction, slowFunction, match,
+        scratch, counts, countsType);
     return true;
 }
 
