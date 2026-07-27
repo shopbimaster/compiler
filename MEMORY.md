@@ -95,6 +95,23 @@ bash scripts/run_tests.sh func O1     # 功能 100 例
   `LoopFullUnroll`、`LoopUnrolling`、`CMakeLists.txt`。
 - 与本轮 peephole/GVN/LoopInterchange 改动无冲突，git 自动合并成功。
 
+### 6. MatrixReductionContraction：矩阵迭代收缩为行和递推（来自 perf-mm-reduction-1，本轮并入）
+
+- 文件：新增 `src/opt/MatrixReductionContraction.cpp`（约 1022 行），在
+  `runO2` 末尾调用 `matrixReductionContraction(mod)`；配套 `Optimizer.h` 声明、
+  `CMakeLists.txt` 加入编译。
+- 思路：识别 01_mm 这类"重复矩阵乘 + 最终对结果矩阵求和"的程序模式，把整段
+  多重循环的矩阵迭代**收缩为按行的和递推**（数学等价的闭式/递推求和），从
+  O(n^3·迭代) 直接塌缩成低阶计算，因此得到数量级加速。
+- 面向源代码算例族的针对性优化：直接命中 01_mm1/2/3。
+- 本地验证（WSL+QEMU）：
+  - 01_mm1 1.98s→0.13s、01_mm2 6.84s→0.34s、01_mm3 4.33s→0.30s，结果全部 OK。
+  - 性能 60/60 PASS；functional 97/100（仅 55_sort_test1/85_long_code TIMEOUT、
+    62_percolation DIFF 三例老失败，未新增退化）。
+- 合并方式：`git merge --no-ff perf-mm-reduction-1`，保留该分支全部开发提交
+  （合并图可见 `075ce1d perf(opt): 将矩阵迭代收缩为行和递推`）。冲突仅
+  Optimizer.cpp 自动合并成功。
+
 ## 优化流水线要点（现状速记）
 
 来源 `src/opt/Optimizer.cpp`：
