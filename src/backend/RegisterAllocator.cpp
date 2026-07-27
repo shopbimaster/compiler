@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>   // [EXP-SCAFFOLD] std::getenv for A/B switch
+#include <set>
+#include <string>
 #include <unordered_set>
 
 namespace Backend {
@@ -32,14 +36,21 @@ void RegisterAllocator::allocate(IR::Function& func) {
     spillMap.clear();
     floatValues.clear();
     intervals.clear();
+    valToInterval.clear();
     // usedCalleeSaved 不清空 — reserveReg() 在 allocate() 之前调用会预填充
     nextSpillSlot = 0;
     spillSlotSize = 0;
 
     maxInstId = assignInstructionIds(func);
     buildIntervals(func);
-    linearScan();
-    coalescePhis(func);  // 修复安全检查后重新启用
+    if (useGraphColoring()) {
+        colorAllocate();   // 图着色分配器（默认；RA_ALLOCATOR=linear 可切回线扫）
+    } else {
+        linearScan();
+    }
+    if (!std::getenv("DEBUG_DISABLE_PHI_COALESCE")) {
+        coalescePhis(func);  // 修复安全检查后重新启用
+    }
 }
 
 // ★ K1+K2 修复：重建 usedCalleeSaved，移除两种情况下残留的无用寄存器：
@@ -96,23 +107,6 @@ int RegisterAllocator::assignInstructionIds(IR::Function& func) {
 }
 
 void RegisterAllocator::buildIntervals(IR::Function& func) {
-    // ================================================================
-    // Collect call instruction IDs (needed for crossesCall analysis)
-    // ================================================================
-    std::vector<int> callIds;
-    for (auto& bb : func.getBlocks()) {
-        for (auto& inst : bb->getInstructions()) {
-            if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
-                auto it = instId.find(inst.get());
-                if (it != instId.end()) {
-                    callIds.push_back(it->second);
-                }
-            }
-        }
-    }
-    // Sort for efficient interval checking
-    std::sort(callIds.begin(), callIds.end());
-
     std::unordered_map<IR::Value*, int> firstSeen;
     std::unordered_map<IR::Value*, int> lastSeen;
     // Track all blocks where a value is used (for loop-aware liveness extension)
@@ -472,10 +466,129 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
     }
 
     // ================================================================
+    // CFG liveness extension
+    //
+    // The allocator represents liveness as one conservative numeric interval,
+    // but block layout order is not execution order. Loop-only heuristics miss
+    // values that cross branches or PHI edges, allowing two simultaneously live
+    // values to receive the same physical register. Compute standard block-level
+    // live-in/live-out sets and widen the numeric intervals to cover every block
+    // in which a value is live. PHI incoming values are uses on predecessor
+    // edges, not uses in the PHI's block.
+    // ================================================================
+    if (!std::getenv("DEBUG_DISABLE_CFG_LIVENESS")) {
+    using ValueSet = std::unordered_set<IR::Value*>;
+    std::unordered_map<IR::BasicBlock*, ValueSet> blockUses;
+    std::unordered_map<IR::BasicBlock*, ValueSet> blockDefs;
+    std::unordered_map<IR::BasicBlock*, ValueSet> phiEdgeUses;
+    std::unordered_map<IR::BasicBlock*, ValueSet> liveIn;
+    std::unordered_map<IR::BasicBlock*, ValueSet> liveOut;
+
+    auto isTracked = [&](IR::Value* value) {
+        return value && firstSeen.find(value) != firstSeen.end();
+    };
+
+    for (auto& bb : func.getBlocks()) {
+        auto* block = bb.get();
+        blockUses[block];
+        blockDefs[block];
+        phiEdgeUses[block];
+        liveIn[block];
+        liveOut[block];
+
+        // PHIs define their results at block entry even if earlier passes have
+        // moved a non-PHI instruction before them in the instruction list.
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::PHI &&
+                isTracked(inst.get())) {
+                blockDefs[block].insert(inst.get());
+            }
+        }
+    }
+
+    if (auto* entry = func.getEntryBlock()) {
+        for (unsigned i = 0; i < func.getNumArgs(); ++i) {
+            auto* arg = func.getArg(i);
+            if (isTracked(arg)) blockDefs[entry].insert(arg);
+        }
+    }
+
+    for (auto& bb : func.getBlocks()) {
+        auto* block = bb.get();
+        auto& defs = blockDefs[block];
+        auto& uses = blockUses[block];
+
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == IR::Instruction::Opcode::PHI) {
+                for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                    auto* incoming = inst->getOperand(i);
+                    auto* pred = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+                    if (pred && isTracked(incoming)) {
+                        phiEdgeUses[pred].insert(incoming);
+                    }
+                }
+                continue;
+            }
+
+            for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
+                auto* operand = inst->getOperand(i);
+                if (isTracked(operand) && !defs.count(operand)) {
+                    uses.insert(operand);
+                }
+            }
+            if (isTracked(inst.get())) defs.insert(inst.get());
+        }
+    }
+
+    bool livenessChanged = true;
+    while (livenessChanged) {
+        livenessChanged = false;
+        for (auto it = func.getBlocks().rbegin(); it != func.getBlocks().rend(); ++it) {
+            auto* block = it->get();
+            ValueSet newOut = phiEdgeUses[block];
+            for (auto* succ : succs[block]) {
+                newOut.insert(liveIn[succ].begin(), liveIn[succ].end());
+            }
+
+            ValueSet newIn = blockUses[block];
+            for (auto* value : newOut) {
+                if (!blockDefs[block].count(value)) newIn.insert(value);
+            }
+
+            if (newOut != liveOut[block] || newIn != liveIn[block]) {
+                liveOut[block] = std::move(newOut);
+                liveIn[block] = std::move(newIn);
+                livenessChanged = true;
+            }
+        }
+    }
+
+    for (auto& bb : func.getBlocks()) {
+        auto* block = bb.get();
+        auto minIt = blockMinId.find(block);
+        auto maxIt = blockMaxId.find(block);
+        if (minIt == blockMinId.end() || maxIt == blockMaxId.end() ||
+            minIt->second == INT_MAX || maxIt->second < 0) {
+            continue;
+        }
+
+        auto widenForBlock = [&](IR::Value* value) {
+            auto firstIt = firstSeen.find(value);
+            if (firstIt == firstSeen.end()) return;
+            firstIt->second = std::min(firstIt->second, minIt->second);
+            lastSeen[value] = std::max(lastSeen[value], maxIt->second);
+        };
+        for (auto* value : liveIn[block]) widenForBlock(value);
+        for (auto* value : liveOut[block]) widenForBlock(value);
+    }
+    }
+
+    // ================================================================
     // Compute loop depth for each block
     // Depth = number of loops that contain this block
     // ================================================================
     std::unordered_map<IR::BasicBlock*, int> blockDepth;
+
     for (auto& bb : func.getBlocks()) {
         int depth = 0;
         for (auto& loop : loops) {
@@ -523,28 +636,6 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
         valLoopDepth[val] = maxDepth;
     }
 
-    // ================================================================
-    // Compute crossesCall for each value once (before interval creation)
-    // ================================================================
-    std::unordered_map<IR::Value*, bool> valCrossesCall;
-    for (auto it = firstSeen.begin(); it != firstSeen.end(); ++it) {
-        auto* val = it->first;
-        int start = it->second;
-        int end = lastSeen[val];
-        bool crosses = false;
-        // Check if any call falls strictly within (start, end).
-        // Defined AT call (start == callId): the return value does NOT cross its
-        // own call. Last used AT call (end == callId): the value is dead at the
-        // call and does not need to survive it.
-        for (int cid : callIds) {
-            if (start < cid && cid < end) {
-                crosses = true;
-                break;
-            }
-        }
-        valCrossesCall[val] = crosses;
-    }
-
     for (auto it = firstSeen.begin(); it != firstSeen.end(); ++it) {
         LiveInterval interval;
         interval.value = it->first;
@@ -555,7 +646,6 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
         interval.spillSlot = -1;
         interval.useCount = useCount[it->first];
         interval.loopDepth = valLoopDepth[it->first];
-        interval.crossesCall = valCrossesCall[it->first];
         intervals.push_back(interval);
     }
 
@@ -566,81 +656,246 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
             if (a.end != b.end) return a.end < b.end;
             return a.value->getName() < b.value->getName();
         });
+
+    // ★ 填充 valToInterval：必须在 sort 之后，且此后 intervals 不得再增删。
+    //   coalesceMoves 会原地修改元素的 reg 字段，但不会 push_back，指针保持有效。
+    valToInterval.clear();
+    for (auto& iv : intervals) {
+        valToInterval[iv.value] = &iv;
+    }
 }
 
 void RegisterAllocator::linearScan() {
-    // ================================================================
-    // RA-CALL-1: Call-aware register preference.
-    //
-    // Pool layout (both INT and FLOAT): callee-saved first (12 regs),
-    // caller-saved last.  INT_REGS:  s0-s11 | t3-t6   (12+4)
-    //                     FLOAT_REGS: fs0-fs11 | ft2-ft11 (12+10)
-    //
-    // - crossesCall=true  → prefer callee-saved (s*/fs*), avoid
-    //   caller-save traffic at every call site
-    // - crossesCall=false → prefer caller-saved (t*/ft*), keeping
-    //   callee-saved registers free and reducing prologue traffic
-    //
-    // When the preferred class is exhausted we fall back to the other
-    // class.  A caller-saved register assigned to a call-crossing
-    // value is still correct: getRegsLiveAtCall will save/restore it
-    // around each call.
-    // ================================================================
-    static const size_t CALLEE_COUNT = 12;  // s0-s11 or fs0-fs11
-
     std::vector<LiveInterval*> active;
 
     for (auto& current : intervals) {
         expireOldIntervals(current.start, active);
 
         const auto& regPool = current.isFloat ? FLOAT_REGS : INT_REGS;
-        const size_t poolSize = regPool.size();
+        std::set<std::string> freeRegs(regPool.begin(), regPool.end());
 
-        // Build active-register set for O(1) lookup
-        std::unordered_set<std::string> activeRegs;
+        // 移除已被预留的寄存器
+        for (const auto& r : reservedRegs) {
+            freeRegs.erase(r);
+        }
+
         for (auto* a : active) {
-            if (!a->reg.empty()) activeRegs.insert(a->reg);
-        }
-
-        auto tryAllocate = [&](const std::string& r) -> bool {
-            if (reservedRegs.count(r)) return false;
-            if (activeRegs.count(r)) return false;
-            current.reg = r;
-            regMap[current.value] = r;
-            if (std::find(usedCalleeSaved.begin(), usedCalleeSaved.end(), r)
-                == usedCalleeSaved.end()) {
-                usedCalleeSaved.push_back(r);
-            }
-            return true;
-        };
-
-        bool allocated = false;
-
-        if (current.crossesCall) {
-            // Prefer callee-saved (indices 0..CALLEE_COUNT-1),
-            // fall back to caller-saved (CALLEE_COUNT..poolSize-1).
-            for (size_t i = 0; i < poolSize; ++i) {
-                if (tryAllocate(regPool[i])) { allocated = true; break; }
-            }
-        } else {
-            // Prefer caller-saved first (later pool indices),
-            // fall back to callee-saved (earlier pool indices).
-            for (size_t i = CALLEE_COUNT; i < poolSize; ++i) {
-                if (tryAllocate(regPool[i])) { allocated = true; break; }
-            }
-            if (!allocated) {
-                for (size_t i = 0; i < CALLEE_COUNT; ++i) {
-                    if (tryAllocate(regPool[i])) { allocated = true; break; }
-                }
+            if (!a->reg.empty()) {
+                freeRegs.erase(a->reg);
             }
         }
 
-        if (allocated) {
+        if (!freeRegs.empty()) {
+            current.reg = *freeRegs.begin();
+            regMap[current.value] = current.reg;
             active.push_back(&current);
+            if (std::find(usedCalleeSaved.begin(), usedCalleeSaved.end(), current.reg)
+                == usedCalleeSaved.end()) {
+                usedCalleeSaved.push_back(current.reg);
+            }
         } else {
             spillAtInterval(current, active);
         }
     }
+}
+
+// ================================================================
+// 图着色寄存器分配（Chaitin-Briggs），实验性。
+// 复用 buildIntervals 产出的 intervals 作为唯一输入，与 linearScan 同源。
+// 干涉判定：同寄存器类（isFloat 相同）且活跃区间重叠 ⇒ 相互干涉。
+// 与 linearScan 的对齐约定（必须一致，否则 codegen 契约破裂）：
+//   - 寄存器池：INT_REGS(16) / FLOAT_REGS(22)，各扣除 reservedRegs；
+//   - 着色成功：写 regMap[val] / iv.reg / usedCalleeSaved；
+//   - 溢出：写 spillMap + nextSpillSlot（8 字节/槽），不写 regMap，
+//     codegen 通过 hasReg()==false 自动走 vregStackOffset 落栈——与 spillAtInterval 一致。
+// 溢出选择用与 spillAtInterval 相同的代价函数，但这里是“全局”决策（在完整
+// 干涉图上选代价最低者溢出），正是线性扫描所缺的全局视野。
+// ================================================================
+// 图着色现为默认分配器（native WSL 60 perf 实测：相较线性扫描净降 1.5%，
+// 零正确性回退）。逃生开关：RA_ALLOCATOR=linear 切回线性扫描。
+// GVN 暂仍关闭——朴素图着色尚缺 move coalescing / live-range splitting，
+// 吃不下 GVN 拉长的活跃区间；补齐后再评估启用 GVN。
+bool RegisterAllocator::useGraphColoring() {
+    static const bool on = [] {
+        const char* v = std::getenv("RA_ALLOCATOR");
+        return !(v && std::string(v) == "linear");   // 默认 true，仅 =linear 时回退
+    }();
+    return on;
+}
+
+void RegisterAllocator::colorAllocate() {
+    // 两个寄存器类独立着色（int / float 互不干涉，寄存器不重叠）。
+    colorRegClass(false);  // int
+    colorRegClass(true);   // float
+}
+
+bool RegisterAllocator::colorRegClass(bool isFloat) {
+    const auto& regPool = isFloat ? FLOAT_REGS : INT_REGS;
+    // 可用物理寄存器 = 池 - 预留寄存器
+    std::vector<std::string> kRegs;
+    for (const auto& r : regPool) {
+        if (!reservedRegs.count(r)) kRegs.push_back(r);
+    }
+    const int K = static_cast<int>(kRegs.size());
+
+    // ── call-aware 偏好支持 ──
+    // 将可用寄存器按 callee-saved / caller-saved 分成两组，保持池内原有相对次序。
+    // 跨调用值（活跃区间包含某 CALL）优先 callee-saved（s*/fs*）：prologue 存一次即可，
+    //   调用间无需在每个 call site 反复保存。
+    // 不跨调用值优先 caller-saved（t*/ft*）：不进 prologue（零 save/restore 成本），
+    //   且因不跨调用，call site 也无需保护它。
+    // 这复刻线性扫描的 RA-CALL 策略——朴素图着色无差别抢 s* 破坏了它，
+    // 导致 knapsack 等深递归/调用密集程序 prologue 膨胀（平台实测 +22.8%）。
+    auto isCalleeSaved = [](const std::string& r) {
+        // s0-s11 / fs0-fs11 为 callee-saved；t*/ft* 为 caller-saved
+        if (r.size() >= 2 && r[0] == 'f' && r[1] == 's') return true;   // fs*
+        if (r[0] == 's') return true;                                    // s*
+        return false;
+    };
+    std::vector<std::string> calleeFirst, callerFirst;
+    for (const auto& r : kRegs) {
+        if (isCalleeSaved(r)) calleeFirst.push_back(r);
+    }
+    for (const auto& r : kRegs) {
+        if (!isCalleeSaved(r)) calleeFirst.push_back(r);
+    }
+    for (const auto& r : kRegs) {
+        if (!isCalleeSaved(r)) callerFirst.push_back(r);
+    }
+    for (const auto& r : kRegs) {
+        if (isCalleeSaved(r)) callerFirst.push_back(r);
+    }
+
+    // 收集所有 CALL 指令的位置（instId），用于判断区间是否跨调用。
+    std::vector<int> callIds;
+    for (const auto& kv : instId) {
+        if (kv.first->getOpcode() == IR::Instruction::Opcode::CALL) {
+            callIds.push_back(kv.second);
+        }
+    }
+    std::sort(callIds.begin(), callIds.end());
+    // 区间 [start,end] 是否严格跨越某 CALL（定义在调用前、使用在调用后）。
+    // 用与 getRegsLiveAtCall 一致的判据：start < callId < end。
+    // [EXP] RA_COLOR_CALLAWARE=0 关闭 call-aware 偏好（退回无差别抢 callee-saved，
+    //   即初版图着色行为），用于 A/B 量化本修复。默认开启。
+    static const bool callAware = [] {
+        const char* v = std::getenv("RA_COLOR_CALLAWARE");
+        return !(v && std::string(v) == "0");
+    }();
+    auto spansCall = [&](const LiveInterval* iv) -> bool {
+        if (!callAware) return true;  // 关闭时一律视为跨调用 → 全走 calleeFirst（旧行为）
+        // 二分：第一个 > start 的 callId，检查它是否 < end
+        auto it = std::upper_bound(callIds.begin(), callIds.end(), iv->start);
+        return it != callIds.end() && *it < iv->end;
+    };
+
+    // 收集本寄存器类的待分配节点（该类且尚未染色/溢出的区间）
+    std::vector<LiveInterval*> nodes;
+    for (auto& iv : intervals) {
+        if (iv.isFloat != isFloat) continue;
+        if (!iv.reg.empty()) continue;      // 已预着色（一般不会，保守跳过）
+        nodes.push_back(&iv);
+    }
+    if (nodes.empty()) return true;
+
+    const int N = static_cast<int>(nodes.size());
+    // 节点 → 下标
+    std::unordered_map<LiveInterval*, int> idx;
+    idx.reserve(N * 2);
+    for (int i = 0; i < N; ++i) idx[nodes[i]] = i;
+
+    // 构建干涉图（邻接集合）。区间重叠即干涉。
+    // O(N^2) 朴素构图；N 为单函数单寄存器类的活跃值数，规模可接受。
+    std::vector<std::unordered_set<int>> adj(N);
+    for (int i = 0; i < N; ++i) {
+        const LiveInterval* a = nodes[i];
+        for (int j = i + 1; j < N; ++j) {
+            const LiveInterval* b = nodes[j];
+            // 区间重叠：a.start <= b.end && b.start <= a.end
+            if (a->start <= b->end && b->start <= a->end) {
+                adj[i].insert(j);
+                adj[j].insert(i);
+            }
+        }
+    }
+
+    // Chaitin-Briggs 简化：反复移除度 < K 的节点压栈；无低度节点时，
+    // 按溢出代价选最低者作为“潜在溢出”压栈（乐观着色，select 阶段再定夺）。
+    auto spillCost = [](const LiveInterval* iv) -> long long {
+        return (long long)iv->loopDepth * 10000 + (long long)iv->useCount * 100
+             + (iv->end - iv->start);
+    };
+    std::vector<int> degree(N);
+    std::vector<char> removed(N, 0);
+    for (int i = 0; i < N; ++i) degree[i] = static_cast<int>(adj[i].size());
+
+    std::vector<int> selectStack;
+    selectStack.reserve(N);
+    int remaining = N;
+    while (remaining > 0) {
+        // 优先移除低度节点（度 < K）
+        int pick = -1;
+        for (int i = 0; i < N; ++i) {
+            if (!removed[i] && degree[i] < K) { pick = i; break; }
+        }
+        if (pick == -1) {
+            // 无低度节点：选溢出代价最低的节点作为潜在溢出。
+            // 决定性：代价相同用节点名兜底，消除迭代顺序非确定性。
+            long long best = LLONG_MAX;
+            for (int i = 0; i < N; ++i) {
+                if (removed[i]) continue;
+                long long c = spillCost(nodes[i]);
+                if (c < best || (c == best && pick != -1
+                        && nodes[i]->value->getName() < nodes[pick]->value->getName())) {
+                    best = c; pick = i;
+                }
+            }
+        }
+        // 压栈并从图中移除
+        removed[pick] = 1;
+        selectStack.push_back(pick);
+        for (int nb : adj[pick]) {
+            if (!removed[nb]) degree[nb]--;
+        }
+        remaining--;
+    }
+
+    // Select：逆序出栈染色。为节点选一个邻居未占用的寄存器；
+    // 若无可用寄存器则真正溢出。
+    bool allColored = true;
+    for (int si = static_cast<int>(selectStack.size()) - 1; si >= 0; --si) {
+        int n = selectStack[si];
+        LiveInterval* iv = nodes[n];
+        std::set<std::string> used;
+        for (int nb : adj[n]) {
+            if (!nodes[nb]->reg.empty()) used.insert(nodes[nb]->reg);
+        }
+        std::string chosen;
+        // call-aware 偏好：跨调用值先试 callee-saved，否则先试 caller-saved。
+        // 两个顺序都覆盖全部 K 个寄存器，只是优先级不同——不影响可着色性，
+        // 只影响“选哪个”，从而最小化 usedCalleeSaved 与 call-site 保护开销。
+        const std::vector<std::string>& tryOrder =
+            spansCall(iv) ? calleeFirst : callerFirst;
+        for (const auto& r : tryOrder) {
+            if (!used.count(r)) { chosen = r; break; }
+        }
+        if (!chosen.empty()) {
+            iv->reg = chosen;
+            regMap[iv->value] = chosen;
+            if (std::find(usedCalleeSaved.begin(), usedCalleeSaved.end(), chosen)
+                == usedCalleeSaved.end()) {
+                usedCalleeSaved.push_back(chosen);
+            }
+        } else {
+            // 实际溢出：不写 regMap，codegen 自动落栈（与 spillAtInterval 一致）
+            iv->spillSlot = nextSpillSlot;
+            spillMap[iv->value] = nextSpillSlot;
+            nextSpillSlot += 8;
+            spillSlotSize = std::max(spillSlotSize, nextSpillSlot);
+            allColored = false;
+        }
+    }
+    return allColored;
 }
 
 void RegisterAllocator::expireOldIntervals(int pos, std::vector<LiveInterval*>& active) {
@@ -706,11 +961,96 @@ void RegisterAllocator::spillAtInterval(LiveInterval& current, std::vector<LiveI
     active.push_back(&current);
 }
 
+// ── 通用 move coalescing 支持函数 ──
+
+LiveInterval* RegisterAllocator::intervalOf(IR::Value* v) {
+    auto it = valToInterval.find(v);
+    return it != valToInterval.end() ? it->second : nullptr;
+}
+
+// 两个值的活跃区间是否重叠（可能同时活跃）。
+// 区间经 buildIntervals 的多处 liveness extension 保守放大，
+// 因此“不重叠”是保守正确的判断——漏合并可接受，错合并不可接受。
+// 任一值无区间（如未提升的 ALLOCA 指针）→ 保守视为重叠，拒绝合并。
+bool RegisterAllocator::intervalsOverlap(IR::Value* a, IR::Value* b) const {
+    auto ia = valToInterval.find(a);
+    auto ib = valToInterval.find(b);
+    if (ia == valToInterval.end() || ib == valToInterval.end()) return true;
+    const LiveInterval* x = ia->second;
+    const LiveInterval* y = ib->second;
+    return x->start <= y->end && y->start <= x->end;
+}
+
+// 物理寄存器 reg 在区间 range 内是否被“第三方”值（≠ self）占用。
+// 用于确保把 self 合并到 reg 后，不会踩踏另一个仍活跃且已占用 reg 的值。
+bool RegisterAllocator::regBusyDuring(const std::string& reg,
+                                      const LiveInterval* range,
+                                      IR::Value* self) const {
+    if (!range) return true;
+    for (const auto& iv : intervals) {
+        if (iv.value == self) continue;
+        if (iv.reg != reg) continue;
+        if (iv.start <= range->end && range->start <= iv.end) return true;
+    }
+    return false;
+}
+
+// 经典 read-modify-write coalescing 判据（旧版逻辑，已在历史用例上验证安全）。
+// 成立条件（全部满足）：
+//   1. incoming 单 use，且唯一 use 是该 PHI；
+//   2. incoming 由某指令定义，该指令以 phi 自身为源操作数（RMW，如 subw s7,s7,s1）；
+//   3. PHI 在 incoming 定义所在 BB 中除该 RMW 指令外无其他 use。
+// 保留此判据作为独立接受路径，确保新版严格包含旧版已验证的安全合并集。
+bool RegisterAllocator::isClassicRmwCoalesce(IR::Value* incoming,
+                                             IR::Instruction* phi,
+                                             const std::string& phiReg) const {
+    (void)phiReg;
+    if (!incoming->hasOneUse()) return false;
+    const auto& uses = incoming->getUses();
+    if (uses.size() != 1) return false;
+    if (uses[0].user != phi) return false;
+
+    auto* defInst = dynamic_cast<IR::Instruction*>(incoming);
+    if (!defInst) return false;
+
+    bool usesPhi = false;
+    for (unsigned j = 0; j < defInst->getNumOperands(); ++j) {
+        if (defInst->getOperand(j) == phi) { usesPhi = true; break; }
+    }
+    if (!usesPhi) return false;
+
+    auto* defBB = defInst->getParent();
+    for (const auto& phiUse : phi->getUses()) {
+        auto* phiUser = dynamic_cast<IR::Instruction*>(phiUse.user);
+        if (!phiUser) continue;
+        if (phiUser == defInst) continue; // read-modify-write 本身
+        if (phiUser->getParent() == defBB) return false; // 同 BB 其他 use → 不安全
+
+        // PHI operands are used on predecessor edges. Coalescing the RMW result
+        // into phiReg overwrites the old PHI value at defInst; reject it when a
+        // different PHI still needs that old value on defBB's outgoing edge.
+        // Example: B.next -> B.phi cannot be coalesced when the same edge also
+        // performs C.phi <- B.phi as part of a parallel copy.
+        if (phiUser->getOpcode() == IR::Instruction::Opcode::PHI &&
+            phiUse.operandNo % 2 == 0 &&
+            phiUse.operandNo + 1 < phiUser->getNumOperands() &&
+            phiUser->getOperand(phiUse.operandNo + 1) == defBB) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ================================================================
-// PHI copy coalescing:
-// When a PHI's incoming value is defined by a single instruction
-// whose result is only used by this PHI, we can assign the same
-// register to both, eliminating the "mv" copy instruction.
+// PHI copy coalescing（通用干涉判断版）:
+// 若 PHI 与其某个 incoming 的活跃区间不重叠，且 PHI 的寄存器在
+// incoming 区间内未被第三方占用，则把 incoming 合并到 PHI 的寄存器，
+// 消除 emitPhiMovesForEdge 发射的 mv/fmv.s（该处 phiReg==srcReg 时自动跳过）。
+//
+// 相比旧版的“read-modify-write + 单 use + 无同 BB 其他 use”三条语法限制，
+// 本版改为区间重叠判断：
+//   - PHI 在 incoming 定义点之后仍有 use → 区间覆盖定义点 → 重叠 → 拒绝（等价旧安全检查）
+//   - 但不再要求 incoming 单 use / 必须是 read-modify-write，覆盖面更广。
 //
 // Example (h-5-01 inner loop):
 //   subw s11, s7, s1    # t27 = w - mul
@@ -719,6 +1059,12 @@ void RegisterAllocator::spillAtInterval(LiveInterval& current, std::vector<LiveI
 //   subw s7, s7, s1     # w = w - mul  (no mv needed!)
 // ================================================================
 void RegisterAllocator::coalescePhis(IR::Function& func) {
+    // [EXP-SCAFFOLD] A/B 实验开关：RA_COALESCE_MODE=rmw 时只走判据(A)（等价 v3.1.0），
+    //   默认或 =full 时走 (A)∪(B)（v3.2.0）。实验结束后连同下方判断一并移除。
+    static const bool rmwOnly = [] {
+        const char* m = std::getenv("RA_COALESCE_MODE");
+        return m && std::string(m) == "rmw";
+    }();
     for (auto& bb : func.getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
             if (inst->getOpcode() != IR::Instruction::Opcode::PHI)
@@ -727,113 +1073,48 @@ void RegisterAllocator::coalescePhis(IR::Function& func) {
             auto* phi = inst.get();
             std::string phiReg = getReg(phi);
             if (phiReg.empty()) continue; // PHI spilled, can't coalesce
+            bool phiFloat = floatValues.count(phi) > 0;
 
             for (unsigned i = 0; i + 1 < phi->getNumOperands(); i += 2) {
                 auto* incoming = phi->getOperand(i);
                 if (!incoming) continue;
                 if (dynamic_cast<IR::Constant*>(incoming)) continue;
 
-                // Check: incoming is defined by a single instruction
-                // and only used by this PHI
-                if (!incoming->hasOneUse()) continue;
-                auto& uses = incoming->getUses();
-                if (uses.size() != 1) continue;
-                if (uses[0].user != phi) continue;
-
-                // Check: incoming has a register
+                // incoming 必须已分配到寄存器且尚未与 PHI 同寄存器
                 std::string incomingReg = getReg(incoming);
-                if (incomingReg.empty()) continue; // spilled
+                if (incomingReg.empty()) continue;      // spilled
+                if (incomingReg == phiReg) continue;    // 已合并
 
-                // Already same register? No need to coalesce
-                if (incomingReg == phiReg) continue;
+                // 寄存器类必须一致（int↔int / float↔float）
+                if ((floatValues.count(incoming) > 0) != phiFloat) continue;
 
-                // Check safety: the PHI's register must not be used
-                // by any other active interval at the point of the
-                // incoming value's definition.
-                // The incoming value is only used by the PHI, so
-                // the only use of the PHI's register at the point
-                // of the incoming value's definition is the PHI's
-                // old value (which is being read by the instruction
-                // that defines the incoming value).
-                //
-                // This is safe for read-modify-write operations
-                // (like subw s7, s7, s1 → subw s7, s7, s1).
-                // The instruction reads the old value and writes
-                // the new value to the same register.
+                LiveInterval* inIv = intervalOf(incoming);
+                if (!inIv) continue;                    // 无区间信息，保守放弃
 
-                // Find the definition instruction of the incoming value
-                auto* defInst = dynamic_cast<IR::Instruction*>(incoming);
-                if (!defInst) continue;
+                // ★ 接受路径为两条判据的并集，严格包含旧的已验证安全集：
+                //   (A) 经典 read-modify-write（旧判据，已在历史用例上验证安全）：
+                //       incoming 单 use 于该 PHI、由指令定义、该指令以 PHI 为源、
+                //       且 PHI 在 incoming 定义所在 BB 无其他 use。
+                //   (B) 通用区间不重叠（保守扩展）：incoming 与 phi 区间不重叠，
+                //       且 phiReg 在 incoming 区间内未被第三方占用。
+                //   任一成立即可合并。(B) 因区间只放大不缩小而保守正确。
+                bool acceptRMW = isClassicRmwCoalesce(incoming, phi, phiReg);
+                bool acceptDisjoint = !rmwOnly    // [EXP-SCAFFOLD] rmw 模式下禁用 (B)
+                    && !intervalsOverlap(incoming, phi)
+                    && !regBusyDuring(phiReg, inIv, incoming);
+                if (!acceptRMW && !acceptDisjoint) continue;
 
-                // Verify: the instruction uses the PHI as a source
-                // (read-modify-write pattern), which is always safe
-                // to coalesce.
-                bool usesPhi = false;
-                for (unsigned j = 0; j < defInst->getNumOperands(); ++j) {
-                    if (defInst->getOperand(j) == phi) {
-                        usesPhi = true;
-                        break;
-                    }
+                if (std::getenv("RA_COALESCE_TRACE")) {
+                    std::fprintf(stderr,
+                        "[phi-coalesce] %s %s -> %s reg=%s rmw=%d disjoint=%d in=[%d,%d]\n",
+                        func.getName().c_str(), incoming->getName().c_str(),
+                        phi->getName().c_str(), phiReg.c_str(), acceptRMW,
+                        acceptDisjoint, inIv->start, inIv->end);
                 }
-
-                // Only coalesce if the instruction uses the PHI as a source.
-                // This ensures the instruction is a read-modify-write
-                // (e.g., subw s7, s7, s1) and the PHI's register is not
-                // being used by a different live interval.
-                if (!usesPhi) continue;
-
-                // ★ 安全检查：PHI 在 incoming 定义所在 BB 中不能有其他使用。
-                //   coalescing 后，incoming 定义写入 phiReg。如果 PHI 在同一 BB
-                //   的 incoming 定义之后还有使用，会读到 incoming 的值而非 PHI
-                //   的值，导致语义错误（SEGFAULT/无限循环）。
-                //   使用在其他 BB（body/header）是安全的，因为它们在 latch 之前执行。
-                auto* defBB = defInst->getParent();
-                bool hasOtherUseInDefBB = false;
-                for (auto& phiUse : phi->getUses()) {
-                    auto* phiUser = dynamic_cast<IR::Instruction*>(phiUse.user);
-                    if (!phiUser) continue;
-                    if (phiUser == defInst) continue; // read-modify-write 本身
-                    if (phiUser->getParent() == defBB) {
-                        hasOtherUseInDefBB = true;
-                        break;
-                    }
-                }
-                if (hasOtherUseInDefBB) continue;
-
-                // PHI assignments on an edge are parallel.  Coalescing a
-                // read-modify-write incoming value with its destination PHI
-                // overwrites the PHI's old value before the edge copies run.
-                // That is unsafe when a sibling PHI still needs the old value
-                // from this same predecessor, for example:
-                //
-                //   b.next = b + x
-                //   b = phi [b.next, latch]
-                //   c = phi [b,      latch]
-                //
-                // Keep b.next in a distinct register so c receives old b.
-                bool feedsSiblingPhiOnEdge = false;
-                auto* phiBB = phi->getParent();
-                if (phiBB && defBB) {
-                    for (auto& siblingPtr : phiBB->getInstructions()) {
-                        auto* sibling = siblingPtr.get();
-                        if (sibling == phi ||
-                            sibling->getOpcode() != IR::Instruction::Opcode::PHI) {
-                            continue;
-                        }
-                        for (unsigned op = 0; op + 1 < sibling->getNumOperands(); op += 2) {
-                            if (sibling->getOperand(op) == phi &&
-                                sibling->getOperand(op + 1) == defBB) {
-                                feedsSiblingPhiOnEdge = true;
-                                break;
-                            }
-                        }
-                        if (feedsSiblingPhiOnEdge) break;
-                    }
-                }
-                if (feedsSiblingPhiOnEdge) continue;
 
                 // Coalesce: assign the PHI's register to the incoming value
                 regMap[incoming] = phiReg;
+                inIv->reg = phiReg;  // 同步区间，供后续 incoming 的 regBusyDuring 判断
             }
         }
     }

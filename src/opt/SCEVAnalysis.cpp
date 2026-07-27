@@ -227,6 +227,13 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
                 } else if (d < 0 && diff <= 0) {
                     info.tripCount = (-diff) / (-d) + 1;
                 }
+            } else if (info.cmpKind == "ne") {
+                // while (x != end) { x += step; } 模式
+                // 保守识别:仅支持递减到 0 (end==0, step==-1)
+                // 用于 CRC _and/_xor 的 32 次循环
+                if (e == 0 && d == -1 && s > 0 && s <= 64) {
+                    info.tripCount = s;
+                }
             }
         }
     }

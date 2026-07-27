@@ -1,9 +1,0 @@
-int compute(int a, int b) {
-    int x = a + 3;
-    int y = b + 5;
-    return x * y + a;
-}
-
-int main() {
-    return compute(2, 4);
-}

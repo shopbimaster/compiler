@@ -65,10 +65,3 @@ build-grammar-test/
 
 # Reference solutions (third-party)
 Solutions/
-
-# Documents
-*.pdf
-docs/
-
-# SysY reference outputs are test data, not native executables.
-!test/**/*.out

@@ -97,7 +97,8 @@ IR::ConstantInt* foldCast(IR::Instruction::Opcode op, int64_t src) {
 // ================================================================
 LatticeValue evaluateInst(
     IR::Instruction* inst,
-    const std::unordered_map<IR::Value*, LatticeValue>& lattice) {
+    const std::unordered_map<IR::Value*, LatticeValue>& lattice,
+    const std::unordered_set<IR::BasicBlock*>& executable) {
     using Opc = IR::Instruction::Opcode;
     auto op = inst->getOpcode();
     LatticeValue result;
@@ -190,12 +191,13 @@ LatticeValue evaluateInst(
         return result;
     }
 
-    // LOAD: 从 const 全局变量加载 → 返回常量值
+    // LOAD: 从 const 全局变量或常量数组加载 → 返回常量值
     // const int KSIZE = 5; load i32, i32* @KSIZE → ConstantInt(5)
-    // 这使得 SCCP 能将常量传播到分支条件（如 while (kr < KSIZE) → while (kr < 5)），
-    // 进而使 SimplifyCFG 能折叠更多分支，LoopUnrolling 能确定循环次数等。
+    // const int arr[] = {1,2,3}; x = arr[1]; → ConstantInt(2)
     if (op == Opc::LOAD) {
         auto* ptr = inst->getOperand(0);
+
+        // Case 1: 直接 LOAD 标量 const 全局变量
         if (auto* gv = dynamic_cast<IR::GlobalVariable*>(ptr)) {
             if (gv->isConstant()) {
                 auto* init = gv->getInitializer();
@@ -206,11 +208,126 @@ LatticeValue evaluateInst(
                 }
             }
         }
+
+        // Case 2: LOAD 来自 GEP(const_global_array, const_indices)
+        if (auto* gep = dynamic_cast<IR::Instruction*>(ptr)) {
+            if (gep->getOpcode() == Opc::GETELEMENTPTR) {
+                // 收集 GEP 链（从内到外：LOAD 的 GEP → ... → 靠 GlobalVariable 的 GEP）
+                std::vector<IR::Instruction*> gepChain;
+                IR::GlobalVariable* baseGV = nullptr;
+                IR::Instruction* cur = gep;
+                while (cur && cur->getOpcode() == Opc::GETELEMENTPTR) {
+                    gepChain.push_back(cur);
+                    auto* base = cur->getOperand(0);
+                    if (auto* gv = dynamic_cast<IR::GlobalVariable*>(base)) {
+                        baseGV = gv;
+                        break;
+                    }
+                    cur = dynamic_cast<IR::Instruction*>(base);
+                }
+
+                if (baseGV && baseGV->isConstant()) {
+                    const auto& idata = baseGV->getInitData();
+                    if (!idata.empty()) {
+                        auto* ptrTy = dynamic_cast<IR::PointerType*>(
+                            baseGV->getType());
+                        IR::Type* curTy = ptrTy ?
+                            ptrTy->getPointeeType() : nullptr;
+                        int64_t flatIdx = 0;
+                        bool allConst = true;
+
+                        // 从外到内处理 GEP（reverse：最靠近 GlobalVariable 的先）
+                        for (auto it = gepChain.rbegin();
+                             it != gepChain.rend() && allConst; ++it) {
+                            auto* gI = *it;
+                            for (unsigned i = 1;
+                                 i < gI->getNumOperands(); ++i) {
+                                auto* idxConst = dynamic_cast<
+                                    IR::ConstantInt*>(gI->getOperand(i));
+                                if (!idxConst) { allConst = false; break; }
+                                int64_t idx = idxConst->getValue();
+                                if (auto* arrTy = dynamic_cast<
+                                        IR::ArrayType*>(curTy)) {
+                                    auto countLeaf = [](IR::Type* t,
+                                        auto&& self) -> unsigned {
+                                        if (auto* at = dynamic_cast<
+                                                IR::ArrayType*>(t))
+                                            return at->getNumElements() *
+                                                self(at->getElementType(),
+                                                     self);
+                                        return 1;
+                                    };
+                                    flatIdx += idx * (int64_t)countLeaf(
+                                        arrTy->getElementType(), countLeaf);
+                                    curTy = arrTy->getElementType();
+                                } else {
+                                    flatIdx += idx;
+                                }
+                            }
+                        }
+
+                        if (allConst && flatIdx >= 0 &&
+                            (size_t)flatIdx < idata.size()) {
+                            int32_t raw = (int32_t)idata[(size_t)flatIdx];
+                            auto* folded = IR::ConstantInt::get(
+                                IR::IntegerType::I32, raw);
+                            result.state = LatticeState::CONSTANT;
+                            result.constant = folded;
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+
         result.state = LatticeState::BOTTOM;
         return result;
     }
 
-    // STORE, CALL, ALLOCA, GETELEMENTPTR, BR, COND_BR, RET, PHI
+    // PHI: 如果所有可执行入边的值都是同一个常量，则 PHI 结果也是该常量
+    // 这是 SCCP 的核心能力之一：跨基本块传播常量值，使得循环中的归纳变量
+    // 能被确定为常量，进而触发循环完全展开和分支折叠。
+    if (op == Opc::PHI) {
+        IR::ConstantInt* commonConst = nullptr;
+        bool hasExecIncoming = false;
+        for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+            auto* bb = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+            if (!bb || !executable.count(bb)) continue;
+            hasExecIncoming = true;
+            auto lv = getLattice(i);
+            if (lv.state == LatticeState::BOTTOM) {
+                result.state = LatticeState::BOTTOM;
+                return result;
+            }
+            if (lv.state == LatticeState::TOP) {
+                // 仍有入边尚未确定，保持 TOP 等待更多信息
+                return result;
+            }
+            // CONSTANT
+            if (!lv.constant) {
+                result.state = LatticeState::BOTTOM;
+                return result;
+            }
+            if (!commonConst) {
+                commonConst = lv.constant;
+            } else if (commonConst->getValue() != lv.constant->getValue()) {
+                // 不同入边值不同 → BOTTOM
+                result.state = LatticeState::BOTTOM;
+                return result;
+            }
+        }
+        if (!hasExecIncoming) {
+            // 没有可执行入边 → 等待
+            return result;
+        }
+        if (commonConst) {
+            result.state = LatticeState::CONSTANT;
+            result.constant = commonConst;
+        }
+        return result;
+    }
+
+    // STORE, CALL, ALLOCA, GETELEMENTPTR, BR, COND_BR, RET
     // 这些指令的结果不是常量
     result.state = LatticeState::BOTTOM;
     return result;
@@ -238,6 +355,33 @@ bool sccpOnFunction(IR::Function* func) {
     // 已知常量值的 worklist（用于传播）
     std::queue<IR::Instruction*> ssaWorklist;
 
+    // 当新块变为可执行时，其后继块的 PHI 节点需要重新求值，
+    // 因为新的入边可能提供了常量值。PHI 节点始终位于 BB 指令列表开头。
+    auto enqueueSuccessorPhis = [&](IR::BasicBlock* bb) {
+        auto* term = bb->getTerminator();
+        if (!term) return;
+        auto op = term->getOpcode();
+        std::vector<IR::BasicBlock*> succs;
+        if (op == IR::Instruction::Opcode::BR) {
+            if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(0)))
+                succs.push_back(t);
+        } else if (op == IR::Instruction::Opcode::COND_BR) {
+            if (term->getNumOperands() >= 3) {
+                if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(1)))
+                    succs.push_back(t);
+                if (auto* f = dynamic_cast<IR::BasicBlock*>(term->getOperand(2)))
+                    succs.push_back(f);
+            }
+        }
+        for (auto* succ : succs) {
+            for (auto& inst : succ->getInstructions()) {
+                if (inst->getOpcode() == IR::Instruction::Opcode::PHI)
+                    ssaWorklist.push(inst.get());
+                else break; // PHI nodes always come first
+            }
+        }
+    };
+
     // 初始化：所有常量（ConstantInt）初始化为 CONSTANT 状态
     for (auto& bb : blocks) {
         for (auto& inst : bb->getInstructions()) {
@@ -259,7 +403,7 @@ bool sccpOnFunction(IR::Function* func) {
             auto* inst = ssaWorklist.front();
             ssaWorklist.pop();
 
-            auto newLattice = evaluateInst(inst, lattice);
+            auto newLattice = evaluateInst(inst, lattice, executable);
             auto& oldLattice = lattice[inst];
 
             // 如果 lattice 值发生变化
@@ -317,16 +461,19 @@ bool sccpOnFunction(IR::Function* func) {
                     if (target && !executable.count(target)) {
                         executable.insert(target);
                         bbWorklist.push(target);
+                        enqueueSuccessorPhis(target);
                     }
                 } else {
                     // 条件未知或不是常量：两个分支都可执行
                     if (thenBB && !executable.count(thenBB)) {
                         executable.insert(thenBB);
                         bbWorklist.push(thenBB);
+                        enqueueSuccessorPhis(thenBB);
                     }
                     if (elseBB && !executable.count(elseBB)) {
                         executable.insert(elseBB);
                         bbWorklist.push(elseBB);
+                        enqueueSuccessorPhis(elseBB);
                     }
                 }
                 continue;  // COND_BR 本身不产生值
@@ -338,12 +485,13 @@ bool sccpOnFunction(IR::Function* func) {
                 if (target && !executable.count(target)) {
                     executable.insert(target);
                     bbWorklist.push(target);
+                    enqueueSuccessorPhis(target);
                 }
                 continue;
             }
 
             // 计算指令的 lattice 值
-            auto newLattice = evaluateInst(inst.get(), lattice);
+            auto newLattice = evaluateInst(inst.get(), lattice, executable);
             auto& oldLattice = lattice[inst.get()];
 
             if (oldLattice.state != newLattice.state ||

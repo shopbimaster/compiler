@@ -13,8 +13,23 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
+#include <cstdlib>   // std::getenv for GVN escape hatch
+#include <string>
 
 namespace Opt {
+
+// GVN 默认启用。历史因线性扫描无法处理其拉长的活跃区间而禁用（+1319ms/线扫时代）；
+// 换用 call-aware 图着色分配器后，图着色的全局溢出决策消化了长区间——
+// 图着色下静态实测 GVN 净降指令 -2.7% / 循环加权 spill -264 / 零回退用例，
+// 正确性 60/60。故正式启用。逃生开关 OPT_DISABLE_GVN=1 可关闭（对称于
+// RA_ALLOCATOR=linear），用于平台回退时快速定位。
+static bool gvnEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("OPT_DISABLE_GVN");
+        return !(v && std::string(v) == "1");
+    }();
+    return on;
+}
 
 // ================================================================
 // O1：基础安全优化（无依赖，总是有益）
@@ -41,7 +56,17 @@ void runO2(IR::Module* mod) {
     // 1a. 树摇
     treeShaking(mod);
 
+    if (recursiveModularMulToNative(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     if (bitOpPatternRecognition(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    if (powerOfTwoDispatchSimplification(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -145,6 +170,13 @@ void runO2(IR::Module* mod) {
         if (simplifyCFG(mod)) {
             constantFolding(mod);
             deadCodeElimination(mod);
+            phase2Changed = true;
+        }
+
+        // 2d. 跳转线程化：消除冗余跳转链 br A -> br B -> br C => br C
+        if (jumpThreading(mod)) {
+            // 跳转线程化可能创造新的SimplifyCFG机会
+            simplifyCFG(mod);
             phase2Changed = true;
         }
 
@@ -331,19 +363,18 @@ void runO2(IR::Module* mod) {
     }
 
     // 6f. GVN：基于支配树的跨 BB CSE
-    // ★ 禁用：即使限制为仅合并直接支配者的 GEP，跨 BB 合并仍会延长活跃区间，
-    //   增加寄存器压力，导致净性能回退（+1319ms / 60 perf tests）。
-    //   同 BB CSE 已在 6e 中运行，可覆盖大部分冗余。
-    //   根本原因：寄存器分配器对长活跃区间处理不佳，需要改进寄存器分配器
-    //   才能安全启用 GVN。
-    // if (globalValueNumbering(mod)) {
-    //     constantFolding(mod);
-    //     deadCodeElimination(mod);
-    //     if (commonSubexpressionElimination(mod)) {
-    //         constantFolding(mod);
-    //         deadCodeElimination(mod);
-    //     }
-    // }
+    // 历史禁用原因：跨 BB 合并延长活跃区间→线性扫描寄存器压力增→净回退
+    //   （+1319ms / 60 perf tests）。换用 call-aware 图着色分配器后，其全局溢出
+    //   决策消化了长区间，图着色下静态实测 GVN 净降指令/循环 spill、零回退，
+    //   正确性 60/60。故正式启用。OPT_DISABLE_GVN=1 可关闭。
+    if (gvnEnabled() && globalValueNumbering(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+        if (commonSubexpressionElimination(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
+    }
 }
 
 // ================================================================

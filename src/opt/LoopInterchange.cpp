@@ -385,21 +385,30 @@ bool tryInterchange(IR::Function* func) {
             if (outer.body.count(inner.header) == 0) continue;
             if (inner.body.count(outer.header) != 0) continue;
 
-            // 安全检查：外层循环体中不能有其他循环（除了当前内层循环）
+            // 安全检查：外层循环体中不能有"平行"的其他循环（除了当前内层循环）
             // 例如 row_reduce: r 循环体中有两个 c 循环，交换后第二个 c 循环仍使用
             // 原来的循环变量，导致语义错误
             // 例如 trsm_optimized: i 循环中有 k 和 j 两个内层循环，交换后 j 循环
             // 依赖的 i 变量变成内层变量，导致 use-before-def
-            bool hasOtherLoop = false;
+            //
+            // 改进：允许完全嵌套的三重循环（i-j-k）
+            // 如果其他循环（k）在当前内层循环（j）的循环体内 → OK（完全嵌套）
+            // 如果其他循环（k）在外层循环（i）体内但不在内层循环（j）内 → SKIP（平行循环）
+            bool hasParallelLoop = false;
             for (size_t mi = 0; mi < loops.size(); ++mi) {
                 if (mi == oi || mi == ii) continue;
                 auto& mid = loops[mi];
+                // 检查 mid 是否在 outer 的循环体内
                 if (outer.body.count(mid.header)) {
-                    hasOtherLoop = true;
-                    break;
+                    // 如果 mid 也在 inner 的循环体内，说明是完全嵌套（i包含j，j包含k）→ OK
+                    // 否则是平行循环（i包含j和k，但j和k是兄弟）→ SKIP
+                    if (!inner.body.count(mid.header)) {
+                        hasParallelLoop = true;
+                        break;
+                    }
                 }
             }
-            if (hasOtherLoop) continue;
+            if (hasParallelLoop) continue;
 
             auto* outerVar = extractIndVar(outer.header);
             auto* innerVar = extractIndVar(inner.header);

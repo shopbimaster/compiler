@@ -1,7 +1,9 @@
 #include "Compiler.h"
 #include "backend/TargetCodeGen.h"
 #include "opt/Optimizer.h"
+#include <cstdlib>
 #include <fstream>
+#include <string>
 
 namespace IR {
 
@@ -57,6 +59,9 @@ void Compiler::emitIRToFile(const std::string& sourcePath, const std::string& ou
 void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out, OptLevel opt) {
     auto mod = compile(sourcePath);
     runOptPasses(mod.get(), opt);
+    if (const char* lowerPhi = std::getenv("DEBUG_LOWER_PHI")) {
+        if (std::string(lowerPhi) == "1") Opt::phiLowering(mod.get());
+    }
     // PHI 指令由 TargetCodeGen 的 emitPhiMovesForEdge 直接在前驱块中
     // 发射寄存器拷贝，无需 phiLowering 降级为 alloca/store/load
     Backend::TargetCodeGen cg;
@@ -67,6 +72,9 @@ void Compiler::emitAsm(const std::string& sourcePath, std::ostream& out, OptLeve
 void Compiler::emitAsmToFile(const std::string& sourcePath, const std::string& outputPath, OptLevel opt) {
     auto mod = compile(sourcePath);
     runOptPasses(mod.get(), opt);
+    if (const char* lowerPhi = std::getenv("DEBUG_LOWER_PHI")) {
+        if (std::string(lowerPhi) == "1") Opt::phiLowering(mod.get());
+    }
     // PHI 指令由 TargetCodeGen 的 emitPhiMovesForEdge 直接在前驱块中
     // 发射寄存器拷贝，无需 phiLowering 降级为 alloca/store/load
     Backend::TargetCodeGen cg;

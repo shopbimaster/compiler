@@ -92,6 +92,7 @@ target_link_libraries(sysy_compiler PUBLIC sysy_ir_builder)
 add_library(sysy_backend STATIC
     src/backend/TargetCodeGen.cpp
     src/backend/RegisterAllocator.cpp
+    src/backend/PostRAScheduler.cpp
 )
 target_include_directories(sysy_backend PUBLIC include)
 target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
@@ -122,6 +123,7 @@ add_library(sysy_opt STATIC
     src/opt/CopyPropagation.cpp
     src/opt/MagicDivision.cpp
     src/opt/BasicBlockReordering.cpp
+    src/opt/JumpThreading.cpp
     src/opt/ADCE.cpp
     src/opt/PeepholeOptimizer.cpp
     src/opt/InlineExpansion.cpp
@@ -134,6 +136,7 @@ add_library(sysy_opt STATIC
     src/opt/InstructionScheduling.cpp
     src/opt/RecursiveMulToNative.cpp
     src/opt/BitOpPatternRecognition.cpp
+    src/opt/PowerOfTwoDispatch.cpp
     src/opt/GlobalVariablePromotion.cpp
     src/opt/GlobalConstantPropagation.cpp
     src/opt/Mem2Reg.cpp
@@ -154,14 +157,17 @@ set_source_files_properties(tests/test_ir.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_ir PRIVATE ${ANTLR_INCLUDES})
 target_link_libraries(test_ir sysy_ir_builder sysy_opt ${ANTLR4_RUNTIME_TARGET})
 
-# Focused register-allocation regressions. These construct small IR graphs so
-# PHI/register interactions can be checked without invoking the front end.
-add_executable(test_register_allocator
-    tests/test_register_allocator.cpp
-)
-target_include_directories(test_register_allocator PRIVATE include)
-target_compile_definitions(test_register_allocator PRIVATE LOCAL_REGISTER_ALLOCATOR_TEST)
-target_link_libraries(test_register_allocator PRIVATE sysy_backend sysy_opt)
+# Focused register-allocation regressions. The source is intentionally optional:
+# official packaging omits standalone test mains, while local developers may
+# restore the guarded fixture when working on the allocator.
+if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_register_allocator.cpp")
+    add_executable(test_register_allocator
+        tests/test_register_allocator.cpp
+    )
+    target_include_directories(test_register_allocator PRIVATE include)
+    target_compile_definitions(test_register_allocator PRIVATE LOCAL_REGISTER_ALLOCATOR_TEST)
+    target_link_libraries(test_register_allocator PRIVATE sysy_backend sysy_opt)
+endif()
 
 # Focused backend peephole regression tests. Keep these independent from the
 # IR pipeline fixtures so a target-code safety fix can be validated in
@@ -196,10 +202,15 @@ target_link_libraries(test_integration sysy_compiler sysy_opt ${ANTLR4_RUNTIME_T
 
 if(BUILD_TESTING)
     add_test(NAME ir_unit COMMAND test_ir)
-    add_test(NAME register_allocator_unit COMMAND test_register_allocator)
     add_test(NAME compiler_integration COMMAND test_integration)
     add_test(NAME peephole_unit COMMAND test_peephole)
-    set_tests_properties(ir_unit register_allocator_unit compiler_integration peephole_unit PROPERTIES
+    set_tests_properties(ir_unit compiler_integration peephole_unit PROPERTIES
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
+    if(TARGET test_register_allocator)
+        add_test(NAME register_allocator_unit COMMAND test_register_allocator)
+        set_tests_properties(register_allocator_unit PROPERTIES
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        )
+    endif()
 endif()

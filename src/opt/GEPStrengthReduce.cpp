@@ -102,11 +102,9 @@ struct GEPCandidate {
 // ================================================================
 // 对单个循环执行 GEP 强度削弱
 // allHeaders: 函数中所有循环的 header 集合，用于检测嵌套循环
-// nestedLoopBlocks: 当前循环内部所有嵌套循环的基本块，用于盈利性判断
 // ================================================================
 bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
-                      const std::unordered_set<IR::BasicBlock*>& allHeaders,
-                      const std::unordered_set<IR::BasicBlock*>& nestedLoopBlocks) {
+                      const std::unordered_set<IR::BasicBlock*>& allHeaders) {
     auto info = analyzeLoopInduction(loop, func);
     if (!info.var || !info.start || !info.step) return false;
 
@@ -255,12 +253,15 @@ bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
         }
     }
 
-    if (candidates.empty()) return false;
+    if (candidates.size() != 1) {
+        // Multiple pointer recurrences in one loop interact poorly with the
+        // current PHI lowering/register allocation path.  A single recurrence
+        // still captures the common linear-array case without that ambiguity.
+        return false;
+    }
 
-    // GEP-LSR-2: Allow a small group of affine pointer recurrences in the
-    // same loop.  Matrix and convolution kernels commonly index two or three
-    // arrays with one IV, so requiring exactly one candidate leaves their hot
-    // loops untouched.  Equivalent candidates share one recurrence.
+    // 去重：相同 base + 相同 ivPos + 相同 pointee 的 GEP 共享同一个 LSR 链
+    // 避免为多个等价 GEP 创建冗余的 lsr.init/lsr.ptr/lsr.inc（浪费寄存器）
     struct LSRCacheKey {
         IR::Value* base;
         int ivPos;
@@ -278,67 +279,6 @@ bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
                  ^ std::hash<int64_t>{}(k.constOffset);
         }
     };
-
-    std::unordered_set<LSRCacheKey, LSRCacheKeyHash> distinctKeys;
-    for (auto& cand : candidates) {
-        distinctKeys.insert({cand.gep->getOperand(0), cand.ivPos,
-                             cand.gep->getType(), cand.constOffset});
-    }
-
-    // A recurrence carried by an outer loop stays live across every nested
-    // loop in its body.  That cost is worthwhile when the pointer is consumed
-    // inside a nested loop (for example, a matrix row base reused by the j/k
-    // loops), but not when it is used only before or after unrelated inner
-    // control flow.  The latter pattern turns cheap indexed accesses into
-    // long-lived pointer PHIs and spill traffic.
-    if (distinctKeys.size() > 1 && !nestedLoopBlocks.empty()) {
-        std::unordered_map<LSRCacheKey, bool, LSRCacheKeyHash> usedInNestedLoop;
-        for (const auto& key : distinctKeys) usedInNestedLoop[key] = false;
-
-        for (auto& cand : candidates) {
-            LSRCacheKey key{cand.gep->getOperand(0), cand.ivPos,
-                            cand.gep->getType(), cand.constOffset};
-            for (auto& use : cand.gep->getUses()) {
-                auto* user = dynamic_cast<IR::Instruction*>(use.user);
-                if (user && nestedLoopBlocks.count(user->getParent())) {
-                    usedInNestedLoop[key] = true;
-                    break;
-                }
-            }
-        }
-        for (const auto& entry : usedInNestedLoop) {
-            if (!entry.second) return false;
-        }
-    }
-
-    // Every chain adds a loop-carried pointer PHI.  Count recurrences already
-    // created anywhere in this natural loop as well as the new group.  Loops
-    // are processed innermost-first, so this preserves the hot inner chains
-    // and prevents later outer-loop/iteration passes from exceeding the same
-    // pressure budget in a nested region.
-    constexpr size_t MAX_LSR_CHAINS = 3;
-    size_t existingChains = 0;
-    for (auto* bb : loop.body) {
-        for (auto& inst : bb->getInstructions()) {
-            if (inst->getOpcode() == Opc::PHI &&
-                inst->getName().rfind("lsr.ptr.", 0) == 0) {
-                ++existingChains;
-            }
-        }
-    }
-    if (existingChains + distinctKeys.size() > MAX_LSR_CHAINS) return false;
-
-    // A call can clobber the caller-saved register holding each pointer and
-    // turn a multi-chain reduction into repeated spill/reload traffic.  The
-    // existing single-chain case remains allowed.
-    if (distinctKeys.size() > 1) {
-        for (auto* bb : loop.body) {
-            for (auto& inst : bb->getInstructions()) {
-                if (inst->getOpcode() == Opc::CALL) return false;
-            }
-        }
-    }
-
     std::unordered_map<LSRCacheKey, IR::Instruction*, LSRCacheKeyHash> lsrCache;
 
     // 对每个候选执行强度削弱
@@ -473,16 +413,7 @@ bool gepStrengthReduce(IR::Module* mod) {
                 allHeaders.insert(loop.header);
             }
             for (auto& loop : loops) {
-                std::unordered_set<IR::BasicBlock*> nestedLoopBlocks;
-                for (const auto& nested : loops) {
-                    if (nested.header == loop.header ||
-                        !loop.body.count(nested.header)) {
-                        continue;
-                    }
-                    nestedLoopBlocks.insert(nested.body.begin(), nested.body.end());
-                }
-                if (reduceGEPsInLoop(loop, func.get(), allHeaders,
-                                     nestedLoopBlocks)) {
+                if (reduceGEPsInLoop(loop, func.get(), allHeaders)) {
                     iterChanged = true;
                 }
             }
