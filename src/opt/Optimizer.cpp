@@ -336,9 +336,15 @@ void runO2(IR::Module* mod) {
     // 6a. IfConversion：条件转换
     if (ifConversion(mod)) {
         simplifyCFG(mod);  // 清理 IfConversion 产生的同目标 COND_BR
+        // IfConversion 把 `||`/`&&` 降级成 select(cond,1,x)/select(cond,x,0)。
+        // 这类 i1 select 等价于单条 or/and，否则后端展开成 seqz/neg/and/or 多条
+        // 指令（knapsack 递归体 `i==0||w==0`、短路求值等热路径每次都执行）。
+        // 此处补一次 algebraicSimplification 折叠这些新 select，再清理。
+        algebraicSimplification(mod);
         constantFolding(mod);
         deadCodeElimination(mod);
     }
+
     // 6b. ADCE：激进死代码消除
     if (adce(mod)) {
         constantFolding(mod);
