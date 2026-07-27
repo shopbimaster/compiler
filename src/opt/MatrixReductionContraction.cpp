@@ -27,6 +27,7 @@ struct CanonicalLoop {
 struct KernelMatch {
     IR::Function* function = nullptr;
     IR::ArrayType* rowType = nullptr;
+    IR::ConstantInt* skippedCoefficient = nullptr;
 };
 
 struct ProgramMatch {
@@ -363,7 +364,7 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
         return false;
     }
 
-    bool hasSkipCompare = false;
+    IR::ConstantInt* skippedCoefficient = nullptr;
     auto dominators = computeDominators(function);
     for (auto& block : function->getBlocks()) {
         for (auto& owned : block->getInstructions()) {
@@ -384,7 +385,9 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
                     other = compare->getOperand(1 - index);
                 }
             }
-            if (!comparedLoad || !isConstant(other, 1) ||
+            auto* skipValue =
+                dynamic_cast<IR::ConstantInt*>(other);
+            if (!comparedLoad || !skipValue ||
                 comparedLoad->getNumOperands() != 1) {
                 continue;
             }
@@ -407,13 +410,18 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
                 : nullptr;
             if (falseTarget &&
                 dominators[updateStore->getParent()].count(falseTarget)) {
-                hasSkipCompare = true;
+                if (skippedCoefficient &&
+                    skippedCoefficient->getValue() !=
+                        skipValue->getValue()) {
+                    return false;
+                }
+                skippedCoefficient = skipValue;
                 break;
             }
         }
-        if (hasSkipCompare) break;
+        if (skippedCoefficient) break;
     }
-    if (!hasSkipCompare) return false;
+    if (!skippedCoefficient) return false;
 
     CanonicalLoop loopI;
     CanonicalLoop loopJ;
@@ -441,6 +449,7 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
 
     match.function = function;
     match.rowType = rowType;
+    match.skippedCoefficient = skippedCoefficient;
     return true;
 }
 
@@ -875,6 +884,8 @@ IR::Function* createAffineRowSummaryFunction(
     auto* i32 = IR::IntegerType::I32;
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
+    auto* skippedCoefficient = IR::ConstantInt::get(
+        i32, match.skippedCoefficient->getValue());
 
     auto* entry = function->createBlock("entry");
     auto* iHeader = function->createBlock("summary.i.cond");
@@ -953,7 +964,7 @@ IR::Function* createAffineRowSummaryFunction(
         Opc::ADD, i32, "summary.updated",
         product, inputSum);
     auto* skip = IR::Instruction::createCmp(
-        Opc::ICMP, coefficient, one, "eq");
+        Opc::ICMP, coefficient, skippedCoefficient, "eq");
     nextAccumulation->setOperand(0, skip);
     nextAccumulation->setOperand(1, accumulation);
     nextAccumulation->setOperand(2, updated);
