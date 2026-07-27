@@ -15,7 +15,26 @@
   TIMEOUT，`62_percolation` DIFF）在合并前即已存在，属本地 QEMU 超时阈值/判定
   的老问题，非本轮改动引入（已用 old/new 编译器对比确认行为一致）。
 
+## Git 工作流铁律（合并到 main 必须保留开发历史）
+
+- **禁止**用 `git commit-tree TREE -p main` 造一个副本节点挂到 main（我之前
+  犯的错）：那样等于把整条开发链压成一个"凭空几千行修改"的孤立 commit，
+  临时开发分支一删，逐步开发的过程记录就全丢了。
+- **禁止**对集成到 main 的分支用 squash 合并——同理会丢过程。
+- **正确做法**：普通 merge，把开发分支的每个 commit 都带进 main：
+  ```bash
+  git checkout main
+  git merge --no-ff <dev-branch>    # 保留分支拓扑，历史每步都在 main 里
+  git push origin main
+  # 之后即使删掉 <dev-branch>，所有 commit 仍可从 main 追溯
+  ```
+- 判定标准：合并后 `git log --oneline --graph main` 能看到开发分支的每个
+  commit；删掉临时分支后这些 commit 依然存在（被 main 可达）。
+- main 是受保护分支（不能 force push），所以更要一次做对：先在本地把
+  dev-branch 的完整历史 merge 进 main，再普通 push。
+
 ## 验证方法（复现步骤）
+
 
 ```bash
 # 在 WSL 中
@@ -98,7 +117,28 @@ bash scripts/run_tests.sh func O1     # 功能 100 例
 
 ## 危险区（禁止重试，除非改变前提）
 
+### Git 合并到 main 必须用普通 merge，禁止 squash / commit-tree 造副本
+- 教训：曾用 `commit-tree` 把 mergetest 的树接到 main 上生成单节点，等于丢掉了
+  临时分支里逐步开发的全部提交历史——一旦删掉临时分支，main 上只剩"一个节点
+  几千行修改"，过程完全丢失。
+- 正确做法：合并到 main 用 `git merge --no-ff <临时分支>`，把开发过程的每个
+  commit 都带进 main 的历史；这样合并后即使删掉临时开发分支，所有步骤仍在
+  main 可追溯。绝不用 squash、绝不用 commit-tree 手工造节点。
+
+### CodeSink 放开 LOAD 下沉（写屏障保护）反而增加 sl1 spill，已回退
+- 尝试：允许 CodeSink 把 LOAD 下沉到首个同 BB 使用者前，仅当 LOAD 与使用者
+  之间无 STORE/CALL（写屏障，保证内存值不变，语义等价、无需别名分析）。
+  目标：缩短 sl1/sl2 七点 stencil 的 7 个 LOAD 同时活跃区间。
+- 结果：sl1 静态指令 217→224、循环体 sw(sp) 17→20（spill 变多），净退化，
+  正好打在想优化的用例上。已 `git checkout` 回退，sl1 复原 217。
+- 根因：把 7 个 stencil LOAD 下沉后它们反而聚集到加法链附近，同时活跃数没降
+  反升；寄存器分配器原本的调度已较优，文本层/IR 层的贪心下沉破坏了它。
+- 结论：sl1/sl2 的 spill 来自 7 点 stencil 固有的高活跃度，不是 LOAD 摆放
+  位置问题。降它需要真正的寄存器压力感知调度或 rematerialization，且本地
+  测不了真实性能，风险高收益不确定，暂缓。
+
 ### 本地无法验证 h_functional，改动前必须先建基线
+
 - 本地 QEMU 对 h_functional 若干例（`35_math` 浮点、`30_many_dimensions`、
   `12_DSU`、`21_union_find`）产出与 `.out` 不同的结果，但这些例在平台是
   40/40 AC。原因：浮点实现差异 + 未初始化/UB 行为在本地 QEMU 与开发板不同。
