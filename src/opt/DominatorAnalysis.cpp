@@ -121,6 +121,52 @@ bool strictlyDominates(IR::BasicBlock* a, IR::BasicBlock* b, const DomMap& dom) 
 }
 
 // ================================================================
+// 支配树 DFS L/R 区间编码（借鉴 Cpl5 Dominators）
+// 对支配树做一次 DFS，每个块记录入序 L 与出序 R。
+//   a 支配 b  ⟺  L[a] <= L[b] && R[a] >= R[b]
+// 支配判断从沿 idom 链的 O(树高) 降为 O(1)，
+// 供 GVN/CSE/LICM 等需要频繁支配判断的热点 pass 使用。
+// ================================================================
+DomTreeLR computeDomTreeLR(IR::Function* func,
+    const std::unordered_map<IR::BasicBlock*, IR::BasicBlock*>& idom) {
+    DomTreeLR lr;
+    auto* entry = func->getEntryBlock();
+    if (!entry) return lr;
+
+    // 构建支配树子节点表
+    std::unordered_map<IR::BasicBlock*, std::vector<IR::BasicBlock*>> children;
+    for (auto& [bb, parent] : idom) {
+        if (parent) children[parent].push_back(bb);
+    }
+
+    // 迭代式 DFS（避免深支配树递归爆栈）
+    unsigned order = 0;
+    std::vector<std::pair<IR::BasicBlock*, size_t>> stack;
+    lr.L[entry] = ++order;
+    stack.emplace_back(entry, 0);
+    while (!stack.empty()) {
+        auto& [bb, childIdx] = stack.back();
+        auto it = children.find(bb);
+        if (it != children.end() && childIdx < it->second.size()) {
+            auto* child = it->second[childIdx++];
+            lr.L[child] = ++order;
+            stack.emplace_back(child, 0);
+        } else {
+            lr.R[bb] = order;
+            stack.pop_back();
+        }
+    }
+    return lr;
+}
+
+bool dominatesLR(IR::BasicBlock* a, IR::BasicBlock* b, const DomTreeLR& lr) {
+    auto la = lr.L.find(a), lb = lr.L.find(b);
+    if (la == lr.L.end() || lb == lr.L.end()) return false;  // 不可达块
+    auto ra = lr.R.find(a), rb = lr.R.find(b);
+    return la->second <= lb->second && ra->second >= rb->second;
+}
+
+// ================================================================
 // 计算立即支配者（idom）
 // idom(B) = 严格支配 B 的节点中，离 B 最近的那个（支配集最大者）
 // ================================================================

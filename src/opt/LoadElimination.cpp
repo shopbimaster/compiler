@@ -44,7 +44,8 @@ bool involvesGlobal(IR::Value* ptr) {
 // key: LOAD 指令, value: 替换为的值
 using ReplaceMap = std::unordered_map<IR::Instruction*, IR::Value*>;
 
-void loadElimOnFunction(IR::Function* func) {
+void loadElimOnFunction(IR::Function* func,
+                        const std::unordered_set<IR::Function*>& pureFuncs) {
     if (func->isExternal()) return;
 
     // 安全检查：如果函数是递归的（调用自身），跳过 LoadElimination
@@ -139,7 +140,11 @@ void loadElimOnFunction(IR::Function* func) {
             }
             else if (ip->getOpcode() == IR::Instruction::Opcode::CALL) {
                 // CALL 可能修改任意内存，清空所有跟踪
-                lastStoreVal.clear();
+                // A2：纯函数 CALL 不写内存，保留跟踪
+                auto* callee = dynamic_cast<IR::Function*>(ip->getOperand(0));
+                if (!callee || !pureFuncs.count(callee)) {
+                    lastStoreVal.clear();
+                }
             }
         }
     }
@@ -168,6 +173,8 @@ void loadElimOnFunction(IR::Function* func) {
 
 bool loadElimination(IR::Module* mod) {
     bool changed = false;
+    // A2：纯函数识别（一次分析，所有函数复用）
+    auto pureFuncs = detectPureFunctions(mod);
     for (auto& func : mod->getFunctions()) {
         if (func->isExternal()) continue;
 
@@ -176,7 +183,7 @@ bool loadElimination(IR::Module* mod) {
             before += bb->getInstructions().size();
         }
 
-        loadElimOnFunction(func.get());
+        loadElimOnFunction(func.get(), pureFuncs);
 
         size_t after = 0;
         for (auto& bb : func->getBlocks()) {

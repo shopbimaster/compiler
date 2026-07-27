@@ -7,7 +7,7 @@ set -e
 
 C=./build/compiler
 GCC=riscv64-linux-gnu-gcc
-QEMU=qemu-riscv64-static
+QEMU=$(which qemu-riscv64-static 2>/dev/null || which qemu-riscv64)
 SYLIB=./build/libsylib.a
 PERF=test/performance
 WORK=/tmp/perf_test_$$
