@@ -56,6 +56,11 @@ void runO2(IR::Module* mod) {
     // 1a. 树摇
     treeShaking(mod);
 
+    if (radixSortLowering(mod)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     if (repeatedDivRemToNative(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
