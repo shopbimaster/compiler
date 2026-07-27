@@ -98,7 +98,26 @@ bash scripts/run_tests.sh func O1     # 功能 100 例
 
 ## 危险区（禁止重试，除非改变前提）
 
+### 本地无法验证 h_functional，改动前必须先建基线
+- 本地 QEMU 对 h_functional 若干例（`35_math` 浮点、`30_many_dimensions`、
+  `12_DSU`、`21_union_find`）产出与 `.out` 不同的结果，但这些例在平台是
+  40/40 AC。原因：浮点实现差异 + 未初始化/UB 行为在本地 QEMU 与开发板不同。
+- 教训：**h_functional 的本地 DIFF 不能作为退化判据**。任何改动前，必须先在
+  当前 HEAD 上跑一遍 h_functional 记录基线 DIFF 集合，只有"新增"的 DIFF 才算
+  真实退化。缺基线时不要对 h_functional 下结论。
+
+### select(cond,1,x)/select(cond,x,0) → or/and 化简：本地不可验证，暂缓
+- 想法：IfConversion 把 `||`/`&&` 降级成 i1 select，后端展开成 seqz/neg/and/or
+  6 条指令；化简为单条 or/and 可提速 knapsack、短路求值等递归/热路径。
+- 静态效果确实生效（knapsack body 的条件判断 6 条→3 条）。
+- 问题：改完后本地 h_functional 出现 4 例 DIFF，但因无基线无法区分是真退化
+  还是本地环境噪声，且该化简依赖 select 三操作数的语义假设（trueVal/falseVal
+  是否总是 i1、宽整数存 i1 是否安全）我未完全验证。为稳妥已回退。
+- 若要重启：先建 h_functional 基线，再仅提交 select 化简单独上 mergetest 由
+  平台验证；确认 select 操作数类型约定后再放开。
+
 ### peephole 跨基本块边界的冗余 li 消除不安全
+
 - 尝试：在 BB 内冗余 li 消除中，遇到"纯 fall-through 标签"（未被任何跳转
   指令引用）时保留 `regKnownImm`，试图跨单前驱边界消除重复 li。
 - 结果：functional 新增 5 例 DIFF（10_var_defn_func、22/23/24_if_test、
