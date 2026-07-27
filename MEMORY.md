@@ -117,6 +117,28 @@ bash scripts/run_tests.sh func O1     # 功能 100 例
 
 ## 危险区（禁止重试，除非改变前提）
 
+### LoopInterchange 对 matmul 的 j/k 交换：pass 是 pre-SSA 设计 + 交换本身不合法
+- 背景：matmul(~6–25s) 想把 i-j-k 换成 i-k-j 改善局部性。研究后确认此路不通。
+- 根因 1（pass 结构错配）：`src/opt/LoopInterchange.cpp` 整体是**基于
+  alloca/load/store 的文本模式匹配**（`extractIndVar` 找"LOAD→ICMP"、
+  `findIncrementVar` 找"STORE(x+1)"、`swapLoadsInBB` 等都操作 alloca 的
+  load/store）。但它在 O3 跑、位于 mem2reg **之后**：真实 matmul1 IR 里 i、k
+  都已是 PHI（`%i.phi`/`%k.phi`），没有 alloca/load/store-of-k，`extractIndVar`
+  返回 nullptr 直接跳过。只有未被提升的 j 还是 alloca。所以"什么都没交换"、
+  日志里 `isUsedOutsideBBSet` SKIP 其实是另一个候选（j 那个 alloca 循环）报的，
+  k 循环连模式都匹配不上。
+- 根因 2（交换不合法）：matmul1 的 k 循环体是**标量归约** `temp += b[i][k]*a[k][j]`
+  （IR 里 `%temp.phi` 沿 k 累加，循环后 `c[i][j]=temp`）。纯 j-k 交换会破坏归约
+  次序，必须配合**标量扩展**（temp 变 temp[200]）才正确。纯 interchange = 错。
+- 转置段 `b[i][j]=a[j][i]` 也不值得交换：`[i][j]` 与 `[j][i]` 互为转置，任何
+  循环顺序都必有一个数组跳跃访问，交换只是换"谁跳跃"，cache miss 总数几乎不变，
+  净收益≈0（真要优化转置得用 loop tiling，不是 interchange）。而且 i 是 PHI，
+  同样匹配不到。
+- 结论：现有 LoopInterchange 只能吃"未被 mem2reg 提升的 alloca 归纳变量 + 纯数组
+  拷贝 + 方阵同界"的二重循环，对 matmul 这类 PHI 归纳 + 标量归约循环无能为力。
+  要做需重写成 PHI 感知 + 合法性证明（无归约/可标量扩展），是对最敏感循环变换
+  的大重构，且本地测不了性能，风险极高、收益不确定。暂缓。
+
 ### Git 合并到 main 必须用普通 merge，禁止 squash / commit-tree 造副本
 - 教训：曾用 `commit-tree` 把 mergetest 的树接到 main 上生成单节点，等于丢掉了
   临时分支里逐步开发的全部提交历史——一旦删掉临时分支，main 上只剩"一个节点
