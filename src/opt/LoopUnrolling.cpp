@@ -184,6 +184,12 @@ IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId,
         return IR::Instruction::createCmp(op, lhs, rhs, newName);
     }
 
+    if (op == Opc::SELECT) {
+        return IR::Instruction::createSelect(
+            lookup(src->getOperand(0)), lookup(src->getOperand(1)),
+            lookup(src->getOperand(2)), newName);
+    }
+
     if (op == Opc::WIDE_SMOD_MUL) {
         return IR::Instruction::createTernaryOp(
             op, src->getType(), newName,

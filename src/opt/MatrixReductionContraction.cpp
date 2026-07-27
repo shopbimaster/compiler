@@ -32,7 +32,7 @@ struct KernelMatch {
 struct ProgramMatch {
     KernelMatch kernel;
     IR::Function* caller = nullptr;
-    IR::Instruction* startTimer = nullptr;
+    IR::BasicBlock* loopPreheader = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
     IR::GlobalVariable* matrixB = nullptr;
     IR::Value* size = nullptr;
@@ -639,23 +639,28 @@ bool matrixHasUnexpectedAccess(
     return false;
 }
 
-IR::Instruction* findRuntimeCall(
-    IR::Function* function, const std::string& calleeName) {
-    IR::Instruction* result = nullptr;
-    for (auto& block : function->getBlocks()) {
-        for (auto& instruction : block->getInstructions()) {
-            if (instruction->getOpcode() != Opc::CALL ||
-                instruction->getNumOperands() == 0) {
-                continue;
-            }
-            auto* callee =
-                dynamic_cast<IR::Function*>(instruction->getOperand(0));
-            if (!callee || callee->getName() != calleeName) continue;
-            if (result) return nullptr;
-            result = instruction.get();
+IR::BasicBlock* findUniqueLoopPreheader(
+    IR::Function* function, IR::BasicBlock* callBlock) {
+    const NaturalLoop* containingLoop = nullptr;
+    auto loops = findNaturalLoops(function);
+    for (const auto& loop : loops) {
+        if (!loop.body.count(callBlock)) continue;
+        if (!containingLoop ||
+            loop.body.size() < containingLoop->body.size()) {
+            containingLoop = &loop;
         }
     }
-    return result;
+    if (!containingLoop) return nullptr;
+
+    auto predecessors = buildPredecessors(function);
+    IR::BasicBlock* preheader = nullptr;
+    for (auto* predecessor :
+         predecessors[containingLoop->header]) {
+        if (containingLoop->body.count(predecessor)) continue;
+        if (preheader) return nullptr;
+        preheader = predecessor;
+    }
+    return preheader;
 }
 
 bool matchProgram(IR::Module* module, ProgramMatch& match) {
@@ -705,11 +710,11 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
             continue;
         }
 
-        auto* startTimer =
-            findRuntimeCall(caller, "_sysy_starttime");
         IR::Instruction* finalLoad = nullptr;
         IR::Instruction* finalInnerCompare = nullptr;
-        if (!startTimer ||
+        auto* loopPreheader =
+            findUniqueLoopPreheader(caller, first->getParent());
+        if (!loopPreheader ||
             !findFinalReduction(
                 module, caller, kernels[0].function,
                 matrixB, first->getOperand(1),
@@ -721,14 +726,14 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
         auto* sizeInstruction =
             dynamic_cast<IR::Instruction*>(first->getOperand(1));
         if (sizeInstruction &&
-            !dominators[startTimer->getParent()].count(
+            !dominators[loopPreheader].count(
                 sizeInstruction->getParent())) {
             continue;
         }
 
         match.kernel = kernels[0];
         match.caller = caller;
-        match.startTimer = startTimer;
+        match.loopPreheader = loopPreheader;
         match.finalInnerCompare = finalInnerCompare;
         match.matrixB = matrixB;
         match.size = first->getOperand(1);
@@ -979,7 +984,6 @@ bool applyContraction(IR::Module* module,
                       const ProgramMatch& match) {
     auto* summaryFunction =
         createRowSummaryFunction(module, match.kernel.rowType);
-    auto* timerBlock = match.startTimer->getParent();
     auto* zero =
         IR::ConstantInt::get(IR::IntegerType::I32, 0);
     auto* matrixType = dynamic_cast<IR::PointerType*>(
@@ -993,22 +997,21 @@ bool applyContraction(IR::Module* module,
         summaryFunction->getFunctionType(), summaryFunction,
         {match.size, matrixBase}, "");
 
-    bool inserted = false;
-    for (auto iterator = timerBlock->begin();
-         iterator != timerBlock->end(); ++iterator) {
-        if (iterator->get() != match.startTimer) continue;
-        iterator = timerBlock->insert(iterator, matrixBase);
+    auto* terminator = match.loopPreheader->getTerminator();
+    if (!terminator) return false;
+    for (auto iterator = match.loopPreheader->begin();
+         iterator != match.loopPreheader->end(); ++iterator) {
+        if (iterator->get() != terminator) continue;
+        iterator =
+            match.loopPreheader->insert(iterator, matrixBase);
         ++iterator;
-        timerBlock->insert(iterator, summaryCall);
-        inserted = true;
-        break;
+        match.loopPreheader->insert(iterator, summaryCall);
+        replaceKernelWithRowSummary(match.kernel);
+        match.finalInnerCompare->setOperand(
+            1, IR::ConstantInt::get(IR::IntegerType::I32, 1));
+        return true;
     }
-    if (!inserted) return false;
-
-    replaceKernelWithRowSummary(match.kernel);
-    match.finalInnerCompare->setOperand(
-        1, IR::ConstantInt::get(IR::IntegerType::I32, 1));
-    return true;
+    return false;
 }
 
 } // namespace
