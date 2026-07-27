@@ -139,6 +139,7 @@ add_library(sysy_opt STATIC
     src/opt/RecursiveCallGuard.cpp
     src/opt/MatrixReductionContraction.cpp
     src/opt/RadixSortLowering.cpp
+    src/opt/RecursiveMemoization.cpp
     src/opt/BitOpPatternRecognition.cpp
     src/opt/PowerOfTwoDispatch.cpp
     src/opt/GlobalVariablePromotion.cpp

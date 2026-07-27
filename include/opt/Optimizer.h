@@ -118,6 +118,7 @@ bool repeatedDivRemToNative(IR::Module* mod);
 bool hoistRecursiveCallGuards(IR::Module* mod);
 bool matrixReductionContraction(IR::Module* mod);
 bool radixSortLowering(IR::Module* mod);
+bool recursiveMemoization(IR::Module* mod);
 bool bitOpPatternRecognition(IR::Module* mod);
 bool powerOfTwoDispatchSimplification(IR::Module* mod);
 bool globalVariablePromotion(IR::Module* mod);

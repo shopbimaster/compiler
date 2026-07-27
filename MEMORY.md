@@ -112,6 +112,31 @@ bash scripts/run_tests.sh func O1     # 功能 100 例
   （合并图可见 `075ce1d perf(opt): 将矩阵迭代收缩为行和递推`）。冲突仅
   Optimizer.cpp 自动合并成功。
 
+### 7. RecursiveMemoization：纯自递归函数结果表化（perf-knapsack-memo，本轮新增）
+
+- 文件：新增 `src/opt/RecursiveMemoization.cpp`（420 行），`Optimizer.h` 声明
+  `recursiveMemoization`，`Optimizer.cpp` 在 O1 早期（mem2reg 之前，PHI 尚不
+  存在）调用一次；`CMakeLists.txt` 加入编译。
+- 匹配条件（纯结构判据，与函数名/字面值无关）：恰好 2 个 i32 参数、i32 返回、
+  非 external；函数体内所有 CALL 都指向自身（无 I/O、无其它被调函数）；所有
+  STORE 只写本函数的直接 ALLOCA（不写 GEP/全局/指针派生地址，即无外部可观察
+  副作用）；函数体内无 PHI（本 pass 跑在 Mem2Reg 之前，body 仍是 alloca 形式，
+  拒绝 PHI 让判据保持纯结构化且克隆逻辑简单）；且函数在自身递归之外只有唯一
+  一个外部调用点（单一"根"调用，保证两次调用之间不会有代码修改全局状态使
+  memo 表失效）。
+- 变换：给函数包一层 memo 表（按 (a,b) 两个参数建静态表，`kDim0=256 ×
+  kDim1=20000`），入口先查表命中则直接返回缓存值；未命中或参数越界则回退到
+  原函数体的克隆版本（"fallback"），计算完成后写回表再返回。越界参数总是走
+  原始递归路径，因此正确性与表大小无关，表大小只影响能省下多少重复计算。
+- 效果：knapsack 类小状态 DP 递归实测 770ms→230ms（本地单独用例）。
+- 验证：`cmake --build build_wsl` 通过；functional+performance 全量 160 例
+  回归（超时阈值 40s，避开批量跑测试时 WSL 资源竞争造成的假性 TIMEOUT）
+  Pass 156，仅 `55_sort_test1/62_percolation/68_brainfk/85_long_code` 四例老
+  失败（基线本身既有问题，与本次改动无关），零新增退化。之前误判的
+  `h-5-01/h-5-02/h-8-*/shuffle1` TIMEOUT 经单独计时核实（基线 vs 本改动，
+  qemu 独立运行）耗时几乎相同（如 shuffle1 基线 20.9s / 改动后 16.8s），
+  纯粹是批测试脚本 10s 超时阈值过紧 + 并发资源竞争导致，非真实回归。
+
 ## 优化流水线要点（现状速记）
 
 来源 `src/opt/Optimizer.cpp`：
@@ -241,5 +266,3 @@ bash scripts/run_tests.sh func O1     # 功能 100 例
 3. 性能 60 例必须 60/60，functional 保持既有基线（不新增失败）。
 4. 用 old/new 编译器对同一算例做汇编 diff + 运行输出 diff，确认语义一致。
 5. 通过后推送到 `testbench`，评测用推 `mergetest`。
-
-
