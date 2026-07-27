@@ -27,6 +27,7 @@ struct CanonicalLoop {
 struct KernelMatch {
     IR::Function* function = nullptr;
     IR::ArrayType* rowType = nullptr;
+    IR::ConstantInt* skippedCoefficient = nullptr;
 };
 
 struct ProgramMatch {
@@ -34,7 +35,9 @@ struct ProgramMatch {
     IR::Function* caller = nullptr;
     IR::BasicBlock* loopPreheader = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
-    IR::GlobalVariable* matrixB = nullptr;
+    std::vector<IR::Instruction*> calls;
+    IR::GlobalVariable* seedMatrix = nullptr;
+    IR::GlobalVariable* resultMatrix = nullptr;
     IR::Value* size = nullptr;
 };
 
@@ -361,7 +364,7 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
         return false;
     }
 
-    bool hasSkipCompare = false;
+    IR::ConstantInt* skippedCoefficient = nullptr;
     auto dominators = computeDominators(function);
     for (auto& block : function->getBlocks()) {
         for (auto& owned : block->getInstructions()) {
@@ -382,7 +385,9 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
                     other = compare->getOperand(1 - index);
                 }
             }
-            if (!comparedLoad || !isConstant(other, 1) ||
+            auto* skipValue =
+                dynamic_cast<IR::ConstantInt*>(other);
+            if (!comparedLoad || !skipValue ||
                 comparedLoad->getNumOperands() != 1) {
                 continue;
             }
@@ -405,13 +410,18 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
                 : nullptr;
             if (falseTarget &&
                 dominators[updateStore->getParent()].count(falseTarget)) {
-                hasSkipCompare = true;
+                if (skippedCoefficient &&
+                    skippedCoefficient->getValue() !=
+                        skipValue->getValue()) {
+                    return false;
+                }
+                skippedCoefficient = skipValue;
                 break;
             }
         }
-        if (hasSkipCompare) break;
+        if (skippedCoefficient) break;
     }
-    if (!hasSkipCompare) return false;
+    if (!skippedCoefficient) return false;
 
     CanonicalLoop loopI;
     CanonicalLoop loopJ;
@@ -439,6 +449,7 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
 
     match.function = function;
     match.rowType = rowType;
+    match.skippedCoefficient = skippedCoefficient;
     return true;
 }
 
@@ -461,9 +472,10 @@ std::vector<IR::Instruction*> collectFunctionCalls(
 bool findFinalReduction(
     IR::Module* module,
     IR::Function* caller,
-    IR::Function* kernel,
-    IR::GlobalVariable* matrixB,
+    IR::GlobalVariable* matrix,
     IR::Value* size,
+    const std::vector<IR::Instruction*>& allowedCalls,
+    IR::BasicBlock* loopPreheader,
     IR::Instruction*& finalLoad,
     IR::Instruction*& innerCompare) {
     std::vector<IR::Instruction*> loads;
@@ -475,19 +487,19 @@ bool findFinalReduction(
             for (auto& instruction : block->getInstructions()) {
                 if (instruction->getOpcode() == Opc::LOAD &&
                     instruction->getNumOperands() == 1 &&
-                    rootGlobal(instruction->getOperand(0)) == matrixB) {
+                    rootGlobal(instruction->getOperand(0)) == matrix) {
                     loads.push_back(instruction.get());
                 }
                 if (instruction->getOpcode() == Opc::STORE &&
                     instruction->getNumOperands() == 2 &&
-                    rootGlobal(instruction->getOperand(1)) == matrixB) {
+                    rootGlobal(instruction->getOperand(1)) == matrix) {
                     stores.push_back(instruction.get());
                 }
                 if (instruction->getOpcode() == Opc::CALL) {
                     for (unsigned index = 1;
                          index < instruction->getNumOperands(); ++index) {
                         if (rootGlobal(instruction->getOperand(index)) ==
-                            matrixB) {
+                            matrix) {
                             callsWithMatrix.push_back(instruction.get());
                             break;
                         }
@@ -497,20 +509,49 @@ bool findFinalReduction(
         }
     }
 
-    if (loads.size() != 1 || stores.size() != 1 ||
-        callsWithMatrix.size() != 2 ||
-        loads[0]->getParent()->getParent() != caller ||
-        stores[0]->getParent()->getParent() != caller) {
+    if (loads.size() != 1 ||
+        callsWithMatrix.empty() ||
+        loads[0]->getParent()->getParent() != caller) {
         return false;
     }
     for (auto* call : callsWithMatrix) {
-        if (call->getOperand(0) != kernel) return false;
+        if (std::find(
+                allowedCalls.begin(), allowedCalls.end(), call) ==
+            allowedCalls.end()) {
+            return false;
+        }
+    }
+
+    auto successors = buildSuccessors(caller);
+    auto reachableFromPreheader =
+        [&](IR::BasicBlock* target) {
+            std::vector<IR::BasicBlock*> worklist = {
+                loopPreheader};
+            std::unordered_set<IR::BasicBlock*> visited = {
+                loopPreheader};
+            while (!worklist.empty()) {
+                auto* block = worklist.back();
+                worklist.pop_back();
+                if (block == target) return true;
+                for (auto* successor : successors[block]) {
+                    if (visited.insert(successor).second) {
+                        worklist.push_back(successor);
+                    }
+                }
+            }
+            return false;
+        };
+    for (auto* store : stores) {
+        if (store->getParent()->getParent() != caller ||
+            reachableFromPreheader(store->getParent())) {
+            return false;
+        }
     }
 
     PointerAccess access;
     if (!collectPointerAccess(
             loads[0]->getOperand(0), nullptr, access) ||
-        access.root != matrixB || access.indices.size() != 2) {
+        access.root != matrix || access.indices.size() != 2) {
         return false;
     }
 
@@ -593,23 +634,9 @@ bool findFinalReduction(
     return true;
 }
 
-bool comesBeforeInBlock(IR::Instruction* first,
-                        IR::Instruction* second) {
-    if (!first || !second ||
-        first->getParent() != second->getParent()) {
-        return false;
-    }
-    for (auto& instruction :
-         first->getParent()->getInstructions()) {
-        if (instruction.get() == first) return true;
-        if (instruction.get() == second) return false;
-    }
-    return false;
-}
-
 bool matrixHasUnexpectedAccess(
     IR::Module* module, IR::GlobalVariable* matrix,
-    IR::Instruction* firstCall, IR::Instruction* secondCall) {
+    const std::vector<IR::Instruction*>& allowedCalls) {
     for (auto& function : module->getFunctions()) {
         for (auto& block : function->getBlocks()) {
             for (auto& instruction : block->getInstructions()) {
@@ -622,8 +649,9 @@ bool matrixHasUnexpectedAccess(
                     return true;
                 }
                 if (instruction->getOpcode() != Opc::CALL ||
-                    instruction.get() == firstCall ||
-                    instruction.get() == secondCall) {
+                    std::find(
+                        allowedCalls.begin(), allowedCalls.end(),
+                        instruction.get()) != allowedCalls.end()) {
                     continue;
                 }
                 for (unsigned index = 1;
@@ -637,6 +665,70 @@ bool matrixHasUnexpectedAccess(
         }
     }
     return false;
+}
+
+bool matrixIsValidLiveIn(
+    IR::Module* module, IR::GlobalVariable* matrix,
+    IR::Function* caller,
+    const std::vector<IR::Instruction*>& allowedCalls,
+    IR::BasicBlock* loopPreheader) {
+    std::vector<IR::Instruction*> loads;
+    std::vector<IR::Instruction*> stores;
+    for (auto& function : module->getFunctions()) {
+        for (auto& block : function->getBlocks()) {
+            for (auto& instruction : block->getInstructions()) {
+                if (instruction->getOpcode() == Opc::LOAD &&
+                    instruction->getNumOperands() == 1 &&
+                    rootGlobal(instruction->getOperand(0)) == matrix) {
+                    loads.push_back(instruction.get());
+                }
+                if (instruction->getOpcode() == Opc::STORE &&
+                    instruction->getNumOperands() == 2 &&
+                    rootGlobal(instruction->getOperand(1)) == matrix) {
+                    stores.push_back(instruction.get());
+                }
+                if (instruction->getOpcode() != Opc::CALL) continue;
+                bool referencesMatrix = false;
+                for (unsigned index = 1;
+                     index < instruction->getNumOperands(); ++index) {
+                    if (rootGlobal(instruction->getOperand(index)) ==
+                        matrix) {
+                        referencesMatrix = true;
+                        break;
+                    }
+                }
+                if (referencesMatrix &&
+                    std::find(
+                        allowedCalls.begin(), allowedCalls.end(),
+                        instruction.get()) == allowedCalls.end()) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    auto successors = buildSuccessors(caller);
+    std::vector<IR::BasicBlock*> worklist = {loopPreheader};
+    std::unordered_set<IR::BasicBlock*> reachable = {loopPreheader};
+    while (!worklist.empty()) {
+        auto* block = worklist.back();
+        worklist.pop_back();
+        for (auto* successor : successors[block]) {
+            if (reachable.insert(successor).second) {
+                worklist.push_back(successor);
+            }
+        }
+    }
+    std::vector<IR::Instruction*> directAccesses = loads;
+    directAccesses.insert(
+        directAccesses.end(), stores.begin(), stores.end());
+    for (auto* access : directAccesses) {
+        if (access->getParent()->getParent() != caller ||
+            reachable.count(access->getParent())) {
+            return false;
+        }
+    }
+    return true;
 }
 
 IR::BasicBlock* findUniqueLoopPreheader(
@@ -666,7 +758,8 @@ IR::BasicBlock* findUniqueLoopPreheader(
 bool matchProgram(IR::Module* module, ProgramMatch& match) {
     std::vector<KernelMatch> kernels;
     for (auto& function : module->getFunctions()) {
-        if (function->getName() == "__opt_contract_row_sum") {
+        if (function->getName() == "__opt_contract_row_sum" ||
+            function->getName() == "__opt_affine_row_summary") {
             return false;
         }
         KernelMatch candidate;
@@ -677,99 +770,101 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
     if (kernels.size() != 1) return false;
 
     auto calls = collectFunctionCalls(kernels[0].function);
-    if (calls.size() != 2 ||
-        calls[0]->getNumOperands() != 5 ||
-        calls[1]->getNumOperands() != 5) {
-        return false;
-    }
-
+    if (calls.empty()) return false;
     auto* caller = calls[0]->getParent()->getParent();
-    if (!caller || calls[1]->getParent()->getParent() != caller ||
-        calls[0]->getParent() != calls[1]->getParent()) {
+    auto* callBlock = calls[0]->getParent();
+    if (!caller || !callBlock) return false;
+    std::unordered_set<IR::Instruction*> callSet;
+    for (auto* call : calls) {
+        if (call->getNumOperands() != 5 ||
+            call->getParent()->getParent() != caller ||
+            call->getParent() != callBlock) {
+            return false;
+        }
+        callSet.insert(call);
+    }
+
+    std::vector<IR::Instruction*> orderedCalls;
+    for (auto& instruction : callBlock->getInstructions()) {
+        if (callSet.count(instruction.get())) {
+            orderedCalls.push_back(instruction.get());
+        }
+    }
+    if (orderedCalls.size() != calls.size()) return false;
+
+    auto* size = orderedCalls.front()->getOperand(1);
+    auto* coefficientMatrix =
+        rootGlobal(orderedCalls.front()->getOperand(2));
+    auto* seedMatrix =
+        rootGlobal(orderedCalls.front()->getOperand(3));
+    if (!coefficientMatrix || !seedMatrix ||
+        coefficientMatrix == seedMatrix) {
         return false;
     }
 
-    for (auto* first : calls) {
-        auto* second = first == calls[0] ? calls[1] : calls[0];
-        if (first->getOperand(1) != second->getOperand(1)) continue;
-
-        auto* matrixA = rootGlobal(first->getOperand(2));
-        auto* matrixB = rootGlobal(first->getOperand(3));
-        auto* matrixC = rootGlobal(first->getOperand(4));
-        if (!matrixA || !matrixB || !matrixC ||
-            matrixA == matrixB || matrixA == matrixC ||
-            matrixB == matrixC ||
-            rootGlobal(second->getOperand(2)) != matrixA ||
-            rootGlobal(second->getOperand(3)) != matrixC ||
-            rootGlobal(second->getOperand(4)) != matrixB) {
-            continue;
+    auto* currentMatrix = seedMatrix;
+    std::unordered_set<IR::GlobalVariable*> carrierMatrices = {
+        seedMatrix};
+    for (auto* call : orderedCalls) {
+        auto* inputMatrix = rootGlobal(call->getOperand(3));
+        auto* outputMatrix = rootGlobal(call->getOperand(4));
+        if (call->getOperand(1) != size ||
+            rootGlobal(call->getOperand(2)) != coefficientMatrix ||
+            inputMatrix != currentMatrix ||
+            !outputMatrix ||
+            outputMatrix == inputMatrix ||
+            outputMatrix == coefficientMatrix) {
+            return false;
         }
-        if (!comesBeforeInBlock(first, second) ||
-            matrixHasUnexpectedAccess(
-                module, matrixC, first, second)) {
-            continue;
-        }
-
-        IR::Instruction* finalLoad = nullptr;
-        IR::Instruction* finalInnerCompare = nullptr;
-        auto* loopPreheader =
-            findUniqueLoopPreheader(caller, first->getParent());
-        if (!loopPreheader ||
-            !findFinalReduction(
-                module, caller, kernels[0].function,
-                matrixB, first->getOperand(1),
-                finalLoad, finalInnerCompare)) {
-            continue;
-        }
-
-        auto dominators = computeDominators(caller);
-        auto* sizeInstruction =
-            dynamic_cast<IR::Instruction*>(first->getOperand(1));
-        if (sizeInstruction &&
-            !dominators[loopPreheader].count(
-                sizeInstruction->getParent())) {
-            continue;
-        }
-
-        match.kernel = kernels[0];
-        match.caller = caller;
-        match.loopPreheader = loopPreheader;
-        match.finalInnerCompare = finalInnerCompare;
-        match.matrixB = matrixB;
-        match.size = first->getOperand(1);
-        return true;
+        carrierMatrices.insert(outputMatrix);
+        currentMatrix = outputMatrix;
     }
-    return false;
-}
+    auto* resultMatrix = currentMatrix;
 
-void clearFunctionBody(IR::Function* function) {
-    auto* entry = function->getEntryBlock();
+    auto* loopPreheader =
+        findUniqueLoopPreheader(caller, callBlock);
+    IR::Instruction* finalLoad = nullptr;
+    IR::Instruction* finalInnerCompare = nullptr;
+    if (!loopPreheader ||
+        !findFinalReduction(
+            module, caller, resultMatrix, size,
+            orderedCalls, loopPreheader,
+            finalLoad, finalInnerCompare)) {
+        return false;
+    }
 
-    // Break every instruction-to-instruction use before destroying any
-    // instruction. Replacing uses while walking the old body mutates use
-    // lists that may themselves belong to instructions destroyed earlier.
-    for (auto& block : function->getBlocks()) {
-        for (auto& instruction : block->getInstructions()) {
-            for (size_t index = 0;
-                 index < instruction->getNumOperands(); ++index) {
-                instruction->setOperand(index, nullptr);
+    for (auto* matrix : carrierMatrices) {
+        if (matrix == resultMatrix) continue;
+        if (matrix == seedMatrix) {
+            if (!matrixIsValidLiveIn(
+                    module, matrix, caller,
+                    orderedCalls, loopPreheader)) {
+                return false;
             }
+        } else if (matrixHasUnexpectedAccess(
+                       module, matrix, orderedCalls)) {
+            return false;
         }
     }
-    for (auto& block : function->getBlocks()) {
-        while (!block->empty()) {
-            auto iterator = block->begin();
-            block->erase(iterator);
-        }
+
+    auto dominators = computeDominators(caller);
+    auto* sizeInstruction =
+        dynamic_cast<IR::Instruction*>(size);
+    if (sizeInstruction &&
+        !dominators[loopPreheader].count(
+            sizeInstruction->getParent())) {
+        return false;
     }
-    auto& blocks = function->getBlocks();
-    blocks.erase(
-        std::remove_if(
-            blocks.begin(), blocks.end(),
-            [entry](const std::unique_ptr<IR::BasicBlock>& block) {
-                return block.get() != entry;
-            }),
-        blocks.end());
+
+    match.kernel = kernels[0];
+    match.caller = caller;
+    match.loopPreheader = loopPreheader;
+    match.finalInnerCompare = finalInnerCompare;
+    match.calls = std::move(orderedCalls);
+    match.seedMatrix = seedMatrix;
+    match.resultMatrix = resultMatrix;
+    match.size = size;
+    return true;
 }
 
 IR::Instruction* makePhi(
@@ -784,14 +879,18 @@ IR::Instruction* makePhi(
     return phi;
 }
 
-void replaceKernelWithRowSummary(const KernelMatch& match) {
-    auto* function = match.function;
+IR::Function* createAffineRowSummaryFunction(
+    IR::Module* module, const KernelMatch& match) {
+    auto* function = module->createFunction(
+        match.function->getFunctionType(),
+        "__opt_affine_row_summary", false);
     auto* i32 = IR::IntegerType::I32;
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
+    auto* skippedCoefficient = IR::ConstantInt::get(
+        i32, match.skippedCoefficient->getValue());
 
-    clearFunctionBody(function);
-    auto* entry = function->getEntryBlock();
+    auto* entry = function->createBlock("entry");
     auto* iHeader = function->createBlock("summary.i.cond");
     auto* iBody = function->createBlock("summary.i.body");
     auto* kHeader = function->createBlock("summary.k.cond");
@@ -868,7 +967,7 @@ void replaceKernelWithRowSummary(const KernelMatch& match) {
         Opc::ADD, i32, "summary.updated",
         product, inputSum);
     auto* skip = IR::Instruction::createCmp(
-        Opc::ICMP, coefficient, one, "eq");
+        Opc::ICMP, coefficient, skippedCoefficient, "eq");
     nextAccumulation->setOperand(0, skip);
     nextAccumulation->setOperand(1, accumulation);
     nextAccumulation->setOperand(2, updated);
@@ -896,6 +995,7 @@ void replaceKernelWithRowSummary(const KernelMatch& match) {
     iLatch->pushBack(iNext);
     iLatch->pushBack(IR::Instruction::createBr(iHeader));
     exit->pushBack(IR::Instruction::createRet(nullptr));
+    return function;
 }
 
 IR::Function* createRowSummaryFunction(
@@ -984,14 +1084,16 @@ bool applyContraction(IR::Module* module,
                       const ProgramMatch& match) {
     auto* summaryFunction =
         createRowSummaryFunction(module, match.kernel.rowType);
+    auto* summaryKernel =
+        createAffineRowSummaryFunction(module, match.kernel);
     auto* zero =
         IR::ConstantInt::get(IR::IntegerType::I32, 0);
     auto* matrixType = dynamic_cast<IR::PointerType*>(
-        match.matrixB->getType());
+        match.seedMatrix->getType());
     if (!matrixType) return false;
     auto* matrixBase =
         IR::Instruction::createGetElementPtr(
-            matrixType->getPointeeType(), match.matrixB,
+            matrixType->getPointeeType(), match.seedMatrix,
             {zero, zero}, "contract.B.base");
     auto* summaryCall = IR::Instruction::createCall(
         summaryFunction->getFunctionType(), summaryFunction,
@@ -1006,7 +1108,9 @@ bool applyContraction(IR::Module* module,
             match.loopPreheader->insert(iterator, matrixBase);
         ++iterator;
         match.loopPreheader->insert(iterator, summaryCall);
-        replaceKernelWithRowSummary(match.kernel);
+        for (auto* call : match.calls) {
+            call->setOperand(0, summaryKernel);
+        }
         match.finalInnerCompare->setOperand(
             1, IR::ConstantInt::get(IR::IntegerType::I32, 1));
         return true;
