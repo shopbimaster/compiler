@@ -381,6 +381,8 @@ void runO2(IR::Module* mod) {
             deadCodeElimination(mod);
         }
     }
+
+    matrixReductionContraction(mod);
 }
 
 // ================================================================
