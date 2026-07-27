@@ -7,7 +7,7 @@
 ## 当前分支与基线
 
 - 主工作分支：`testbench`；集成/评测用推送分支：`mergetest`。
-- 最新集成提交：`f0c6753`（合并 perf-bitloop-1 后）。
+- 最新集成提交：`6c006af`（`git merge --no-ff` 合并 perf-mm-reduction-1，testbench 与 mergetest 同步至此）。
 - 本地验证环境：WSL Ubuntu，`riscv64-linux-gnu-gcc` + `qemu-riscv64-static`，
   构建目录 `build_wsl`。
 - 本地性能算例：**60/60 PASS**，无退化。
