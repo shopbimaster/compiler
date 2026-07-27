@@ -114,6 +114,7 @@ void runP3(IR::Module* mod);
 // ================================================================
 bool recursiveMulToNative(IR::Module* mod);
 bool recursiveModularMulToNative(IR::Module* mod);
+bool matrixReductionContraction(IR::Module* mod);
 bool bitOpPatternRecognition(IR::Module* mod);
 bool powerOfTwoDispatchSimplification(IR::Module* mod);
 bool globalVariablePromotion(IR::Module* mod);
