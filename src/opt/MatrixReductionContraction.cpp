@@ -1,4 +1,5 @@
 #include "opt/Optimizer.h"
+#include "opt/LoopPatternAnalysis.h"
 
 #include <algorithm>
 #include <memory>
@@ -17,11 +18,6 @@ using AllocaArgumentMap =
 struct PointerAccess {
     IR::Value* root = nullptr;
     std::vector<IR::Value*> indices;
-};
-
-struct CanonicalLoop {
-    IR::Instruction* compare = nullptr;
-    std::unordered_set<IR::BasicBlock*> body;
 };
 
 struct KernelMatch {
@@ -44,17 +40,6 @@ struct ProgramMatch {
 bool isConstant(IR::Value* value, int64_t expected) {
     auto* constant = dynamic_cast<IR::ConstantInt*>(value);
     return constant && constant->getValue() == expected;
-}
-
-bool isAddOneOf(IR::Instruction* instruction, IR::Value* value) {
-    if (!instruction || instruction->getOpcode() != Opc::ADD ||
-        instruction->getNumOperands() != 2) {
-        return false;
-    }
-    return (instruction->getOperand(0) == value &&
-            isConstant(instruction->getOperand(1), 1)) ||
-           (instruction->getOperand(1) == value &&
-            isConstant(instruction->getOperand(0), 1));
 }
 
 AllocaArgumentMap buildAllocaArgumentMap(IR::Function* function) {
@@ -147,65 +132,6 @@ IR::GlobalVariable* rootGlobal(IR::Value* value) {
     PointerAccess access;
     if (!collectPointerAccess(value, nullptr, access)) return nullptr;
     return dynamic_cast<IR::GlobalVariable*>(access.root);
-}
-
-bool matchCanonicalLoop(IR::Function* function,
-                        IR::Value* induction,
-                        IR::Value* bound,
-                        IR::BasicBlock* containedBlock,
-                        CanonicalLoop& match) {
-    auto* phi = dynamic_cast<IR::Instruction*>(induction);
-    if (!phi || phi->getOpcode() != Opc::PHI ||
-        phi->getNumOperands() < 4 ||
-        phi->getNumOperands() % 2 != 0) {
-        return false;
-    }
-
-    auto* header = phi->getParent();
-    auto* terminator = header ? header->getTerminator() : nullptr;
-    if (!terminator || terminator->getOpcode() != Opc::COND_BR ||
-        terminator->getNumOperands() != 3) {
-        return false;
-    }
-
-    auto* compare =
-        dynamic_cast<IR::Instruction*>(terminator->getOperand(0));
-    if (!compare || compare->getOpcode() != Opc::ICMP ||
-        compare->getName() != "slt" ||
-        compare->getNumOperands() != 2 ||
-        compare->getOperand(0) != phi ||
-        compare->getOperand(1) != bound) {
-        return false;
-    }
-
-    bool hasZero = false;
-    bool hasStep = false;
-    for (unsigned index = 0;
-         index < phi->getNumOperands(); index += 2) {
-        auto* incoming = phi->getOperand(index);
-        if (isConstant(incoming, 0)) {
-            hasZero = true;
-            continue;
-        }
-        auto* add = dynamic_cast<IR::Instruction*>(incoming);
-        if (!isAddOneOf(add, phi)) return false;
-        hasStep = true;
-    }
-    if (!hasZero || !hasStep) return false;
-
-    bool contains = false;
-    for (auto& loop : findNaturalLoops(function)) {
-        if (loop.header == header &&
-            loop.body.count(containedBlock)) {
-            contains = true;
-            match.body = loop.body;
-            break;
-        }
-    }
-    if (!contains) return false;
-
-    match.compare = compare;
-    return true;
 }
 
 bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
@@ -421,25 +347,25 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
         }
         if (skippedCoefficient) break;
     }
-    CanonicalLoop loopI;
-    CanonicalLoop loopJ;
-    CanonicalLoop loopK;
-    CanonicalLoop zeroLoopI;
-    CanonicalLoop zeroLoopJ;
+    CanonicalCountedLoop loopI;
+    CanonicalCountedLoop loopJ;
+    CanonicalCountedLoop loopK;
+    CanonicalCountedLoop zeroLoopI;
+    CanonicalCountedLoop zeroLoopJ;
     auto* size = function->getArg(0);
-    if (!matchCanonicalLoop(
+    if (!analyzeCanonicalCountedLoop(
             function, indexI, size,
             updateStore->getParent(), loopI) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             function, indexJ, size,
             updateStore->getParent(), loopJ) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             function, indexK, size,
             updateStore->getParent(), loopK) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             function, zeroOutput.indices[0], size,
             zeroStore->getParent(), zeroLoopI) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             function, zeroOutput.indices[1], size,
             zeroStore->getParent(), zeroLoopJ)) {
         return false;
@@ -621,12 +547,12 @@ bool findFinalReduction(
         return false;
     }
 
-    CanonicalLoop outer;
-    CanonicalLoop inner;
-    if (!matchCanonicalLoop(
+    CanonicalCountedLoop outer;
+    CanonicalCountedLoop inner;
+    if (!analyzeCanonicalCountedLoop(
             caller, access.indices[0], size,
             loads[0]->getParent(), outer) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             caller, access.indices[1], size,
             loads[0]->getParent(), inner)) {
         return false;
