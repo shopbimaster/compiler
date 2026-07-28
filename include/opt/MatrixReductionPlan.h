@@ -14,6 +14,7 @@ struct AffineKernelSummary {
     IR::ArrayType* rowType = nullptr;
     IR::ConstantInt* skippedScale = nullptr;
     int64_t indexStart = 0;
+    int64_t indexStep = 1;
     bool inclusiveUpperBound = false;
 };
 

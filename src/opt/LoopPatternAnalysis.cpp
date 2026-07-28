@@ -7,20 +7,27 @@ namespace {
 
 using Opc = IR::Instruction::Opcode;
 
-bool isConstant(IR::Value* value, int64_t expected) {
-    auto* constant = dynamic_cast<IR::ConstantInt*>(value);
-    return constant && constant->getValue() == expected;
-}
-
-bool isAddOneOf(IR::Instruction* instruction, IR::Value* value) {
+bool getPositiveConstantStep(
+    IR::Instruction* instruction,
+    IR::Value* induction,
+    int64_t& step) {
     if (!instruction || instruction->getOpcode() != Opc::ADD ||
         instruction->getNumOperands() != 2) {
         return false;
     }
-    return (instruction->getOperand(0) == value &&
-            isConstant(instruction->getOperand(1), 1)) ||
-           (instruction->getOperand(1) == value &&
-            isConstant(instruction->getOperand(0), 1));
+    IR::Value* stepValue = nullptr;
+    if (instruction->getOperand(0) == induction) {
+        stepValue = instruction->getOperand(1);
+    } else if (instruction->getOperand(1) == induction) {
+        stepValue = instruction->getOperand(0);
+    } else {
+        return false;
+    }
+    auto* constant =
+        dynamic_cast<IR::ConstantInt*>(stepValue);
+    if (!constant || constant->getValue() <= 0) return false;
+    step = constant->getValue();
+    return true;
 }
 
 } // namespace
@@ -89,7 +96,7 @@ bool analyzeCanonicalCountedLoop(
     if (!naturalLoop) return false;
 
     IR::Value* start = nullptr;
-    bool hasStep = false;
+    int64_t step = 0;
     for (unsigned index = 0;
          index < phi->getNumOperands(); index += 2) {
         auto* incoming = phi->getOperand(index);
@@ -102,17 +109,22 @@ bool analyzeCanonicalCountedLoop(
             continue;
         }
         auto* add = dynamic_cast<IR::Instruction*>(incoming);
-        if (!isAddOneOf(add, phi)) return false;
-        hasStep = true;
+        int64_t incomingStep = 0;
+        if (!getPositiveConstantStep(
+                add, phi, incomingStep)) {
+            return false;
+        }
+        if (step != 0 && step != incomingStep) return false;
+        step = incomingStep;
     }
-    if (!start || !hasStep) return false;
+    if (!start || step == 0) return false;
 
     result.induction = phi;
     result.compare = compare;
     result.header = header;
     result.start = start;
     result.bound = bound;
-    result.step = 1;
+    result.step = step;
     result.boundOperand = boundOperand;
     result.inclusiveUpperBound =
         directLessEqual || reversedGreaterEqual;

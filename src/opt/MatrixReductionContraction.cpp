@@ -24,6 +24,7 @@ bool isConstant(IR::Value* value, int64_t expected) {
 bool getCommonIterationDomain(
     const std::vector<const CanonicalCountedLoop*>& loops,
     int64_t& start,
+    int64_t& step,
     bool& inclusiveUpperBound) {
     bool initialized = false;
     for (auto* loop : loops) {
@@ -33,11 +34,13 @@ bool getCommonIterationDomain(
         if (!constant) return false;
         if (!initialized) {
             start = constant->getValue();
+            step = loop->step;
             inclusiveUpperBound =
                 loop->inclusiveUpperBound;
             initialized = true;
         } else if (
             constant->getValue() != start ||
+            loop->step != step ||
             loop->inclusiveUpperBound !=
                 inclusiveUpperBound) {
             return false;
@@ -235,14 +238,20 @@ bool matchKernelFunction(
         return false;
     }
     int64_t indexStart = 0;
+    int64_t indexStep = 0;
     bool inclusiveUpperBound = false;
     if (!getCommonIterationDomain(
             {&loopI, &loopJ, &loopK,
              &zeroLoopI, &zeroLoopJ},
-            indexStart, inclusiveUpperBound) ||
+            indexStart, indexStep,
+            inclusiveUpperBound) ||
         indexStart < 0 ||
-        indexStart >=
-            std::numeric_limits<int32_t>::max()) {
+        indexStep <= 0 ||
+        indexStep >
+            std::numeric_limits<int32_t>::max() ||
+        indexStart >
+            std::numeric_limits<int32_t>::max() -
+                indexStep) {
         return false;
     }
 
@@ -283,6 +292,7 @@ bool matchKernelFunction(
     summary.rowType = rowType;
     summary.skippedScale = skippedCoefficient;
     summary.indexStart = indexStart;
+    summary.indexStep = indexStep;
     summary.inclusiveUpperBound =
         inclusiveUpperBound;
     return true;
@@ -310,6 +320,7 @@ bool findFinalReduction(
     IR::GlobalVariable* matrix,
     IR::Value* size,
     int64_t expectedStart,
+    int64_t expectedStep,
     bool expectedInclusiveUpperBound,
     const std::vector<IR::Instruction*>& allowedCalls,
     IR::BasicBlock* loopPreheader,
@@ -421,11 +432,14 @@ bool findFinalReduction(
         return false;
     }
     int64_t reductionStart = 0;
+    int64_t reductionStep = 0;
     bool reductionInclusiveUpperBound = false;
     if (!getCommonIterationDomain(
             {&outer, &inner}, reductionStart,
+            reductionStep,
             reductionInclusiveUpperBound) ||
         reductionStart != expectedStart ||
+        reductionStep != expectedStep ||
         reductionInclusiveUpperBound !=
             expectedInclusiveUpperBound) {
         return false;
@@ -632,6 +646,7 @@ bool matchCallChain(
         !findFinalReduction(
             module, caller, resultMatrix, size,
             kernel.indexStart,
+            kernel.indexStep,
             kernel.inclusiveUpperBound,
             orderedCalls, loopPreheader,
             finalLoad, finalInnerCompare,

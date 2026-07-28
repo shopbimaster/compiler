@@ -26,9 +26,10 @@ IR::Function* createAffineRowSummaryFunction(
         "__opt_affine_row_summary", false);
     auto* i32 = IR::IntegerType::I32;
     auto* zero = IR::ConstantInt::get(i32, 0);
-    auto* one = IR::ConstantInt::get(i32, 1);
     auto* indexStart = IR::ConstantInt::get(
         i32, summary.indexStart);
+    auto* indexStep = IR::ConstantInt::get(
+        i32, summary.indexStep);
     const std::string loopPredicate =
         summary.inclusiveUpperBound ? "sle" : "slt";
 
@@ -41,9 +42,11 @@ IR::Function* createAffineRowSummaryFunction(
     auto* exit = function->createBlock("summary.exit");
 
     auto* iNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "summary.i.next", nullptr, one);
+        Opc::ADD, i32, "summary.i.next", nullptr,
+        indexStep);
     auto* kNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "summary.k.next", nullptr, one);
+        Opc::ADD, i32, "summary.k.next", nullptr,
+        indexStep);
     auto* indexI = makePhi(
         i32, "summary.i", indexStart, entry, iNext, iLatch);
     auto* indexK = makePhi(
@@ -149,7 +152,8 @@ IR::Function* createAffineRowSummaryFunction(
 
 IR::Function* createRowSummaryFunction(
     IR::Module* module, IR::ArrayType* rowType,
-    int64_t start, bool inclusiveUpperBound) {
+    int64_t start, int64_t step,
+    bool inclusiveUpperBound) {
     auto* i32 = IR::IntegerType::I32;
     auto* rowPointer = IR::PointerType::get(rowType);
     auto* type = IR::FunctionType::get(
@@ -158,8 +162,8 @@ IR::Function* createRowSummaryFunction(
         type, "__opt_contract_row_sum", false);
 
     auto* zero = IR::ConstantInt::get(i32, 0);
-    auto* one = IR::ConstantInt::get(i32, 1);
     auto* indexStart = IR::ConstantInt::get(i32, start);
+    auto* indexStep = IR::ConstantInt::get(i32, step);
     const std::string loopPredicate =
         inclusiveUpperBound ? "sle" : "slt";
     auto* entry = function->createBlock("entry");
@@ -171,9 +175,11 @@ IR::Function* createRowSummaryFunction(
     auto* exit = function->createBlock("rows.exit");
 
     auto* iNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rows.i.next", nullptr, one);
+        Opc::ADD, i32, "rows.i.next", nullptr,
+        indexStep);
     auto* jNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rows.j.next", nullptr, one);
+        Opc::ADD, i32, "rows.j.next", nullptr,
+        indexStep);
     auto* sumNext = IR::Instruction::createBinOp(
         Opc::ADD, i32, "rows.sum.next", nullptr, nullptr);
     auto* indexI = makePhi(
@@ -245,6 +251,7 @@ bool applyMatrixReductionPlan(
         createRowSummaryFunction(
             module, plan.kernel.rowType,
             plan.kernel.indexStart,
+            plan.kernel.indexStep,
             plan.kernel.inclusiveUpperBound);
     auto* summaryKernel =
         createAffineRowSummaryFunction(module, plan.kernel);
@@ -280,7 +287,7 @@ bool applyMatrixReductionPlan(
                 plan.kernel.indexStart +
                     (plan.kernel.inclusiveUpperBound
                          ? 0
-                         : 1)));
+                         : plan.kernel.indexStep)));
         return true;
     }
     return false;
