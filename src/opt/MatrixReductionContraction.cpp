@@ -1,4 +1,5 @@
 #include "opt/Optimizer.h"
+#include "opt/AffineRecurrenceAnalysis.h"
 #include "opt/LoopPatternAnalysis.h"
 #include "opt/MemoryAccessAnalysis.h"
 #include "opt/ScalarReductionAnalysis.h"
@@ -105,76 +106,27 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
     if (!zeroStore || !updateStore) return false;
 
     PointerAccess zeroOutput;
-    PointerAccess updatedOutput;
     if (!collectPointerAccess(
             zeroStore->getOperand(1), &argumentMap, zeroOutput) ||
-        !collectPointerAccess(
-            updateStore->getOperand(1), &argumentMap, updatedOutput) ||
-        zeroOutput.indices.size() != 2 ||
-        updatedOutput.indices.size() != 2) {
+        zeroOutput.indices.size() != 2) {
         return false;
     }
 
-    auto* add =
-        dynamic_cast<IR::Instruction*>(updateStore->getOperand(0));
-    if (!add || add->getOpcode() != Opc::ADD ||
-        add->getNumOperands() != 2) {
+    AffineRecurrence recurrence;
+    if (!analyzeAffineRecurrence(
+            updateStore, &argumentMap, recurrence)) {
+        return false;
+    }
+    const auto& updatedOutput = recurrence.destination;
+    if (updatedOutput.indices.size() != 2 ||
+        recurrence.previous.root != function->getArg(3) ||
+        recurrence.previous.indices != updatedOutput.indices) {
         return false;
     }
 
-    IR::Instruction* multiply = nullptr;
-    IR::Instruction* inputLoad = nullptr;
-    for (unsigned index = 0; index < 2; ++index) {
-        auto* operand =
-            dynamic_cast<IR::Instruction*>(add->getOperand(index));
-        if (!operand) return false;
-        if (operand->getOpcode() == Opc::MUL) multiply = operand;
-        if (operand->getOpcode() == Opc::LOAD) inputLoad = operand;
-    }
-    if (!multiply || !inputLoad ||
-        multiply->getNumOperands() != 2 ||
-        inputLoad->getNumOperands() != 1) {
-        return false;
-    }
-
-    IR::Instruction* oldOutputLoad = nullptr;
-    IR::Instruction* coefficientLoad = nullptr;
-    for (unsigned index = 0; index < 2; ++index) {
-        auto* load = dynamic_cast<IR::Instruction*>(
-            multiply->getOperand(index));
-        if (!load || load->getOpcode() != Opc::LOAD ||
-            load->getNumOperands() != 1) {
-            return false;
-        }
-        PointerAccess access;
-        if (!collectPointerAccess(
-                load->getOperand(0), &argumentMap, access)) {
-            return false;
-        }
-        if (access.root == function->getArg(3)) {
-            oldOutputLoad = load;
-        } else if (access.root == function->getArg(1)) {
-            coefficientLoad = load;
-        }
-    }
-    PointerAccess oldOutput;
-    if (!oldOutputLoad || !coefficientLoad ||
-        !collectPointerAccess(
-            oldOutputLoad->getOperand(0),
-            &argumentMap, oldOutput) ||
-        oldOutput.root != function->getArg(3) ||
-        oldOutput.indices != updatedOutput.indices) {
-        return false;
-    }
-
-    PointerAccess coefficient;
-    PointerAccess input;
-    if (!collectPointerAccess(
-            coefficientLoad->getOperand(0),
-            &argumentMap, coefficient) ||
-        !collectPointerAccess(
-            inputLoad->getOperand(0), &argumentMap, input) ||
-        coefficient.root != function->getArg(1) ||
+    const auto& coefficient = recurrence.scale;
+    const auto& input = recurrence.addend;
+    if (coefficient.root != function->getArg(1) ||
         input.root != function->getArg(2) ||
         coefficient.indices.size() != 2 ||
         input.indices.size() != 2) {

@@ -109,6 +109,7 @@ add_library(sysy_opt STATIC
     src/opt/ReadOnlyGlobal.cpp
     src/opt/SCCP.cpp
     src/opt/LoopFind.cpp
+    src/opt/AffineRecurrenceAnalysis.cpp
     src/opt/LoopPatternAnalysis.cpp
     src/opt/MemoryAccessAnalysis.cpp
     src/opt/ScalarReductionAnalysis.cpp
