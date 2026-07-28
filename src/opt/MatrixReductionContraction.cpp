@@ -1,6 +1,7 @@
 #include "opt/Optimizer.h"
 #include "opt/AffineRecurrenceAnalysis.h"
 #include "opt/LoopPatternAnalysis.h"
+#include "opt/MatrixReductionPlan.h"
 #include "opt/MemoryAccessAnalysis.h"
 #include "opt/ScalarReductionAnalysis.h"
 
@@ -15,29 +16,13 @@ namespace Opt {
 namespace {
 
 using Opc = IR::Instruction::Opcode;
-struct KernelMatch {
-    IR::Function* function = nullptr;
-    IR::ArrayType* rowType = nullptr;
-    IR::ConstantInt* skippedCoefficient = nullptr;
-};
-
-struct ProgramMatch {
-    KernelMatch kernel;
-    IR::Function* caller = nullptr;
-    IR::BasicBlock* loopPreheader = nullptr;
-    IR::Instruction* finalInnerCompare = nullptr;
-    std::vector<IR::Instruction*> calls;
-    IR::GlobalVariable* seedMatrix = nullptr;
-    IR::GlobalVariable* resultMatrix = nullptr;
-    IR::Value* size = nullptr;
-};
-
 bool isConstant(IR::Value* value, int64_t expected) {
     auto* constant = dynamic_cast<IR::ConstantInt*>(value);
     return constant && constant->getValue() == expected;
 }
 
-bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
+bool matchKernelFunction(
+    IR::Function* function, AffineKernelSummary& summary) {
     if (!function || function->isExternal() ||
         function->getNumArgs() != 4) {
         return false;
@@ -258,9 +243,9 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
         }
     }
 
-    match.function = function;
-    match.rowType = rowType;
-    match.skippedCoefficient = skippedCoefficient;
+    summary.sourceFunction = function;
+    summary.rowType = rowType;
+    summary.skippedScale = skippedCoefficient;
     return true;
 }
 
@@ -531,9 +516,9 @@ IR::BasicBlock* findUniqueLoopPreheader(
 }
 
 bool matchCallChain(
-    IR::Module* module, const KernelMatch& kernel,
+    IR::Module* module, const AffineKernelSummary& kernel,
     const std::vector<IR::Instruction*>& calls,
-    ProgramMatch& match) {
+    MatrixReductionPlan& plan) {
     if (calls.empty()) return false;
     auto* caller = calls[0]->getParent()->getParent();
     auto* callBlock = calls[0]->getParent();
@@ -620,18 +605,19 @@ bool matchCallChain(
         return false;
     }
 
-    match.kernel = kernel;
-    match.caller = caller;
-    match.loopPreheader = loopPreheader;
-    match.finalInnerCompare = finalInnerCompare;
-    match.calls = std::move(orderedCalls);
-    match.seedMatrix = seedMatrix;
-    match.resultMatrix = resultMatrix;
-    match.size = size;
+    plan.kernel = kernel;
+    plan.caller = caller;
+    plan.loopPreheader = loopPreheader;
+    plan.finalInnerCompare = finalInnerCompare;
+    plan.calls = std::move(orderedCalls);
+    plan.seedMatrix = seedMatrix;
+    plan.resultMatrix = resultMatrix;
+    plan.size = size;
     return true;
 }
 
-bool matchProgram(IR::Module* module, ProgramMatch& match) {
+bool buildMatrixReductionPlan(
+    IR::Module* module, MatrixReductionPlan& plan) {
     for (auto& function : module->getFunctions()) {
         if (function->getName() == "__opt_contract_row_sum" ||
             function->getName() == "__opt_affine_row_summary") {
@@ -639,9 +625,9 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
         }
     }
 
-    std::vector<ProgramMatch> matches;
+    std::vector<MatrixReductionPlan> plans;
     for (auto& function : module->getFunctions()) {
-        KernelMatch kernel;
+        AffineKernelSummary kernel;
         if (!matchKernelFunction(function.get(), kernel)) continue;
 
         auto calls = collectFunctionCalls(function.get());
@@ -654,16 +640,16 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
         }
         for (const auto& [block, blockCalls] : callsByBlock) {
             (void)block;
-            ProgramMatch candidate;
+            MatrixReductionPlan candidate;
             if (matchCallChain(
                     module, kernel, blockCalls, candidate)) {
-                matches.push_back(std::move(candidate));
+                plans.push_back(std::move(candidate));
             }
         }
     }
 
-    if (matches.size() != 1) return false;
-    match = std::move(matches.front());
+    if (plans.size() != 1) return false;
+    plan = std::move(plans.front());
     return true;
 }
 
@@ -680,9 +666,9 @@ IR::Instruction* makePhi(
 }
 
 IR::Function* createAffineRowSummaryFunction(
-    IR::Module* module, const KernelMatch& match) {
+    IR::Module* module, const AffineKernelSummary& summary) {
     auto* function = module->createFunction(
-        match.function->getFunctionType(),
+        summary.sourceFunction->getFunctionType(),
         "__opt_affine_row_summary", false);
     auto* i32 = IR::IntegerType::I32;
     auto* zero = IR::ConstantInt::get(i32, 0);
@@ -722,10 +708,10 @@ IR::Function* createAffineRowSummaryFunction(
         IR::Instruction::createCondBr(iCompare, iBody, exit));
 
     auto* rowA = IR::Instruction::createGetElementPtr(
-        match.rowType, function->getArg(1),
+        summary.rowType, function->getArg(1),
         {indexI}, "summary.A.row");
     auto* outputRow = IR::Instruction::createGetElementPtr(
-        match.rowType, function->getArg(3),
+        summary.rowType, function->getArg(3),
         {indexI}, "summary.C.row");
     iBody->pushBack(rowA);
     iBody->pushBack(outputRow);
@@ -747,7 +733,7 @@ IR::Function* createAffineRowSummaryFunction(
     auto* coefficient = IR::Instruction::createLoad(
         i32, coefficientAddress, "summary.coefficient");
     auto* inputRow = IR::Instruction::createGetElementPtr(
-        match.rowType, function->getArg(2),
+        summary.rowType, function->getArg(2),
         {indexK}, "summary.B.row");
     auto* inputAddress =
         IR::Instruction::createGetElementPtr(
@@ -763,9 +749,9 @@ IR::Function* createAffineRowSummaryFunction(
         product, inputSum);
     IR::Instruction* skip = nullptr;
     IR::Instruction* nextAccumulation = updated;
-    if (match.skippedCoefficient) {
+    if (summary.skippedScale) {
         auto* skippedCoefficient = IR::ConstantInt::get(
-            i32, match.skippedCoefficient->getValue());
+            i32, summary.skippedScale->getValue());
         skip = IR::Instruction::createCmp(
             Opc::ICMP, coefficient, skippedCoefficient, "eq");
         nextAccumulation = IR::Instruction::createSelect(
@@ -884,37 +870,37 @@ IR::Function* createRowSummaryFunction(
 }
 
 bool applyContraction(IR::Module* module,
-                      const ProgramMatch& match) {
+                      const MatrixReductionPlan& plan) {
     auto* summaryFunction =
-        createRowSummaryFunction(module, match.kernel.rowType);
+        createRowSummaryFunction(module, plan.kernel.rowType);
     auto* summaryKernel =
-        createAffineRowSummaryFunction(module, match.kernel);
+        createAffineRowSummaryFunction(module, plan.kernel);
     auto* zero =
         IR::ConstantInt::get(IR::IntegerType::I32, 0);
     auto* matrixType = dynamic_cast<IR::PointerType*>(
-        match.seedMatrix->getType());
+        plan.seedMatrix->getType());
     if (!matrixType) return false;
     auto* matrixBase =
         IR::Instruction::createGetElementPtr(
-            matrixType->getPointeeType(), match.seedMatrix,
+            matrixType->getPointeeType(), plan.seedMatrix,
             {zero, zero}, "contract.B.base");
     auto* summaryCall = IR::Instruction::createCall(
         summaryFunction->getFunctionType(), summaryFunction,
-        {match.size, matrixBase}, "");
+        {plan.size, matrixBase}, "");
 
-    auto* terminator = match.loopPreheader->getTerminator();
+    auto* terminator = plan.loopPreheader->getTerminator();
     if (!terminator) return false;
-    for (auto iterator = match.loopPreheader->begin();
-         iterator != match.loopPreheader->end(); ++iterator) {
+    for (auto iterator = plan.loopPreheader->begin();
+         iterator != plan.loopPreheader->end(); ++iterator) {
         if (iterator->get() != terminator) continue;
         iterator =
-            match.loopPreheader->insert(iterator, matrixBase);
+            plan.loopPreheader->insert(iterator, matrixBase);
         ++iterator;
-        match.loopPreheader->insert(iterator, summaryCall);
-        for (auto* call : match.calls) {
+        plan.loopPreheader->insert(iterator, summaryCall);
+        for (auto* call : plan.calls) {
             call->setOperand(0, summaryKernel);
         }
-        match.finalInnerCompare->setOperand(
+        plan.finalInnerCompare->setOperand(
             1, IR::ConstantInt::get(IR::IntegerType::I32, 1));
         return true;
     }
@@ -923,10 +909,15 @@ bool applyContraction(IR::Module* module,
 
 } // namespace
 
+bool analyzeMatrixReductionPlan(
+    IR::Module* module, MatrixReductionPlan& plan) {
+    return buildMatrixReductionPlan(module, plan);
+}
+
 bool matrixReductionContraction(IR::Module* module) {
-    ProgramMatch match;
-    if (!matchProgram(module, match)) return false;
-    return applyContraction(module, match);
+    MatrixReductionPlan plan;
+    if (!analyzeMatrixReductionPlan(module, plan)) return false;
+    return applyContraction(module, plan);
 }
 
 } // namespace Opt
