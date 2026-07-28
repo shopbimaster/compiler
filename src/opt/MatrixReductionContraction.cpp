@@ -786,21 +786,10 @@ IR::BasicBlock* findUniqueLoopPreheader(
     return preheader;
 }
 
-bool matchProgram(IR::Module* module, ProgramMatch& match) {
-    std::vector<KernelMatch> kernels;
-    for (auto& function : module->getFunctions()) {
-        if (function->getName() == "__opt_contract_row_sum" ||
-            function->getName() == "__opt_affine_row_summary") {
-            return false;
-        }
-        KernelMatch candidate;
-        if (matchKernelFunction(function.get(), candidate)) {
-            kernels.push_back(candidate);
-        }
-    }
-    if (kernels.size() != 1) return false;
-
-    auto calls = collectFunctionCalls(kernels[0].function);
+bool matchCallChain(
+    IR::Module* module, const KernelMatch& kernel,
+    const std::vector<IR::Instruction*>& calls,
+    ProgramMatch& match) {
     if (calls.empty()) return false;
     auto* caller = calls[0]->getParent()->getParent();
     auto* callBlock = calls[0]->getParent();
@@ -887,7 +876,7 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
         return false;
     }
 
-    match.kernel = kernels[0];
+    match.kernel = kernel;
     match.caller = caller;
     match.loopPreheader = loopPreheader;
     match.finalInnerCompare = finalInnerCompare;
@@ -895,6 +884,42 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
     match.seedMatrix = seedMatrix;
     match.resultMatrix = resultMatrix;
     match.size = size;
+    return true;
+}
+
+bool matchProgram(IR::Module* module, ProgramMatch& match) {
+    for (auto& function : module->getFunctions()) {
+        if (function->getName() == "__opt_contract_row_sum" ||
+            function->getName() == "__opt_affine_row_summary") {
+            return false;
+        }
+    }
+
+    std::vector<ProgramMatch> matches;
+    for (auto& function : module->getFunctions()) {
+        KernelMatch kernel;
+        if (!matchKernelFunction(function.get(), kernel)) continue;
+
+        auto calls = collectFunctionCalls(function.get());
+        std::unordered_map<
+            IR::BasicBlock*, std::vector<IR::Instruction*>>
+            callsByBlock;
+        for (auto* call : calls) {
+            if (!call || !call->getParent()) continue;
+            callsByBlock[call->getParent()].push_back(call);
+        }
+        for (const auto& [block, blockCalls] : callsByBlock) {
+            (void)block;
+            ProgramMatch candidate;
+            if (matchCallChain(
+                    module, kernel, blockCalls, candidate)) {
+                matches.push_back(std::move(candidate));
+            }
+        }
+    }
+
+    if (matches.size() != 1) return false;
+    match = std::move(matches.front());
     return true;
 }
 
