@@ -132,6 +132,8 @@ add_library(sysy_opt STATIC
     src/opt/AlgebraicSimplification.cpp
     src/opt/LoopUnrolling.cpp
     src/opt/LoopInterchange.cpp
+    src/opt/ReductionSplitting.cpp
+    src/opt/EarlyReturnToSelect.cpp
     src/opt/TailRecursionElimination.cpp
     src/opt/InstructionScheduling.cpp
     src/opt/RecursiveMulToNative.cpp

@@ -272,32 +272,69 @@ bool magicDivisionOnFunction(IR::Function* func) {
                 changed = true;
             } else {
                 // SREM: r = n - q * d
+                uint32_t absD = (d >= 0) ? (uint32_t)d : (uint32_t)(-d);
+                bool isPow2 = (absD != 0) && ((absD & (absD - 1)) == 0);
+
+                // ★ P6: 宏指令融合 — srem x, 2^k 仅用于 icmp eq/ne 0 时 → and x, 2^k-1
+                //   数学等价性：对任意有符号整数 x，x % 2^k == 0 ⟺ (x & (2^k-1)) == 0
+                //     - 偶数：x % 2^k == 0，x & (2^k-1) == 0 ✓
+                //     - 正奇数：x % 2^k > 0（非零），x & (2^k-1) > 0（非零）✓
+                //     - 负奇数：x % 2^k < 0（非零），x & (2^k-1) > 0（非零）✓
+                //   因此当 srem 结果仅用于与 0 的相等/不等比较时，可安全替换为 AND，
+                //   无需证明 x 非负。1 条 AND 指令替代 6 条 div.pow2 序列。
+                //   触发用例：matmul1（mul 结果 % 2 == 0 检查）、conv2d（% 2048）
+                auto isUsedOnlyInZeroComparison = [](IR::Instruction* sremInst) -> bool {
+                    for (auto& use : sremInst->getUses()) {
+                        auto* user = dynamic_cast<IR::Instruction*>(use.user);
+                        if (!user) return false;
+                        if (user->getOpcode() != Opc::ICMP) return false;
+                        const std::string& pred = user->getName();
+                        if (pred != "eq" && pred != "ne") return false;
+                        auto* other = (use.operandNo == 0)
+                            ? user->getOperand(1) : user->getOperand(0);
+                        auto* ci = dynamic_cast<IR::ConstantInt*>(other);
+                        if (!ci || ci->getValue() != 0) return false;
+                    }
+                    return !sremInst->getUses().empty();  // 至少有一个 use
+                };
+
+                static const bool p6Disable = [] {
+                    const char* v = std::getenv("P6_OFF");
+                    return v && std::string(v) == "1";
+                }();
+                if (!p6Disable && isPow2 && absD > 1 && isUsedOnlyInZeroComparison(inst.get())) {
+                    auto* maskConst = IR::ConstantInt::get(i32, (int32_t)(absD - 1));
+                    auto* andInst = IR::Instruction::createBinOp(
+                        Opc::AND, i32, "magic.rem.andz", n, maskConst);
+                    toInsert.push_back({inst.get(), andInst});
+                    inst->replaceAllUsesWith(andInst);
+                    toErase.push_back(inst.get());
+                    changed = true;
+                    continue;
+                }
+
                 // ★ 快速路径：srem x, 2^k 当 x 可证明非负时 → x & (2^k - 1)
                 //   1 条 AND 指令替代 6 条 div.pow2 序列
                 //   安全条件：x >= 0（C 取余符号与被除数相同，非负数取余结果非负）
-                {
-                    uint32_t absD = (d >= 0) ? (uint32_t)d : (uint32_t)(-d);
-                    bool isPow2 = (absD != 0) && ((absD & (absD - 1)) == 0);
-                    if (isPow2 && absD > 1 && canProveNonNegative(n)) {
-                        auto* maskConst = IR::ConstantInt::get(i32, (int32_t)(absD - 1));
-                        auto* andInst = IR::Instruction::createBinOp(
-                            Opc::AND, i32, "magic.rem.and", n, maskConst);
-                        toInsert.push_back({inst.get(), andInst});
+                if (isPow2 && absD > 1 && canProveNonNegative(n)) {
+                    auto* maskConst = IR::ConstantInt::get(i32, (int32_t)(absD - 1));
+                    auto* andInst = IR::Instruction::createBinOp(
+                        Opc::AND, i32, "magic.rem.and", n, maskConst);
+                    toInsert.push_back({inst.get(), andInst});
 
-                        // 负除数取反：n % -2^k = -(n % 2^k)
-                        IR::Instruction* result = andInst;
-                        if (d < 0) {
-                            result = IR::Instruction::createBinOp(
-                                Opc::SUB, i32, "magic.rem.neg",
-                                IR::ConstantInt::get(i32, 0), andInst);
-                            toInsert.push_back({inst.get(), result});
-                        }
-
-                        inst->replaceAllUsesWith(result);
-                        toErase.push_back(inst.get());
-                        changed = true;
-                        continue;  // 跳过下面的通用 SREM 处理
+                    // 负除数取反：n % -2^k = -(n % 2^k)
+                    IR::Instruction* result = andInst;
+                    if (d < 0) {
+                        result = IR::Instruction::createBinOp(
+                            Opc::SUB, i32, "magic.rem.neg",
+                            IR::ConstantInt::get(i32, 0), andInst);
+                        toInsert.push_back({inst.get(), result});
                     }
+
+                    inst->replaceAllUsesWith(result);
+                    toErase.push_back(inst.get());
+                    changed = true;
+                    continue;  // 跳过下面的通用 SREM 处理
                 }
 
                 // 通用 SREM: r = n - q * d

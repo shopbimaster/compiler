@@ -85,6 +85,16 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    // P4-pre: EarlyReturn→Select — 在第一次 inlineExpansion 之前运行
+    // 目的：将 max/min 等"if-else-RET"小函数先转为 SELECT+RET 单 BB，
+    //       缩小函数体积使其满足内联阈值；内联后调用方循环体直接得到 SELECT
+    //       而非 COND_BR，使后续 LoopUnrolling 可展开（如 h-4-03 的 max）。
+    if (PASS_CALL(earlyReturnToSelect)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     if (PASS_CALL(inlineExpansion)) {
         constantFolding(mod);
         deadCodeElimination(mod);
@@ -115,6 +125,15 @@ void runO2(IR::Module* mod) {
     // 1c. 二次 mem2reg：内联引入的 retAlloca（用于返回值）和其他临时 ALLOCA
     //     应被提升为 SSA，使后续优化（SCCP/CSE/InstCombine 等）更有效
     if (PASS_CALL(mem2reg)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // P4: EarlyReturn→Select — if-else-RET → SELECT+RET
+    // 内联后 max/min 等小函数变为 if-else-RET 模式，转换为 SELECT 消除 COND_BR，
+    // 使含此类调用的循环体变为单 BB，后续 LoopUnrolling 可展开（如 h-4-03）。
+    if (PASS_CALL(earlyReturnToSelect)) {
+        simplifyCFG(mod);
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -421,7 +440,16 @@ void runO3(IR::Module* mod) {
         o3Changed = true;
     }
 
-    // LoopUnrolling：部分展开（最大 8×）
+    // P1: ReductionSplitting — 多累加器归约分裂（长依赖链消除）
+    // 在 LoopUnrolling 之前运行：分裂后仍可被进一步展开。
+    // 仅对可证明无溢出的加法归约生效（常量/布尔值），由 P2 超大展开覆盖其余。
+    if (PASS_CALL(reductionSplitting)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+        o3Changed = true;
+    }
+
+    // LoopUnrolling：部分展开（P2: 最大 16×，tc≤256）
     if (loopUnrolling(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);

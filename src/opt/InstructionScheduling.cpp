@@ -2,9 +2,14 @@
 // P3-3: 指令调度（Instruction Scheduling）
 // 策略：基本块内"分段"列表调度
 //   - 将 BB 中连续的可移动指令视为一个"段"（segment）
-//   - 非可移动指令（STORE/LOAD/CALL/ALLOCA/PHI/terminator）作为段边界
+//   - 非可移动指令（STORE/CALL/ALLOCA/PHI/terminator）作为段边界
 //   - 每个段内构建数据依赖 DAG，优先调度 LOAD 和多使用者指令
-//   - 段边界不可跨越，保证 STORE/LOAD 等指令的依赖关系不被打乱
+//   - 段边界不可跨越，保证 STORE/CALL 等指令的依赖关系不被打乱
+//
+// ★ P8: LOAD 现在是可移动的（不再作为段边界）
+//   - 在无 STORE 的段内，LOAD 可被提前调度，隐藏 BOOM 4 周期 load-use 延迟
+//   - 安全性：段内无 STORE（STORE 是段边界），LOAD 不会跨越 STORE
+//   - 数据依赖由 DAG 保证：LOAD 的地址操作数必须先计算
 // ================================================================
 
 #include "opt/Optimizer.h"
@@ -21,9 +26,17 @@ using Opc = IR::Instruction::Opcode;
 
 bool isMovable(IR::Instruction* inst) {
     auto op = inst->getOpcode();
+    // P8: LOAD 现在可移动——允许调度器将 LOAD 提前，隐藏 load-use 延迟
+    // STORE 仍为段边界——保证 LOAD 不会跨越 STORE（维护内存访问顺序）
+    // P8_OFF=1 可回退到 LOAD 不可移动（原行为）
+    static const bool p8Off = [] {
+        const char* v = std::getenv("P8_OFF");
+        return v && std::string(v) == "1";
+    }();
+    if (p8Off && op == Opc::LOAD) return false;
     return op != Opc::BR && op != Opc::COND_BR && op != Opc::RET &&
            op != Opc::PHI && op != Opc::CALL && op != Opc::ALLOCA &&
-           op != Opc::STORE && op != Opc::LOAD;
+           op != Opc::STORE;
 }
 
 // ---- 对一个段内的可移动指令做列表调度 ----

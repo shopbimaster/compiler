@@ -73,8 +73,15 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
 
     // ivVal 应该是 LOAD 或 ADD 的结果
     if (ivInst->getOpcode() == IR::Instruction::Opcode::LOAD) {
-        // LOAD 模式：循环变量存储在 ALLOCA 中
+        // LOAD 模式：循环变量存储在 ALLOCA 中（mem2reg 未提升的情况）
         info.var = ivInst->getOperand(0);  // ALLOCA 指针
+
+        // 辅助函数：判断值是否是从同一 ALLOCA 的 LOAD
+        auto isLoadFromVar = [&](IR::Value* v) -> bool {
+            auto* inst = dynamic_cast<IR::Instruction*>(v);
+            return inst && inst->getOpcode() == IR::Instruction::Opcode::LOAD &&
+                   inst->getNumOperands() > 0 && inst->getOperand(0) == info.var;
+        };
 
         // 在循环体中找 STORE 到同一 ALLOCA 的 ADD/SUB 指令
         for (auto* bb : loop.body) {
@@ -87,12 +94,14 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
                             if (arithInst->getOpcode() == IR::Instruction::Opcode::ADD) {
                                 auto* op0 = arithInst->getOperand(0);
                                 auto* op1 = arithInst->getOperand(1);
-                                if (op0 == ivVal) info.step = op1;
-                                else if (op1 == ivVal) info.step = op0;
+                                // ★ 修复：循环体内的 LOAD 可能与 header 中的 LOAD
+                                //   是不同指令（但来自同一 ALLOCA），用 isLoadFromVar 判断
+                                if (isLoadFromVar(op0)) info.step = op1;
+                                else if (isLoadFromVar(op1)) info.step = op0;
                             } else if (arithInst->getOpcode() == IR::Instruction::Opcode::SUB) {
                                 auto* op0 = arithInst->getOperand(0);
                                 auto* op1 = arithInst->getOperand(1);
-                                if (op0 == ivVal) {
+                                if (isLoadFromVar(op0)) {
                                     if (auto* ci = dynamic_cast<IR::ConstantInt*>(op1)) {
                                         info.step = IR::ConstantInt::get(
                                             IR::IntegerType::I32, -ci->getValue());
@@ -102,14 +111,32 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
                         }
                     }
                 }
-                // 也在 entry block 中找初始 STORE
-                if (bb == func->getEntryBlock()) {
-                    if (inst->getOpcode() == IR::Instruction::Opcode::STORE) {
-                        auto* storePtr = inst->getOperand(1);
-                        if (storePtr == info.var) {
-                            info.start = inst->getOperand(0);
-                        }
-                    }
+            }
+        }
+
+        // ★ 修复：在循环前置块（preheader）中找初始 STORE，而非仅 entry block
+        //   循环变量如 `j = 0` 通常在循环外但非 entry 的 BB 中初始化
+        auto allPreds = buildPredecessors(func);
+        for (auto* pred : allPreds[header]) {
+            if (loop.body.count(pred)) continue;  // 跳过 back-edge 前驱
+            // 这是 preheader，查找最后一个 STORE 到 info.var
+            IR::Value* lastStore = nullptr;
+            for (auto& inst : pred->getInstructions()) {
+                if (inst->getOpcode() == IR::Instruction::Opcode::STORE &&
+                    inst->getNumOperands() > 1 &&
+                    inst->getOperand(1) == info.var) {
+                    lastStore = inst->getOperand(0);
+                }
+            }
+            if (lastStore) info.start = lastStore;
+        }
+        // 回退：也检查 entry block（以防 preheader 未找到）
+        if (!info.start) {
+            for (auto& inst : func->getEntryBlock()->getInstructions()) {
+                if (inst->getOpcode() == IR::Instruction::Opcode::STORE &&
+                    inst->getNumOperands() > 1 &&
+                    inst->getOperand(1) == info.var) {
+                    info.start = inst->getOperand(0);
                 }
             }
         }

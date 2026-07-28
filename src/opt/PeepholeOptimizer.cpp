@@ -1816,9 +1816,12 @@ std::string peepholeOptimize(const std::string& asmCode) {
             // j label; label: → eliminate j (fall through to label)
             // 跳过中间的空行、注释、.p2align/.align 指令、非目标空 label
             // 典型模式：j .Lxxx; .Lxxx: 或 j .Lxxx; .p2align 4; .Lxxx: 或 j .Lxxx; .Lempty; .Lxxx:
+            // ★ 安全限制：仅对 .L 局部标签消除。全局标签（如 func_exit）可能被链接器
+            // 解析到 sylib 的同名符号（如 main_exit），消除 j 会绕过 sylib 的退出处理。
             if (!matched) {
                 std::string jRd, jRs, jImm;
-                if (tryMatch(lines[i], "j", jRd, jRs, jImm) && !jRd.empty()) {
+                if (tryMatch(lines[i], "j", jRd, jRs, jImm) && !jRd.empty() &&
+                    jRd.rfind(".L", 0) == 0) {
                     bool canEliminate = false;
                     for (size_t k = i + 1; k < lines.size(); ++k) {
                         const std::string& nextLine = lines[k];

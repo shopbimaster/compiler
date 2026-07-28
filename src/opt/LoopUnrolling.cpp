@@ -66,7 +66,10 @@ std::vector<LoopInfo> detectLoops(IR::Function* func) {
 //   while (i = 1; i < 16; i++) 的 tripCount = 16 - 1 = 15，不是 16。
 //   如果忽略初始值，会导致 factor 选择错误（16%8==0 但 15%8!=0），
 //   进而导致循环展开后越界访问或无限循环。
-int inferTripCount(IR::BasicBlock* header) {
+// ★ P2-fix: 支持 LOAD/STORE 形式的循环变量（mem2reg 未提升时）
+//   如 matmul1 的 j 变量：header 中 %t = load %j; icmp %t, 200
+//   需要在 preheader 中找 store 初始值到 %j 的指令
+int inferTripCount(IR::BasicBlock* header, const BBSet& body, IR::Function* func) {
     for (auto& inst : header->getInstructions()) {
         if (inst->getOpcode() != IR::Instruction::Opcode::ICMP) continue;
         if (inst->getNumOperands() < 2) continue;
@@ -84,18 +87,83 @@ int inferTripCount(IR::BasicBlock* header) {
         // 尝试从 PHI 获取初始值
         int64_t initVal = 0;
         bool initKnown = false;
-        if (auto* phiInst = dynamic_cast<IR::Instruction*>(varOp)) {
-            if (phiInst->getOpcode() == IR::Instruction::Opcode::PHI) {
+        if (auto* varInst = dynamic_cast<IR::Instruction*>(varOp)) {
+            if (varInst->getOpcode() == IR::Instruction::Opcode::PHI) {
                 // 遍历 PHI 的操作数，找来自非 body BB 的初始值
-                for (unsigned i = 0; i + 1 < phiInst->getNumOperands(); i += 2) {
-                    auto* predBB = dynamic_cast<IR::BasicBlock*>(phiInst->getOperand(i + 1));
-                    if (predBB != header) {
+                for (unsigned i = 0; i + 1 < varInst->getNumOperands(); i += 2) {
+                    auto* predBB = dynamic_cast<IR::BasicBlock*>(varInst->getOperand(i + 1));
+                    if (predBB != header && !body.count(predBB)) {
                         // 这是初始值
-                        if (auto* ci = dynamic_cast<IR::ConstantInt*>(phiInst->getOperand(i))) {
+                        if (auto* ci = dynamic_cast<IR::ConstantInt*>(varInst->getOperand(i))) {
                             initVal = ci->getValue();
                             initKnown = true;
                         }
                         break;
+                    }
+                }
+            } else if (varInst->getOpcode() == IR::Instruction::Opcode::LOAD) {
+                // ★ LOAD 模式：循环变量在 ALLOCA 中（mem2reg 未提升）
+                //   在 preheader（非 back-edge 前驱）中找最后一个 STORE 到同一 ALLOCA
+                //   若 preheader 是合成空块（LICM 插入），沿前驱链向上查找（≤3 层）
+                auto* allocaPtr = varInst->getOperand(0);
+                if (std::getenv("DBG_UNROLL")) fprintf(stderr, "[unroll] %s LOAD varOp alloca=%s\n",
+                    header->getName().c_str(),
+                    allocaPtr ? allocaPtr->getName().c_str() : "?");
+                auto preds = buildPredecessors(func);
+
+                // 辅助函数：在 BB 中查找最后一个 STORE 常量到 allocaPtr
+                auto findConstStore = [&](IR::BasicBlock* bb) -> IR::ConstantInt* {
+                    IR::Value* lastStore = nullptr;
+                    for (auto& pInst : bb->getInstructions()) {
+                        if (pInst->getOpcode() == IR::Instruction::Opcode::STORE &&
+                            pInst->getNumOperands() > 1 &&
+                            pInst->getOperand(1) == allocaPtr) {
+                            lastStore = pInst->getOperand(0);
+                        }
+                    }
+                    return dynamic_cast<IR::ConstantInt*>(lastStore);
+                };
+
+                for (auto* pred : preds[header]) {
+                    if (body.count(pred)) continue;  // 跳过 back-edge 前驱
+                    // 先在 preheader 本身查找
+                    if (auto* ci = findConstStore(pred)) {
+                        initVal = ci->getValue();
+                        initKnown = true;
+                        break;
+                    }
+                    // preheader 可能是合成空块，沿前驱链向上查找（≤3 层）
+                    auto predPreds = buildPredecessors(func);
+                    std::vector<IR::BasicBlock*> wl = {pred};
+                    std::unordered_set<IR::BasicBlock*> visited = {pred, header};
+                    int depth = 0;
+                    while (!wl.empty() && depth < 3 && !initKnown) {
+                        auto* cur = wl.back(); wl.pop_back();
+                        ++depth;
+                        for (auto* pp : predPreds[cur]) {
+                            if (visited.count(pp) || body.count(pp)) continue;
+                            visited.insert(pp);
+                            if (auto* ci = findConstStore(pp)) {
+                                initVal = ci->getValue();
+                                initKnown = true;
+                                break;
+                            }
+                            wl.push_back(pp);
+                        }
+                    }
+                    if (initKnown) break;
+                }
+                // 回退：也检查 entry block
+                if (!initKnown) {
+                    for (auto& eInst : func->getEntryBlock()->getInstructions()) {
+                        if (eInst->getOpcode() == IR::Instruction::Opcode::STORE &&
+                            eInst->getNumOperands() > 1 &&
+                            eInst->getOperand(1) == allocaPtr) {
+                            if (auto* ci = dynamic_cast<IR::ConstantInt*>(eInst->getOperand(0))) {
+                                initVal = ci->getValue();
+                                initKnown = true;
+                            }
+                        }
                     }
                 }
             }
@@ -106,15 +174,16 @@ int inferTripCount(IR::BasicBlock* header) {
         if (!initKnown) return -1;
 
         // 仅处理 slt（有符号小于）：i < N  → tripCount = N - init
-        if (inst->getName() == "slt" && bound > 0 && bound <= 64) {
+        // P2: 上界从 64 放宽到 256，允许大循环部分展开（如 matmul1 tc=200）
+        if (inst->getName() == "slt" && bound > 0 && bound <= 256) {
             int tc = static_cast<int>(bound - initVal);
-            if (tc > 0 && tc <= 64) return tc;
+            if (tc > 0 && tc <= 256) return tc;
             return -1;
         }
         // sle（有符号小于等于）：i <= N → tripCount = N+1 - init
-        if (inst->getName() == "sle" && bound >= 0 && bound < 64) {
+        if (inst->getName() == "sle" && bound >= 0 && bound < 256) {
             int tc = static_cast<int>(bound + 1 - initVal);
-            if (tc > 0 && tc <= 64) return tc;
+            if (tc > 0 && tc <= 256) return tc;
             return -1;
         }
     }
@@ -219,7 +288,11 @@ IR::Instruction* cloneNonTermInst(IR::Instruction* src, int copyId,
 //   4. 全部克隆完成后，更新 PHI 的 back-edge operand 为最后一次克隆的值
 bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     // 仅处理单 BB 循环体
-    if (loop.body.size() > 2) return false; // header + body
+    if (loop.body.size() > 2) {
+        if (std::getenv("DBG_UNROLL")) fprintf(stderr, "[unroll] %s body.size=%zu >2 skip\n",
+            loop.header->getName().c_str(), loop.body.size());
+        return false; // header + body
+    }
 
     // 找到 body BB（非 header 的那个）
     IR::BasicBlock* bodyBB = nullptr;
@@ -230,19 +303,26 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
         }
     }
     if (!bodyBB) return false;
-    if (!isSimpleBody(bodyBB)) return false;
+    if (!isSimpleBody(bodyBB)) {
+        if (std::getenv("DBG_UNROLL")) fprintf(stderr, "[unroll] %s not simple body\n",
+            loop.header->getName().c_str());
+        return false;
+    }
 
     // 推导或使用预设迭代次数
     int tc = loop.tripCount;
-    if (tc < 0) tc = inferTripCount(loop.header);
+    if (tc < 0) tc = inferTripCount(loop.header, loop.body, func);
     loop.tripCount = tc;
-    if (tc < 2 || tc > 64) return false;
+    if (std::getenv("DBG_UNROLL")) fprintf(stderr, "[unroll] %s tc=%d\n",
+        loop.header->getName().c_str(), tc);
+    // P2: 上界从 64 放宽到 256，允许大循环部分展开
+    if (tc < 2 || tc > 256) return false;
 
-    // 按从大到小尝试因子，最大 8×
+    // 按从大到小尝试因子，最大 16×（P2: 原 8×）
     // 包含质数因子 5 和 7，支持 tc 为质数的循环完全展开
     // （如 conv2d 的 KSIZE=5 循环，如果循环体是单 BB）
     unsigned factor = 0;
-    static const unsigned candidates[] = {8, 6, 4, 3, 2};
+    static const unsigned candidates[] = {16, 12, 8, 6, 4, 3, 2};
     for (unsigned f : candidates) {
         if (tc % f == 0 && tc >= f) {
             factor = f;
@@ -254,6 +334,81 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
         factor = static_cast<unsigned>(tc);
     }
     if (factor == 0) return false;
+
+    // ★ P2: 寄存器压力检查（改进版：区分不变量与循环携带值）
+    //   原版 ev*factor 公式假设每个外部值都需要 factor 份拷贝，过于保守。
+    //   实际上：
+    //     - 不变量（定义在循环外）：只需 1 份寄存器，与 factor 无关
+    //     - 循环携带 PHI（header 中的 PHI）：展开后每迭代需 1 份寄存器
+    //   新公式：live ≈ invariants + factor * loopCarriedPhis ≤ 18
+    //   （BOOM 有 20 个可用寄存器，留 2 个临时寄存器）
+    {
+        std::unordered_set<IR::Value*> externalVals;
+        for (auto* bb : loop.body) {
+            for (auto& inst : bb->getInstructions()) {
+                for (unsigned i = 0; i < inst->getNumOperands(); ++i) {
+                    auto* op = inst->getOperand(i);
+                    if (!op) continue;
+                    if (dynamic_cast<IR::Constant*>(op)) continue;
+                    if (dynamic_cast<IR::BasicBlock*>(op)) continue;
+                    if (dynamic_cast<IR::Function*>(op)) continue;
+                    if (dynamic_cast<IR::GlobalVariable*>(op)) continue;
+                    auto* opInst = dynamic_cast<IR::Instruction*>(op);
+                    if (opInst) {
+                        auto* opBB = opInst->getParent();
+                        if (!loop.body.count(opBB)) {
+                            externalVals.insert(op);
+                        }
+                    } else if (dynamic_cast<IR::Argument*>(op)) {
+                        externalVals.insert(op);
+                    }
+                }
+            }
+        }
+        size_t invariants = externalVals.size();
+
+        // 统计 header 中的循环携带 PHI 数量（有 back-edge 来自 bodyBB 的 PHI）
+        size_t loopCarriedPhis = 0;
+        for (auto& inst : loop.header->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::PHI) continue;
+            for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                auto* predBB = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+                if (predBB == bodyBB) {
+                    ++loopCarriedPhis;
+                    break;
+                }
+            }
+        }
+
+        // 改进后的寄存器压力公式：
+        //   live = invariants + factor * loopCarriedPhis
+        //   上限 18（BOOM 20 个可用寄存器，留 2 个临时）
+        //   同时保留硬上限：invariants ≤ 12（避免不变量本身就溢出）
+        const size_t REG_BUDGET = 18;
+        const size_t INVARIANT_LIMIT = 12;
+
+        auto liveRegs = [&](unsigned f) -> size_t {
+            return invariants + f * loopCarriedPhis;
+        };
+
+        // factor=16 需要更严格：invariants + 16*lc ≤ 18 → 仅 lc=0/1 且 invariants 小时可行
+        if (factor >= 16 && liveRegs(factor) > REG_BUDGET) {
+            factor = 12;
+        }
+        // 逐步降级，找最大的满足 liveRegs(f) ≤ REG_BUDGET 的因子
+        if (liveRegs(factor) > REG_BUDGET || invariants > INVARIANT_LIMIT) {
+            unsigned downgraded = 0;
+            for (unsigned f : {12, 8, 6, 4, 3, 2}) {
+                if (tc % f == 0 && tc >= f && liveRegs(f) <= REG_BUDGET &&
+                    invariants <= INVARIANT_LIMIT) {
+                    downgraded = f;
+                    break;
+                }
+            }
+            if (downgraded == 0) return false;
+            factor = downgraded;
+        }
+    }
 
     // 收集可克隆的非终止指令
     std::vector<IR::Instruction*> toClone;

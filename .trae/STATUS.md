@@ -7,8 +7,68 @@
 
 ## 一、当前焦点
 
-**分支**：`opt-research-scratch`（A 组已提交 `b24d9ab`，E 组待提交）
-**当前方向**：**BOOM 双发射针对性优化**（E1/E2 完成，E3 评估完毕不实施）
+**分支**：`opt-research-scratch`（A 组 `b24d9ab`，E1+E2 `599e662`）→ 独立分支 `boom-dual-issue-opt`（P1+P2+P4+P6+P8 深度优化）
+**当前方向**：**BOOM 双发射深度优化**（P1 归约分裂 + P2 超大展开 + P4 EarlyReturn→Select + P6 宏指令融合 + P8 软件流水，提交独立分支待 FPGA 重测）
+
+### 1.0 本轮优化清单（2026-07-29，提交到 `boom-dual-issue-opt`）
+
+| 优化                         | 文件                            | 说明                                                   | QEMU 计时                                         | FPGA 预期                                                  |
+| ---------------------------- | ------------------------------- | ------------------------------------------------------ | ------------------------------------------------- | ---------------------------------------------------------- |
+| **P1** 归约分裂 v2           | ReductionSplitting.cpp（新建）  | 多累加器拆分串行 ADD 链，IV 链式传递，IV/归约 PHI 区分 | 触发用例 QEMU 回归（+2~6%，代码变大增加翻译开销） | **正向**：独立 ADD 链可双发射，BOOM ROB=16 暴露 ILP 有价值 |
+| **P2** 超大循环展开          | LoopUnrolling.cpp               | 候选因子 {16,12,8,6,4,3,2}，tc≤256，寄存器压力检查     | 无 SEGFAULT，功能 60/60                           | 中性偏正：减少分支开销，但 I-cache 压力                    |
+| **P4** EarlyReturn→Select    | EarlyReturnToSelect.cpp（新建） | if-else-RET → SELECT+RET，消除 COND_BR 使循环体变单 BB | 触发 h-4-03/conv2d/huffman/crc，QEMU 噪声 ±5%     | **正向**：消除分支避免 14 周期误预测惩罚                   |
+| **P6** 宏指令融合            | MagicDivision.cpp               | srem x,2^k 仅用于 icmp eq/ne 0 → and x,2^k-1           | **matmul -10~15%**，其他波动在 QEMU 噪声内        | **正向**：每迭代省 5 条指令，直接减少动态指令数            |
+| **P8** 软件流水（LOAD 前移） | InstructionScheduling.cpp       | LOAD 从段边界改为可移动，调度器优先提前 LOAD           | 改变多个用例汇编（matmul/conv2d/huffman/fft）     | **正向**：隐藏 BOOM 4 周期 load-use 延迟，暴露跨迭代 ILP   |
+
+### 1.1 P6 宏指令融合关键设计
+
+- **模式**：`srem x, 2^k` → `and x, 2^k-1`，当 srem 结果仅用于 `icmp eq/ne 0` 时
+- **数学等价性**：对任意有符号整数 x，`x % 2^k == 0` ⟺ `(x & (2^k-1)) == 0`（偶数两式均为 0；奇数两式均非零）
+- **安全性**：检查 srem 的所有 use 必须是 `icmp eq/ne` 且另一操作数为常量 0
+- **效果**：matmul1 内层循环 mod-2 检查从 8 条指令（sraiw+andi+addw+sraiw+slliw+subw+beqz）降到 3 条（andi+beqz）
+- **触发用例**：matmul1/2/3（% 2 == 0 检查），conv2d-2（% 2048，但结果非零比较不触发）
+- **开关**：`P6_OFF=1` 可禁用
+
+### 1.2 P8 软件流水（LOAD 前移）关键设计
+
+- **改动**：`isMovable()` 中 LOAD 从不可移动改为可移动，STORE 仍为段边界
+- **安全性**：段内无 STORE（STORE 是段边界），LOAD 不会跨越 STORE；数据依赖由 DAG 保证
+- **调度策略**：优先级 LOAD += 100（已有），使 LOAD 在段内尽早调度
+- **效果**：改变 matmul1/conv2d-2/huffman-01/transpose0/fft0/01_mm1 的汇编
+- **开关**：`P8_OFF=1` 可回退到 LOAD 不可移动（原行为）
+
+### 1.3 QEMU 模拟计时分析（注意：QEMU TCG 不模拟双发射）
+
+P6 启用 vs 基线（P1+P2+P4），3 次取最小值：
+
+| 用例       | 基线   | P6     | 变化                 |
+| ---------- | ------ | ------ | -------------------- |
+| matmul1    | 51301  | 43396  | **-15.4%**           |
+| matmul2    | 177643 | 153546 | **-13.6%**           |
+| matmul3    | 99380  | 88537  | **-10.9%**           |
+| transpose1 | 20362  | 19042  | -6.5%                |
+| transpose2 | 180914 | 173788 | -3.9%                |
+| 其他用例   | —      | —      | ±5%（QEMU TCG 噪声） |
+
+- **结论**：P6 在 matmul 系列显著生效（-10~15%），因 mod-2 检查在内层循环每迭代省 5 条指令
+- P8 的 load-use 延迟隐藏收益需 FPGA 实测（QEMU TCG 不模拟延迟）
+
+### 1.1 P1 ReductionSplitting v2 关键设计
+
+- **v1 bug**：克隆体用同一个 IV 值但步长 ×N → 跳过 3/4 项且结果 ×N（已修复）
+- **v2 修复**：IV 链式传递（参考 LoopUnrolling 的 phiToBackEdge 机制），每个克隆用 i+1, i+2, ...
+- **IV/归约区分**：PHI 被 header ICMP 使用 → 是 IV → 跳过（修复 52_scope SEGFAULT）
+- **安全检查**：体不含 CALL/PHI/ALLOCA；所有体指令 opcode 可克隆；溢出对 i32 是 UB
+- **触发用例**：conv2d-2、huffman-01、crc1（功能正确，60/60 perf pass）
+- **未触发**：matmul（if-in-loop 多 BB，需 P3）；conv2d-1/3（ICMP 检查或结构不匹配）
+
+### 1.2 QEMU 模拟计时分析（注意：QEMU TCG 不模拟双发射）
+
+P1 启用 vs 禁用（均含 P2+P4），3 次取最小值：
+
+- P1 触发用例：conv2d-2 +2.08%、huffman-01 +6.22%、crc1 +0.85%（QEMU 回归，代码变大）
+- 未触发用例波动 ±5-8%（QEMU TCG 噪声主导，陷阱 19）
+- **结论**：QEMU 无法验证双发射收益，需 FPGA 实测。BOOM 上独立 ADD 链可双发射，减少串行依赖。
 
 > 调研文档：`Solutions/调研文档.md`；本次 BOOM 微架构优化调研报告见本节"3.1 调研结论"。
 
@@ -210,15 +270,18 @@ if (a.op == "mul" || a.op == "mulw" || a.op == "mulh" || a.op == "smulh") return
 - ~~E1 mul latency 修复~~：PostRAScheduler `latencyOf` 中 mul 系列从 3 周期改为 1 周期（BOOM 单周期全流水）。零风险，静态指令数不变（20130）。
 - ~~E2 fall-through 优化~~：TargetCodeGen `emitCondBr`/`emitBr`/`emitRet` 支持 fall-through，省冗余 `j`。配套修复 PeepholeOptimizer 死 trampoline 清理的 fall-through 前驱检测。静态 20130→19602（**-528, -2.62%**），功能 95/100，性能 60/60。
 - ~~E3 显式压缩指令~~：评估完毕**不实施**。汇编器已自动产生 39.8% 压缩指令（9576/24048），所有可压缩模式均已覆盖。显式生成不改变最终二进制，PostRAScheduler 基于延迟调度不受益于指令大小信息。
+- ~~func_exit 符号冲突修复~~：`func_exit` 标签从 `main_exit:` 改为 `.Lmain_exit:`（`.L` 前缀不进符号表）。根因：FPGA sylib 定义全局 `main_exit` 函数输出 `main` 返回值，编译器生成的本地 `main_exit:` 标签被 FPGA 链接器解析为全局符号，遮蔽 sylib 的 `main_exit`，导致 `01_multiple_returns`/`02_ret_in_block` 等仅含 `return` 的用例无输出。修复后 `nm` 验证符号表无 `exit` 符号。emitRet 始终发射 `j .Lfunc_exit`，由 PeepholeOptimizer `.L` 限制规则做 fall-through 优化。
+- ~~性能分析（test15 基线 vs test16 E1+E2）~~：60 用例，28 改进 / 12 回归 / 20 持平。几何平均加速比 **+0.35%**（ratio=0.9965）。总时间 -0.74s（-0.11%）。**显著改进**：transpose -7.4~-8.7%、crc -4.8%、crypto -3.3~3.5%、h-8 -6.1~6.4%。**显著回归**：h-4-03 +14.62%（+1.74s）、huffman-01/02/03 +3.8~4.1%。长耗时用例（many_mat_cal/knapsack/conv2d）基本持平。
 
 ---
 
 ## 六、历史日志
 
-| 日期       | 内容                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 2026-07-28 | 创建草纸。基于稳定版 `017ab02` 建 `opt-research-scratch` 分支。完成调研报告 vs 现有实现差距分析：A/B/C/D 四组路线。                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| 2026-07-28 | **A 组完成**。A1 支配树 L/R 编码 + GVN 全支配合并；A2 纯函数识别；A4 PassManager 参数化。A3 放弃（BOOM mul 单周期）。静态 20337→20130（-1.02%），收益全部来自 GVN 全支配。已提交 b24d9ab。                                                                                                                                                                                                                                                                                                                                                 |
-| 2026-07-28 | **B 组评估完毕，无可行优化**。B1 无干净 unswitch 机会；B2 IndVars 被 SCEV 覆盖且 mul 廉价；B3 SimplifyCFG 折叠空 preheader；B4 RV64GC 无 Zba。实验：GEPStrengthReduce 多候选放宽 → +4.75% 回归，已回退。LSR 0/60 生效（PHI 形式不匹配）。结论：BOOM mul 单周期使所有 strength-reduction 净负。                                                                                                                                                                                                                                             |
-| 2026-07-28 | **BOOM 双发射优化调研立项**。调研 LLVM/GCC/学术界对双发射乱序 CPU 的优化方法，核查后端实现。关键结论：(1) BOOM ROB 仅 16 entries，编译器暴露跨迭代 ILP 有价值；(2) C 扩展翻倍取指带宽，当前未显式生成；(3) 分支误预测 ~14 周期，当前无概率引导布局；(4) 发现 PostRAScheduler mul latency bug（设 3 周期，应 1 周期）；(5) OoO 硬件已覆盖基本块内指令重排，精确发射口配对收益有限。整理 E/F/G 三梯队路线，E1/E2/E3/E4 为第一批。                                                                                                            |
-| 2026-07-28 | **E 组第一批完成**。E1: PostRAScheduler mul latency 3→1（Bug-1 修复）。E2: TargetCodeGen fall-through 优化——emitCondBr/emitBr/emitRet 省冗余 j；修复两个 bug：(a) away 边有 phi moves 时禁用 fall-through + 条件分支直接跳 awayBB 标签避免 edgeLabel 拦截；(b) PeepholeOptimizer 死 trampoline 清理增加 fall-through 前驱检测避免误删。静态 20130→19602（-528, -2.62%），功能 95/100 基线一致，性能 60/60。E3 评估不实施：汇编器已自动压缩 39.8%，显式生成无额外收益。剩余 j 分析：549 回边(需 loop rotation)、273 前向跳转、84 函数退出。 |
+| 日期       | 内容                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-07-28 | 创建草纸。基于稳定版 `017ab02` 建 `opt-research-scratch` 分支。完成调研报告 vs 现有实现差距分析：A/B/C/D 四组路线。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 2026-07-28 | **A 组完成**。A1 支配树 L/R 编码 + GVN 全支配合并；A2 纯函数识别；A4 PassManager 参数化。A3 放弃（BOOM mul 单周期）。静态 20337→20130（-1.02%），收益全部来自 GVN 全支配。已提交 b24d9ab。                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 2026-07-28 | **B 组评估完毕，无可行优化**。B1 无干净 unswitch 机会；B2 IndVars 被 SCEV 覆盖且 mul 廉价；B3 SimplifyCFG 折叠空 preheader；B4 RV64GC 无 Zba。实验：GEPStrengthReduce 多候选放宽 → +4.75% 回归，已回退。LSR 0/60 生效（PHI 形式不匹配）。结论：BOOM mul 单周期使所有 strength-reduction 净负。                                                                                                                                                                                                                                                                                                      |
+| 2026-07-28 | **BOOM 双发射优化调研立项**。调研 LLVM/GCC/学术界对双发射乱序 CPU 的优化方法，核查后端实现。关键结论：(1) BOOM ROB 仅 16 entries，编译器暴露跨迭代 ILP 有价值；(2) C 扩展翻倍取指带宽，当前未显式生成；(3) 分支误预测 ~14 周期，当前无概率引导布局；(4) 发现 PostRAScheduler mul latency bug（设 3 周期，应 1 周期）；(5) OoO 硬件已覆盖基本块内指令重排，精确发射口配对收益有限。整理 E/F/G 三梯队路线，E1/E2/E3/E4 为第一批。                                                                                                                                                                     |
+| 2026-07-28 | **E 组第一批完成**。E1: PostRAScheduler mul latency 3→1（Bug-1 修复）。E2: TargetCodeGen fall-through 优化——emitCondBr/emitBr/emitRet 省冗余 j；修复两个 bug：(a) away 边有 phi moves 时禁用 fall-through + 条件分支直接跳 awayBB 标签避免 edgeLabel 拦截；(b) PeepholeOptimizer 死 trampoline 清理增加 fall-through 前驱检测避免误删。静态 20130→19602（-528, -2.62%），功能 95/100 基线一致，性能 60/60。E3 评估不实施：汇编器已自动压缩 39.8%，显式生成无额外收益。剩余 j 分析：549 回边(需 loop rotation)、273 前向跳转、84 函数退出。                                                          |
+| 2026-07-28 | **func_exit 符号冲突修复 + 性能分析**。test16 FPGA 测试发现 `01_multiple_returns`/`02_ret_in_block` 功能回归。根因：`func_exit` 标签 `main_exit:`（无 `.L` 前缀）进入符号表，FPGA 链接器将其解析为全局符号，遮蔽 sylib 的 `main_exit` 函数（负责输出 main 返回值）。修复：`func.getName()+"_exit:"` → `".L"+func.getName()+"_exit:"`，emitRet 同步改为 `j .Lfunc_exit`。`nm` 验证符号表无 exit 符号。性能分析（test15 基线 vs test16 E1+E2）：60 用例 28 改进/12 回归/20 持平，几何平均 +0.35%。最大改进 transpose2 -7.42%（-1.36s），最大回归 h-4-03 +14.62%（+1.74s）。huffman-\* 一致 +4% 回归。 |

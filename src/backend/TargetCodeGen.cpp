@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdlib>
 #include <iostream>
 #include <set>
 
@@ -342,7 +343,11 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
         (void)bb;
     }
 
-    emitter.emitText(func.getName() + "_exit:");
+    // ★ 使用 .L 前缀：func_exit 标签仅作本地跳转目标，不进入符号表。
+    // 若不带 .L（如 main_exit:），FPGA 链接器可能将其解析为全局符号，
+    // 与 sylib 运行时的 main_exit 函数冲突，导致程序退出时绕过 sylib
+    // 的输出处理（01_multiple_returns / 02_ret_in_block 回归根因）。
+    emitter.emitText(".L" + func.getName() + "_exit:");
     emitEpilogue(func);
 
     currentFunc = nullptr;
@@ -925,9 +930,11 @@ std::string TargetCodeGen::emitGEPAddressToReg(IR::Instruction& gep,
 
 void TargetCodeGen::emitBasicBlock(IR::BasicBlock& bb) {
     currentBB = &bb;
-    // 循环头对齐到 16 字节边界，优化 BOOM 分支预测和取指
+    // 循环头对齐：BOOM 取指带宽 16B/周期，32B 对齐确保循环头不跨取指块边界。
+    // P5 实验：默认 32B（.p2align 5），可用 BOOM_ALIGN32_OFF=1 回退到 16B 做对照。
     if (loopHeaders.count(&bb)) {
-        emitter.emitText("  .p2align 4");
+        const char* a = std::getenv("BOOM_ALIGN32_OFF");
+        emitter.emitText((a && std::string(a) == "1") ? "  .p2align 4" : "  .p2align 5");
     }
     // Use .L prefix for local labels to avoid symbol conflicts across functions
     emitter.emitText(".L" + currentFunc->getName() + "_" + bb.getName() + ":");
@@ -1490,10 +1497,10 @@ void TargetCodeGen::emitRet(IR::Instruction& inst) {
             emitter.emitText(code);
         }
     }
-    // Fall-through 优化：最后一个块的 ret 直接 fall-through 到 func_exit
-    if (!nextIsExit) {
-        emitter.emitText("  j       " + currentFunc->getName() + "_exit");
-    }
+    // ★ 始终发射 j .Lfunc_exit，由 PeepholeOptimizer 做 fall-through 优化。
+    // .L 前缀确保退出标签不进入符号表，避免与 sylib 运行时的 main_exit 函数冲突。
+    // main 返回后由 _start 调用 sylib 的 main_exit(retval) 输出返回值。
+    emitter.emitText("  j       .L" + currentFunc->getName() + "_exit");
 }
 
 void TargetCodeGen::emitBr(IR::Instruction& inst) {

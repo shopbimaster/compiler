@@ -136,6 +136,8 @@ bool loopStrengthReduce(IR::Module* mod);
 bool loopFullUnroll(IR::Module* mod);
 bool gepStrengthReduce(IR::Module* mod);
 bool instructionScheduling(IR::Module* mod);
+bool reductionSplitting(IR::Module* mod);   // P1: 多累加器归约分裂
+bool earlyReturnToSelect(IR::Module* mod);   // P4: if-else-RET → SELECT
 void runO3(IR::Module* mod);
 
 // ================================================================
