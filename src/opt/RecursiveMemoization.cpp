@@ -163,7 +163,9 @@ IR::Instruction* cloneBodyInstruction(
         std::unordered_map<IR::BasicBlock*, IR::BasicBlock*>& blockMap) {
     auto remap = [&](IR::Value* value) -> IR::Value* {
         if (!value) return nullptr;
-        if (value == selfFunction) return fallback;
+        // Keep self-calls pointing at the memoized wrapper (selfFunction),
+        // not the fallback, so every recursive sub-problem is also cached.
+        (void)fallback;
         if (auto* block = dynamic_cast<IR::BasicBlock*>(value)) {
             auto found = blockMap.find(block);
             return found != blockMap.end() ? found->second : block;

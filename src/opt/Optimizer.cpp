@@ -63,7 +63,7 @@ void runO2(IR::Module* mod) {
     // 纯自递归函数记忆化：在尾递归消除/内联之前运行，因为匹配逻辑依赖
     // 恰好一个外部调用点和 alloca/load/store（非 PHI）的原始形态；
     // 这两个前提在内联或尾递归转换后不再成立。
-    if (recursiveMemoization(mod)) {
+    if (PASS_CALL(recursiveMemoization)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
