@@ -13,6 +13,7 @@ struct AffineKernelSummary {
     IR::Function* sourceFunction = nullptr;
     IR::ArrayType* rowType = nullptr;
     IR::ConstantInt* skippedScale = nullptr;
+    int64_t indexStart = 0;
 };
 
 // A fully proven transformation plan. Building the plan performs all
@@ -23,6 +24,7 @@ struct MatrixReductionPlan {
     IR::Function* caller = nullptr;
     IR::BasicBlock* loopPreheader = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
+    unsigned finalInnerBoundOperand = 1;
     std::vector<IR::Instruction*> calls;
     IR::GlobalVariable* seedMatrix = nullptr;
     IR::GlobalVariable* resultMatrix = nullptr;

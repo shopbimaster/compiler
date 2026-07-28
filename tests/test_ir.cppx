@@ -3,6 +3,7 @@
 #include <string>
 #include "ir/IR.h"
 #include "ir/IRBuilder.h"
+#include "opt/LoopPatternAnalysis.h"
 #include "opt/Optimizer.h"
 
 using namespace IR;
@@ -777,6 +778,55 @@ void test_instruction_scheduling_dep_chain() {
     PASS();
 }
 
+void test_counted_loop_nonzero_reversed_compare() {
+    TEST("CountedLoop 非零起点与反向比较");
+    Module mod;
+    auto* function = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "counted_loop");
+    auto* entry = function->createBlock("entry");
+    auto* header = function->createBlock("loop.header");
+    auto* body = function->createBlock("loop.body");
+    auto* latch = function->createBlock("loop.latch");
+    auto* exit = function->createBlock("exit");
+
+    auto* start = ConstantInt::get(IntegerType::I32, 2);
+    auto* bound = ConstantInt::get(IntegerType::I32, 7);
+    auto* one = ConstantInt::get(IntegerType::I32, 1);
+    auto* next = Instruction::createBinOp(
+        Instruction::Opcode::ADD, IntegerType::I32,
+        "i.next", nullptr, one);
+    auto* induction =
+        Instruction::createPhi(IntegerType::I32, "i", 4);
+    induction->addOperand(start);
+    induction->addOperand(entry);
+    induction->addOperand(next);
+    induction->addOperand(latch);
+    next->setOperand(0, induction);
+
+    entry->pushBack(Instruction::createBr(header));
+    header->pushBack(induction);
+    auto* compare = Instruction::createCmp(
+        Instruction::Opcode::ICMP, bound, induction, "sgt");
+    header->pushBack(compare);
+    header->pushBack(
+        Instruction::createCondBr(compare, body, exit));
+    body->pushBack(Instruction::createBr(latch));
+    latch->pushBack(next);
+    latch->pushBack(Instruction::createBr(header));
+    exit->pushBack(Instruction::createRet(
+        ConstantInt::get(IntegerType::I32, 0)));
+
+    Opt::CanonicalCountedLoop loop;
+    CHECK(Opt::analyzeCanonicalCountedLoop(
+        function, induction, bound, body, loop));
+    CHECK(loop.start == start);
+    CHECK(loop.bound == bound);
+    CHECK(loop.step == 1);
+    CHECK(loop.boundOperand == 0);
+    CHECK(loop.body.count(body) == 1);
+    PASS();
+}
+
 // ================================================================
 // main
 // ================================================================
@@ -814,6 +864,9 @@ int main() {
     std::cout << "\n[Instruction Scheduling]\n";
     test_instruction_scheduling_load_hoist();
     test_instruction_scheduling_dep_chain();
+
+    std::cout << "\n[Loop Pattern Analysis]\n";
+    test_counted_loop_nonzero_reversed_compare();
 
     std::cout << "\n=== 结果: " << passed << " passed, "
               << failed << " failed ===\n";

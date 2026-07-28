@@ -6,23 +6,25 @@
 
 namespace Opt {
 
-// Describes the canonical counted-loop form currently consumed by
+// Describes an ascending unit-step counted loop consumed by
 // structure-sensitive transformations:
 //
-//   for (i = 0; i < bound; i += 1)
+//   for (i = start; i < bound; i += 1)
 //
-// Keeping this descriptor outside an individual transformation makes the
-// structural requirement explicit and provides one place to generalize it.
+// The comparison may also be represented equivalently as bound > i.
 struct CanonicalCountedLoop {
     IR::Instruction* induction = nullptr;
     IR::Instruction* compare = nullptr;
     IR::BasicBlock* header = nullptr;
+    IR::Value* start = nullptr;
     IR::Value* bound = nullptr;
+    int64_t step = 0;
+    unsigned boundOperand = 1;
     std::unordered_set<IR::BasicBlock*> body;
 };
 
-// Recognizes a zero-based, unit-step, signed-less-than natural loop and also
-// proves that containedBlock belongs to that loop.
+// Recognizes an ascending, unit-step, exclusive-upper-bound natural loop and
+// also proves that containedBlock belongs to that loop.
 bool analyzeCanonicalCountedLoop(
     IR::Function* function,
     IR::Value* induction,

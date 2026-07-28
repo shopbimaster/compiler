@@ -27,6 +27,8 @@ IR::Function* createAffineRowSummaryFunction(
     auto* i32 = IR::IntegerType::I32;
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
+    auto* indexStart = IR::ConstantInt::get(
+        i32, summary.indexStart);
 
     auto* entry = function->createBlock("entry");
     auto* iHeader = function->createBlock("summary.i.cond");
@@ -41,9 +43,9 @@ IR::Function* createAffineRowSummaryFunction(
     auto* kNext = IR::Instruction::createBinOp(
         Opc::ADD, i32, "summary.k.next", nullptr, one);
     auto* indexI = makePhi(
-        i32, "summary.i", zero, entry, iNext, iLatch);
+        i32, "summary.i", indexStart, entry, iNext, iLatch);
     auto* indexK = makePhi(
-        i32, "summary.k", zero, iBody, kNext, kBody);
+        i32, "summary.k", indexStart, iBody, kNext, kBody);
     auto* accumulation =
         IR::Instruction::createPhi(i32, "summary.acc", 4);
     accumulation->addOperand(zero);
@@ -91,7 +93,7 @@ IR::Function* createAffineRowSummaryFunction(
         {indexK}, "summary.B.row");
     auto* inputAddress =
         IR::Instruction::createGetElementPtr(
-            i32, inputRow, {zero, zero},
+            i32, inputRow, {zero, indexStart},
             "summary.B.sum.addr");
     auto* inputSum = IR::Instruction::createLoad(
         i32, inputAddress, "summary.B.sum");
@@ -129,7 +131,7 @@ IR::Function* createAffineRowSummaryFunction(
 
     auto* outputAddress =
         IR::Instruction::createGetElementPtr(
-            i32, outputRow, {zero, zero},
+            i32, outputRow, {zero, indexStart},
             "summary.C.sum.addr");
     iLatch->pushBack(outputAddress);
     iLatch->pushBack(
@@ -142,7 +144,8 @@ IR::Function* createAffineRowSummaryFunction(
 }
 
 IR::Function* createRowSummaryFunction(
-    IR::Module* module, IR::ArrayType* rowType) {
+    IR::Module* module, IR::ArrayType* rowType,
+    int64_t start) {
     auto* i32 = IR::IntegerType::I32;
     auto* rowPointer = IR::PointerType::get(rowType);
     auto* type = IR::FunctionType::get(
@@ -152,6 +155,7 @@ IR::Function* createRowSummaryFunction(
 
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
+    auto* indexStart = IR::ConstantInt::get(i32, start);
     auto* entry = function->createBlock("entry");
     auto* iHeader = function->createBlock("rows.i.cond");
     auto* iBody = function->createBlock("rows.i.body");
@@ -167,9 +171,9 @@ IR::Function* createRowSummaryFunction(
     auto* sumNext = IR::Instruction::createBinOp(
         Opc::ADD, i32, "rows.sum.next", nullptr, nullptr);
     auto* indexI = makePhi(
-        i32, "rows.i", zero, entry, iNext, iLatch);
+        i32, "rows.i", indexStart, entry, iNext, iLatch);
     auto* indexJ = makePhi(
-        i32, "rows.j", zero, iBody, jNext, jBody);
+        i32, "rows.j", indexStart, iBody, jNext, jBody);
     auto* sum = makePhi(
         i32, "rows.sum", zero, iBody, sumNext, jBody);
     iNext->setOperand(0, indexI);
@@ -214,7 +218,7 @@ IR::Function* createRowSummaryFunction(
 
     auto* outputAddress =
         IR::Instruction::createGetElementPtr(
-            i32, row, {zero, zero},
+            i32, row, {zero, indexStart},
             "rows.output.addr");
     iLatch->pushBack(outputAddress);
     iLatch->pushBack(
@@ -230,7 +234,9 @@ IR::Function* createRowSummaryFunction(
 bool applyMatrixReductionPlan(
     IR::Module* module, const MatrixReductionPlan& plan) {
     auto* summaryFunction =
-        createRowSummaryFunction(module, plan.kernel.rowType);
+        createRowSummaryFunction(
+            module, plan.kernel.rowType,
+            plan.kernel.indexStart);
     auto* summaryKernel =
         createAffineRowSummaryFunction(module, plan.kernel);
     auto* zero =
@@ -259,7 +265,10 @@ bool applyMatrixReductionPlan(
             call->setOperand(0, summaryKernel);
         }
         plan.finalInnerCompare->setOperand(
-            1, IR::ConstantInt::get(IR::IntegerType::I32, 1));
+            plan.finalInnerBoundOperand,
+            IR::ConstantInt::get(
+                IR::IntegerType::I32,
+                plan.kernel.indexStart + 1));
         return true;
     }
     return false;

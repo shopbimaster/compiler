@@ -6,6 +6,7 @@
 #include "opt/ScalarReductionAnalysis.h"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -18,6 +19,25 @@ using Opc = IR::Instruction::Opcode;
 bool isConstant(IR::Value* value, int64_t expected) {
     auto* constant = dynamic_cast<IR::ConstantInt*>(value);
     return constant && constant->getValue() == expected;
+}
+
+bool getCommonConstantStart(
+    const std::vector<const CanonicalCountedLoop*>& loops,
+    int64_t& start) {
+    bool initialized = false;
+    for (auto* loop : loops) {
+        auto* constant =
+            loop ? dynamic_cast<IR::ConstantInt*>(loop->start)
+                 : nullptr;
+        if (!constant) return false;
+        if (!initialized) {
+            start = constant->getValue();
+            initialized = true;
+        } else if (constant->getValue() != start) {
+            return false;
+        }
+    }
+    return initialized;
 }
 
 bool matchKernelFunction(
@@ -208,6 +228,16 @@ bool matchKernelFunction(
             zeroStore->getParent(), zeroLoopJ)) {
         return false;
     }
+    int64_t indexStart = 0;
+    if (!getCommonConstantStart(
+            {&loopI, &loopJ, &loopK,
+             &zeroLoopI, &zeroLoopJ},
+            indexStart) ||
+        indexStart < 0 ||
+        indexStart >=
+            std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
 
     auto postDominators = computePostDominators(function);
     auto* innerTerminator = loopJ.compare->getParent()
@@ -245,6 +275,7 @@ bool matchKernelFunction(
     summary.sourceFunction = function;
     summary.rowType = rowType;
     summary.skippedScale = skippedCoefficient;
+    summary.indexStart = indexStart;
     return true;
 }
 
@@ -269,10 +300,12 @@ bool findFinalReduction(
     IR::Function* caller,
     IR::GlobalVariable* matrix,
     IR::Value* size,
+    int64_t expectedStart,
     const std::vector<IR::Instruction*>& allowedCalls,
     IR::BasicBlock* loopPreheader,
     IR::Instruction*& finalLoad,
-    IR::Instruction*& innerCompare) {
+    IR::Instruction*& innerCompare,
+    unsigned& innerBoundOperand) {
     std::vector<IR::Instruction*> loads;
     std::vector<IR::Instruction*> stores;
     std::vector<IR::Instruction*> callsWithMatrix;
@@ -377,6 +410,12 @@ bool findFinalReduction(
             loads[0]->getParent(), inner)) {
         return false;
     }
+    int64_t reductionStart = 0;
+    if (!getCommonConstantStart(
+            {&outer, &inner}, reductionStart) ||
+        reductionStart != expectedStart) {
+        return false;
+    }
 
     for (auto* block : inner.body) {
         for (auto& instruction : block->getInstructions()) {
@@ -390,6 +429,7 @@ bool findFinalReduction(
 
     finalLoad = loads[0];
     innerCompare = inner.compare;
+    innerBoundOperand = inner.boundOperand;
     return true;
 }
 
@@ -573,11 +613,14 @@ bool matchCallChain(
         findUniqueLoopPreheader(caller, callBlock);
     IR::Instruction* finalLoad = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
+    unsigned finalInnerBoundOperand = 1;
     if (!loopPreheader ||
         !findFinalReduction(
             module, caller, resultMatrix, size,
+            kernel.indexStart,
             orderedCalls, loopPreheader,
-            finalLoad, finalInnerCompare)) {
+            finalLoad, finalInnerCompare,
+            finalInnerBoundOperand)) {
         return false;
     }
 
@@ -608,6 +651,8 @@ bool matchCallChain(
     plan.caller = caller;
     plan.loopPreheader = loopPreheader;
     plan.finalInnerCompare = finalInnerCompare;
+    plan.finalInnerBoundOperand =
+        finalInnerBoundOperand;
     plan.calls = std::move(orderedCalls);
     plan.seedMatrix = seedMatrix;
     plan.resultMatrix = resultMatrix;

@@ -48,41 +48,61 @@ bool analyzeCanonicalCountedLoop(
     auto* compare =
         dynamic_cast<IR::Instruction*>(terminator->getOperand(0));
     if (!compare || compare->getOpcode() != Opc::ICMP ||
-        compare->getName() != "slt" ||
-        compare->getNumOperands() != 2 ||
-        compare->getOperand(0) != phi ||
-        compare->getOperand(1) != bound) {
+        compare->getNumOperands() != 2) {
         return false;
     }
 
-    bool hasZero = false;
+    unsigned boundOperand = 1;
+    const bool directLessThan =
+        compare->getName() == "slt" &&
+        compare->getOperand(0) == phi &&
+        compare->getOperand(1) == bound;
+    const bool reversedGreaterThan =
+        compare->getName() == "sgt" &&
+        compare->getOperand(0) == bound &&
+        compare->getOperand(1) == phi;
+    if (!directLessThan && !reversedGreaterThan) return false;
+    if (reversedGreaterThan) boundOperand = 0;
+
+    const NaturalLoop* naturalLoop = nullptr;
+    auto loops = findNaturalLoops(function);
+    for (auto& loop : loops) {
+        if (loop.header == header &&
+            loop.body.count(containedBlock)) {
+            naturalLoop = &loop;
+            break;
+        }
+    }
+    if (!naturalLoop) return false;
+
+    IR::Value* start = nullptr;
     bool hasStep = false;
     for (unsigned index = 0;
          index < phi->getNumOperands(); index += 2) {
         auto* incoming = phi->getOperand(index);
-        if (isConstant(incoming, 0)) {
-            hasZero = true;
+        auto* incomingBlock = dynamic_cast<IR::BasicBlock*>(
+            phi->getOperand(index + 1));
+        if (!incomingBlock) return false;
+        if (!naturalLoop->body.count(incomingBlock)) {
+            if (start) return false;
+            start = incoming;
             continue;
         }
         auto* add = dynamic_cast<IR::Instruction*>(incoming);
         if (!isAddOneOf(add, phi)) return false;
         hasStep = true;
     }
-    if (!hasZero || !hasStep) return false;
+    if (!start || !hasStep) return false;
 
-    for (auto& loop : findNaturalLoops(function)) {
-        if (loop.header != header ||
-            !loop.body.count(containedBlock)) {
-            continue;
-        }
-        result.induction = phi;
-        result.compare = compare;
-        result.header = header;
-        result.bound = bound;
-        result.body = loop.body;
-        return true;
-    }
-    return false;
+    result.induction = phi;
+    result.compare = compare;
+    result.header = header;
+    result.start = start;
+    result.bound = bound;
+    result.step = 1;
+    result.boundOperand = boundOperand;
+    result.body = naturalLoop->body;
+    return true;
 }
 
 } // namespace Opt
