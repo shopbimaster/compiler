@@ -13,23 +13,19 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
-#include <cstdlib>   // std::getenv for GVN escape hatch
+#include <cstdlib>   // std::getenv
 #include <string>
 
 namespace Opt {
 
-// GVN 默认启用。历史因线性扫描无法处理其拉长的活跃区间而禁用（+1319ms/线扫时代）；
-// 换用 call-aware 图着色分配器后，图着色的全局溢出决策消化了长区间——
-// 图着色下静态实测 GVN 净降指令 -2.7% / 循环加权 spill -264 / 零回退用例，
-// 正确性 60/60。故正式启用。逃生开关 OPT_DISABLE_GVN=1 可关闭（对称于
-// RA_ALLOCATOR=linear），用于平台回退时快速定位。
-static bool gvnEnabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("OPT_DISABLE_GVN");
-        return !(v && std::string(v) == "1");
-    }();
-    return on;
-}
+// ================================================================
+// A4：参数化 Pass 开关（见 PassManager.cpp）
+//   OPT_DISABLE="mem2reg,globalValueNumbering"  黑名单
+//   OPT_ENABLE="globalValueNumbering"           白名单（只跑列出的）
+// 宏将 pass 函数名字符串化，与函数调用一起短路求值：
+//   pass 被禁用时直接返回 false，跳过其后的 CF/DCE 清理。
+// ================================================================
+#define PASS_CALL(fn) (Opt::passEnabled(#fn) && (fn(mod)))
 
 // ================================================================
 // O1：基础安全优化（无依赖，总是有益）
@@ -54,49 +50,54 @@ void runO2(IR::Module* mod) {
     // ================================================================
 
     // 1a. 树摇
-    treeShaking(mod);
+    if (PASS_CALL(treeShaking)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
 
-    if (radixSortLowering(mod)) {
+    if (PASS_CALL(radixSortLowering)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
     // 纯自递归函数记忆化：在尾递归消除/内联之前运行，因为匹配逻辑依赖
-    // "恰好一个外部调用点"和 alloca/load/store（非 PHI）的原始形态；
+    // 恰好一个外部调用点和 alloca/load/store（非 PHI）的原始形态；
     // 这两个前提在内联或尾递归转换后不再成立。
     if (recursiveMemoization(mod)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
-    if (repeatedDivRemToNative(mod)) {
+
+    if (PASS_CALL(repeatedDivRemToNative)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
-    if (recursiveModularMulToNative(mod)) {
+    if (PASS_CALL(recursiveModularMulToNative)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
-    if (bitOpPatternRecognition(mod)) {
+    if (PASS_CALL(bitOpPatternRecognition)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
-    if (powerOfTwoDispatchSimplification(mod)) {
+    if (PASS_CALL(powerOfTwoDispatchSimplification)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
-    if (tailRecursionElimination(mod)) {
+    if (PASS_CALL(tailRecursionElimination)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
-    inlineExpansion(mod);
-    constantFolding(mod);
-    deadCodeElimination(mod);
+    if (PASS_CALL(inlineExpansion)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
 
     // Mem2Reg+PhiLowering：将 alloca/load/store 提升为 SSA（PHI）形式，
     // 让后续优化（SCCP/GVN/CSE 等）能在 SSA 上运行，然后降低 PHI 为
@@ -105,7 +106,7 @@ void runO2(IR::Module* mod) {
     // isAllocaPromotable 会跳过这些 ALLOCA，避免消耗 callee-saved 寄存器
     // 导致 12_DSU SEGFAULT。
     // ★ 暂时禁用用于诊断 SEGFAULT
-    if (mem2reg(mod)) {
+    if (PASS_CALL(mem2reg)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -115,14 +116,14 @@ void runO2(IR::Module* mod) {
     //     叶子函数 getNumPos）现在指令数大幅减少，可被内联。
     //     ★ 依赖 InlineExpansion 的 PHI 克隆支持（mem2reg 引入 PHI 节点）
     //     内联后再次 CF+DCE 清理，并重跑 mem2reg 消除内联引入的临时 ALLOCA
-    if (inlineExpansion(mod)) {
+    if (PASS_CALL(inlineExpansion)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
 
     // 1c. 二次 mem2reg：内联引入的 retAlloca（用于返回值）和其他临时 ALLOCA
     //     应被提升为 SSA，使后续优化（SCCP/CSE/InstCombine 等）更有效
-    if (mem2reg(mod)) {
+    if (PASS_CALL(mem2reg)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -134,7 +135,7 @@ void runO2(IR::Module* mod) {
     //     保留代码以备未来添加函数对齐后重新启用。
     if (false) treeShaking(mod);
 
-    if (globalVariablePromotion(mod)) {
+    if (PASS_CALL(globalVariablePromotion)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -147,7 +148,7 @@ void runO2(IR::Module* mod) {
     //   效果：如 hashmod.local0（在 entry 中 STORE 两次，循环中 LOAD）→ 直接使用
     //   最后一个 STORE 的值，消除循环中的栈 LOAD
     // ★ 暂时禁用用于诊断 SEGFAULT
-    if (mem2regLocal(mod)) {
+    if (PASS_CALL(mem2regLocal)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -156,7 +157,7 @@ void runO2(IR::Module* mod) {
     // 在 GVP 之后运行，使后续 SCCP 能传播这些常量到函数参数和循环边界，
     // 触发循环完全展开等优化。
     // ★ 暂时禁用用于诊断 SEGFAULT
-    if (globalConstantPropagation(mod)) {
+    if (PASS_CALL(globalConstantPropagation)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -171,28 +172,28 @@ void runO2(IR::Module* mod) {
         bool phase2Changed = false;
 
         // 2a. InstCombine：代数恒等式化简 + Store-to-Load 前推
-        if (instCombine(mod)) {
+        if (PASS_CALL(instCombine)) {
             constantFolding(mod);
             deadCodeElimination(mod);
             phase2Changed = true;
         }
 
         // 2b. DSE：InstCombine 的 Store-to-Load 前推可能暴露死存储
-        if (deadStoreElimination(mod)) {
+        if (PASS_CALL(deadStoreElimination)) {
             constantFolding(mod);
             deadCodeElimination(mod);
             phase2Changed = true;
         }
 
         // 2c. CFG 简化：常量分支折叠 + 不可达块删除 + 空块消除
-        if (simplifyCFG(mod)) {
+        if (PASS_CALL(simplifyCFG)) {
             constantFolding(mod);
             deadCodeElimination(mod);
             phase2Changed = true;
         }
 
         // 2d. 跳转线程化：消除冗余跳转链 br A -> br B -> br C => br C
-        if (jumpThreading(mod)) {
+        if (PASS_CALL(jumpThreading)) {
             // 跳转线程化可能创造新的SimplifyCFG机会
             simplifyCFG(mod);
             phase2Changed = true;
@@ -390,8 +391,8 @@ void runO2(IR::Module* mod) {
     // 历史禁用原因：跨 BB 合并延长活跃区间→线性扫描寄存器压力增→净回退
     //   （+1319ms / 60 perf tests）。换用 call-aware 图着色分配器后，其全局溢出
     //   决策消化了长区间，图着色下静态实测 GVN 净降指令/循环 spill、零回退，
-    //   正确性 60/60。故正式启用。OPT_DISABLE_GVN=1 可关闭。
-    if (gvnEnabled() && globalValueNumbering(mod)) {
+    //   正确性 60/60。故正式启用。OPT_DISABLE=globalValueNumbering 可关闭。
+    if (PASS_CALL(globalValueNumbering)) {
         constantFolding(mod);
         deadCodeElimination(mod);
         if (commonSubexpressionElimination(mod)) {

@@ -122,22 +122,32 @@ bool gvnOnFunction(IR::Function* func) {
     auto dom = computeDominators(func);
     auto idom = computeImmediateDominators(func, dom);
     auto children = buildDomTreeChildren(func, idom);
+    // A1：支配树 L/R 区间编码，支配判断 O(1)
+    auto domLR = computeDomTreeLR(func, idom);
+
+    // 历史限制：只合并同 BB 或直接支配者（idom）的表达式，
+    //   因线性扫描无法处理跨多 BB 的长活跃区间（寄存器分配 bug）。
+    // 现默认图着色分配器可消化长区间（见 Optimizer.cpp 顶部注释），
+    //   放开为"支配当前 BB 即合并"（全支配 GVN）。
+    // 逃生开关 OPT_GVN_IDOM_ONLY=1 恢复旧的 idom-only 限制。
+    static const bool idomOnly = [] {
+        const char* v = std::getenv("OPT_GVN_IDOM_ONLY");
+        return v && std::string(v) == "1";
+    }();
 
     // 用 scoped hash table 实现支配树 DFS
     // 每个 BB 继承 idom 的可用表达式，添加自己的表达式
     // 退出时恢复（通过记录添加的数量）
     std::unordered_map<GVNKey, IR::Instruction*, GVNKeyHash> available;
 
-    std::vector<IR::Instruction*> toErase;
     bool changed = false;
 
     // DFS 遍历支配树
     std::function<void(IR::BasicBlock*)> dfs = [&](IR::BasicBlock* bb) {
-        // 记录当前可用表达式数量，用于退出时恢复
-        size_t savedSize = available.size();
+        // 记录本 BB 添加的键，用于退出时恢复
         std::vector<GVNKey> addedKeys;
 
-        // 当前 BB 的直接支配者
+        // 当前 BB 的直接支配者（仅 idomOnly 模式下使用）
         auto idomIt = idom.find(bb);
         IR::BasicBlock* bbIdom = (idomIt != idom.end()) ? idomIt->second : nullptr;
 
@@ -153,14 +163,16 @@ bool gvnOnFunction(IR::Function* func) {
             auto found = available.find(key);
 
             if (found != available.end() && found->second != inst) {
-                // ★ 安全检查：只合并来自直接支配者的 GEP
-                // 原因：寄存器分配器对跨多 BB 的长活跃区间处理有 bug。
-                // 限制为直接支配者（idom）可将活跃区间限制在 1 个 BB 边界内。
-                // 来自更远祖先的 GEP 不合并，避免触发寄存器分配器 bug。
+                // ★ 安全检查：只合并支配当前 BB 的表达式。
+                //   available 表沿支配树 DFS 继承，found->second 必然位于
+                //   当前 BB 的某个支配者中；L/R 编码 O(1) 显式验证。
+                //   idomOnly 模式退回旧的"同 BB 或 idom"限制。
                 auto* existingBB = found->second->getParent();
-                if (existingBB != bb && existingBB != bbIdom) {
-                    // 不是同 BB 也不是直接支配者 — 跳过合并
-                    // 但将当前 GEP 注册为新可用值，供直接子节点使用
+                bool mergeable = idomOnly
+                    ? (existingBB == bb || existingBB == bbIdom)
+                    : (existingBB == bb || dominatesLR(existingBB, bb, domLR));
+                if (!mergeable) {
+                    // 不合并，但将当前指令注册为新可用值，供后代使用
                     bool alreadyAdded = false;
                     for (auto& ak : addedKeys) {
                         if (ak == key) { alreadyAdded = true; break; }
@@ -172,7 +184,7 @@ bool gvnOnFunction(IR::Function* func) {
                     ++it;
                     continue;
                 }
-                // 同 BB 或直接支配者 — 安全合并
+                // 支配关系明确 — 安全合并
                 inst->replaceAllUsesWith(found->second);
                 inst->dropAllUses();
                 it = bb->erase(it);
@@ -199,7 +211,6 @@ bool gvnOnFunction(IR::Function* func) {
         for (const auto& key : addedKeys) {
             available.erase(key);
         }
-        (void)savedSize;
     };
 
     // 从 entry 开始 DFS

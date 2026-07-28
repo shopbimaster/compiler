@@ -147,6 +147,8 @@ add_library(sysy_opt STATIC
     src/opt/Mem2Reg.cpp
     src/opt/GVN.cpp
     src/opt/PhiLowering.cpp
+    src/opt/PassManager.cpp
+    src/opt/PureFuncDetection.cpp
 )
 target_include_directories(sysy_opt PUBLIC include)
 target_link_libraries(sysy_opt PUBLIC sysy_ir_core)

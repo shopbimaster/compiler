@@ -29,6 +29,40 @@ DomMap computeDominators(IR::Function* func);
 DomMap computePostDominators(IR::Function* func);
 bool strictlyDominates(IR::BasicBlock* a, IR::BasicBlock* b, const DomMap& dom);
 
+// ================================================================
+// 支配树 DFS L/R 区间编码（借鉴 Cpl5）
+// 一次 DFS 给每个块分配 [L, R] 区间，之后 isDominate(a,b) 降为 O(1)：
+//   a 支配 b  ⟺  L[a] <= L[b] && R[a] >= R[b]
+// 供 GVN/CSE 等需要频繁支配判断的热点 pass 使用。
+// ================================================================
+struct DomTreeLR {
+    std::unordered_map<IR::BasicBlock*, unsigned> L;
+    std::unordered_map<IR::BasicBlock*, unsigned> R;
+};
+DomTreeLR computeDomTreeLR(IR::Function* func,
+    const std::unordered_map<IR::BasicBlock*, IR::BasicBlock*>& idom);
+// a 是否支配 b（含 a==b）。块不在编码表中（不可达）时返回 false。
+bool dominatesLR(IR::BasicBlock* a, IR::BasicBlock* b, const DomTreeLR& lr);
+
+// ================================================================
+// 参数化 Pass 开关（PassManager.cpp）
+// OPT_DISABLE="gvn,licm" 黑名单；OPT_ENABLE="gvn,sccp" 白名单。
+// 键名为 pass 函数名（GVN/LICM/SCCP/CSE/DSE 别名已归一化）。
+// ================================================================
+bool passEnabled(const std::string& name);
+
+// ================================================================
+// 纯函数识别（借鉴 Cpl5 PureFuncDect）
+// 纯函数：不 STORE 到全局/参数指针/未知内存，不调用非纯函数，
+//         不调用有副作用的外部函数（sylib IO 等）。
+// 迭代至不动点以支持相互递归。结果用于 LICM 提升 CALL、
+// LoadElimination 跨纯 CALL 保留缓存。
+// ================================================================
+bool isPureFunction(IR::Function* func,
+    const std::unordered_set<IR::Function*>& pureSet);
+// 返回模块中所有纯函数（含 main 若满足条件）。
+std::unordered_set<IR::Function*> detectPureFunctions(IR::Module* mod);
+
 // 计算立即支配者（idom）：每个块在支配树中的直接父节点
 std::unordered_map<IR::BasicBlock*, IR::BasicBlock*> computeImmediateDominators(IR::Function* func, const DomMap& dom);
 
