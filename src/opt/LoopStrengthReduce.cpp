@@ -83,6 +83,7 @@ bool strengthReduceLoop(const NaturalLoop& loop, IR::Function* func) {
     if (info.tripCount < 0) return false;
 
     int64_t multiplier = mul.constOperand->getValue();
+
     int64_t stepVal = 0;
     if (auto* stepCI = dynamic_cast<IR::ConstantInt*>(info.step)) {
         stepVal = stepCI->getValue();
@@ -94,10 +95,18 @@ bool strengthReduceLoop(const NaturalLoop& loop, IR::Function* func) {
     auto* mulBB = mul.mulInst->getParent();
 
     // 1. 在 header 的 preheader 或 header 开头创建累加器的初始值
-    // 初始值 = 0（如果起始值是 0）或 start * multiplier
+    // 初始值 = start * multiplier
+    // ★ 修复：当 start 不是编译期常量时必须跳过 LSR。
+    //   原代码默认 initialVal=0，对非常量起始值的 IV（如 crypto 的 input_len
+    //   循环，start = input_len+1 依赖参数）会把累加器错误初始化为 0，
+    //   导致数组下标计算错误、数据损坏。正确做法应在 preheader 生成
+    //   start*multiplier 的运行时计算指令，但 LSR 在 BOOM（mul 单周期全流水）
+    //   上无收益（project_memory 已验证），保守跳过。
     int64_t initialVal = 0;
     if (auto* startCI = dynamic_cast<IR::ConstantInt*>(info.start)) {
         initialVal = startCI->getValue() * multiplier;
+    } else {
+        return false;
     }
 
     auto* initConst = IR::ConstantInt::get(IR::IntegerType::get(32), initialVal);

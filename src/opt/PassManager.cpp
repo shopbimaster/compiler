@@ -60,6 +60,16 @@ bool passEnabled(const std::string& name) {
     if (disableList.count(name) > 0)
         return false;
 
+    // ★ 内置默认禁用列表：这些 pass 在 BOOM 目标上无收益或有 bug。
+    //   可用 OPT_ENABLE=passName 强制开启（用于调试/对比）。
+    //   - loopStrengthReduce：BOOM mul 单周期全流水，强度削减净负收益（A3/B2 验证）；
+    //     且在多 BB 循环体（如 crypto 的 3*i）上累加器变换有 bug，破坏计算。
+    static const std::unordered_set<std::string> builtinDisable = {
+        "loopStrengthReduce",
+    };
+    if (builtinDisable.count(name) > 0)
+        return false;
+
     // 兼容旧开关 OPT_DISABLE_GVN=1
     if (name == "globalValueNumbering") {
         static const bool gvnOff = [] {

@@ -222,7 +222,7 @@ void runO2(IR::Module* mod) {
     // ================================================================
 
     // 3a. MagicDivision：常量除法 → 乘法+移位序列（产生新常量）
-    if (magicDivision(mod)) {
+    if (PASS_CALL(magicDivision)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -240,7 +240,7 @@ void runO2(IR::Module* mod) {
     }
 
     // 3d. LoadElimination：消除冗余 LOAD（简化后续分析）
-    if (loadElimination(mod)) {
+    if (PASS_CALL(loadElimination)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -300,7 +300,7 @@ void runO2(IR::Module* mod) {
         }
 
         // 反馈-2: MagicDivision 处理 SCCP 新暴露的常量除法
-        if (magicDivision(mod)) {
+        if (PASS_CALL(magicDivision)) {
             constantFolding(mod);
             deadCodeElimination(mod);
             feedbackChanged = true;
@@ -348,7 +348,7 @@ void runO2(IR::Module* mod) {
 
     // 5b. LoadElimination（第二次）：LICM 外提代码后可能暴露冗余 LOAD
     //     （外提的 LOAD 与循环内的 LOAD 可能引用同一地址）
-    if (loadElimination(mod)) {
+    if (PASS_CALL(loadElimination)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -379,7 +379,7 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
     // 6d. BasicBlockReordering：基于支配树的拓扑排序，优化 fall-through
-    if (basicBlockReordering(mod)) {
+    if (PASS_CALL(basicBlockReordering)) {
         // 仅布局变化，无需 CF/DCE
     }
 
@@ -420,21 +420,21 @@ void runO3(IR::Module* mod) {
     bool o3Changed = false;
 
     // LoopInterchange：循环交换（在 LSR/GEP 之前，因为交换改变循环结构）
-    if (loopInterchange(mod)) {
+    if (PASS_CALL(loopInterchange)) {
         constantFolding(mod);
         deadCodeElimination(mod);
         o3Changed = true;
     }
 
     // LoopStrengthReduce：循环强度削弱（MUL→累加）
-    if (loopStrengthReduce(mod)) {
+    if (PASS_CALL(loopStrengthReduce)) {
         constantFolding(mod);
         deadCodeElimination(mod);
         o3Changed = true;
     }
 
     // LoopFullUnroll：基于 SCEV 确定迭代次数的完全展开
-    if (loopFullUnroll(mod)) {
+    if (PASS_CALL(loopFullUnroll)) {
         constantFolding(mod);
         deadCodeElimination(mod);
         o3Changed = true;
@@ -450,7 +450,7 @@ void runO3(IR::Module* mod) {
     }
 
     // LoopUnrolling：部分展开（P2: 最大 16×，tc≤256）
-    if (loopUnrolling(mod)) {
+    if (PASS_CALL(loopUnrolling)) {
         constantFolding(mod);
         deadCodeElimination(mod);
         o3Changed = true;
@@ -516,7 +516,7 @@ void runO3(IR::Module* mod) {
         }
 
         // 5. LoadElimination：消除展开后的冗余 LOAD
-        if (loadElimination(mod)) {
+        if (PASS_CALL(loadElimination)) {
             constantFolding(mod);
             deadCodeElimination(mod);
         }
@@ -537,7 +537,7 @@ void runO3(IR::Module* mod) {
         //    必须重新排列以使指令 ID 反映执行顺序，
         //    否则寄存器分配器的活跃区间分析会出错
         //    （如 04_break_continue：临时变量和 PHI 被分配同一寄存器）
-        if (basicBlockReordering(mod)) {
+        if (PASS_CALL(basicBlockReordering)) {
             deadCodeElimination(mod);
         }
     }
@@ -588,7 +588,7 @@ void runP0(IR::Module* mod) {
 // P3：指令调度
 // ================================================================
 void runP3(IR::Module* mod) {
-    if (instructionScheduling(mod)) { /* changed */ }
+    if (PASS_CALL(instructionScheduling)) { /* changed */ }
     constantFolding(mod);
     deadCodeElimination(mod);
 }

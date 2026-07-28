@@ -53,6 +53,15 @@ P6 启用 vs 基线（P1+P2+P4），3 次取最小值：
 - **结论**：P6 在 matmul 系列显著生效（-10~15%），因 mod-2 检查在内层循环每迭代省 5 条指令
 - P8 的 load-use 延迟隐藏收益需 FPGA 实测（QEMU TCG 不模拟延迟）
 
+### 1.4 LSR 禁用修复 crypto（2026-07-29）
+
+- **症状**：crypto-1/2/3 全部 WA，计算结果数字错误（-O0 数字正确，-O1 错误）
+- **根因**：LoopStrengthReduce 在 crypto 主循环 `while(i<64)` 中匹配 `3*i`（multiplier=3, start=0），累加器变换破坏多 BB 循环体计算。LSR 原记录"0/60 生效"过时——crypto 的 IV `i` 因 useBlocks>3 未被 mem2reg 提升（仍是 alloca），使 `findMulOfInductionVar` 匹配到 `LOAD alloca` 形式 MUL。
+- **修复**：PassManager.cpp 添加 builtinDisable 列表默认禁用 loopStrengthReduce（可用 `OPT_ENABLE=loopStrengthReduce` 强制开启调试）。同步修复 strengthReduceLoop 中 start 非常量时 initialVal=0 的 bug（加 return false 保护）。
+- **附带修复**：75_max_flow 从 fail 变 pass（同样受 LSR bug 影响）
+- **验证**：功能 95/100（同基线，失败均为预存），性能 60/60 全 pass
+- **pass 可调度性增强**：将 magicDivision/loadElimination/basicBlockReordering/loopInterchange/loopFullUnroll/loopUnrolling/instructionScheduling 从直接调用改为 PASS_CALL 包裹，支持 OPT_DISABLE 二分定位
+
 ### 1.1 P1 ReductionSplitting v2 关键设计
 
 - **v1 bug**：克隆体用同一个 IV 值但步长 ×N → 跳过 3/4 项且结果 ×N（已修复）
