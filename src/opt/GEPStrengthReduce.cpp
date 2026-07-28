@@ -257,6 +257,10 @@ bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
         // Multiple pointer recurrences in one loop interact poorly with the
         // current PHI lowering/register allocation path.  A single recurrence
         // still captures the common linear-array case without that ambiguity.
+        // ★ 实测验证（2026-07-28）：放宽为 ≤4 候选导致静态指令数 20130→21087
+        //   (+4.75%)，每个额外候选新增 lsr.init+lsr.ptr PHI+lsr.inc 三条指令，
+        //   且多指针 PHI 增加寄存器压力导致溢出。BOOM 上 mul 单周期，
+        //   GEP 强度削减（mul+add→指针 PHI+inc）不省延迟反增代码体积。维持单候选。
         return false;
     }
 

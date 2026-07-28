@@ -7,10 +7,10 @@
 
 ## 一、当前焦点
 
-**分支**：`opt-research-scratch`（基于稳定版本 `017ab02` 创建）
-**当前状态**：A 组优化（A1/A2/A4）已实现并验证完毕，**待用户确认是否提交，并选择下一批目标（B 组）**。
+**分支**：`opt-research-scratch`（A 组已提交 `b24d9ab`）
+**当前状态**：B 组深度分析完毕，正在尝试 **GEPStrengthReduce 多候选放宽实验**（B2 类）。
 
-### A 组实施结果（2026-07-28 完成）
+### A 组实施结果（2026-07-28 完成，已提交 b24d9ab）
 
 | 项  | 内容                                                                                   | 结果                                                                     |
 | --- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
@@ -19,21 +19,49 @@
 | A3  | BFS 乘法 mul_plan                                                                      | **放弃**：BOOM 上 mul 单周期全流水，shift+add 链反而更慢（实测结论冲突） |
 | A4  | PassManager 参数化（OPT_DISABLE / OPT_ENABLE 环境变量，含 GVN/LICM/SCCP/CSE/DSE 别名） | 基建，已用于本次归因隔离                                                 |
 
-- **验证**：功能 95/100（3 预存 DIFF + 2 预存超时，与基线一致）；性能 60/60 全过。
-- **静态指令数**：20337 → 20130，**净 -207（-1.02%）**。30 用例改善、24 不变、6 微回归（crypto +1、sl +2，均来自 GVN 全支配合并，净收益为正故保留默认）。
-- **逃生开关**：`OPT_GVN_IDOM_ONLY=1` 恢复 GVN 旧 idom-only 限制；`OPT_DISABLE=<pass名>` 黑名单 / `OPT_ENABLE=<pass名>` 白名单。
-- 附带修复：`scripts/test_perf_wsl.sh` qemu 自动检测（`which qemu-riscv64-static || qemu-riscv64`）。
+- **静态指令数**：20337 → 20130，净 -207（-1.02%）。功能 95/100、性能 60/60 同基线。
+- **逃生开关**：`OPT_GVN_IDOM_ONLY=1`；`OPT_DISABLE=<pass名>` / `OPT_ENABLE=<pass名>`。
 
-### 下一步候选（B 组，按推荐顺序）
+### B 组深度分析结论（2026-07-28，基于代码+汇编实证）
 
-| 排序 | 候选                                                  | 预估收益 | 风险  | 前置                                          |
-| ---- | ----------------------------------------------------- | -------- | ----- | --------------------------------------------- |
-| 1    | B3 LoopSimplify/LCSSA/LoopRotate 规范化链             | ★★       | 中    | LoopFind 已有；规范后 LSR/Unroll/IndVars 更稳 |
-| 2    | B2 IndVarsSimplify（归纳变量 {0,+,1} + 重写退出条件） | ★★       | 中    | 依赖 B3 + SCEV（已有）                        |
-| 3    | B1 LoopUnswitching（不变条件外提，循环复制两版本）    | ★★       | 中    | 依赖 B3                                       |
-| 4    | B5 LoopInit / B4 TRE / B6 LIVS                        | ★        | 低-中 | 按用例瓶颈选做                                |
+**基线静态指令数：20130（已复核）**。最大用例：huffman 697、sort 684、conv2d 639、crypto 614、fft 470、shuffle 383。
 
-**待用户确认**：是否提交 A 组；下一批选 B3→B2→B1 顺序还是其他。
+| #   | 候选               | 代码实证结论                                                                                                                                                                          | 裁决     |
+| --- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| B1  | LoopUnswitching    | 测试用例少有循环不变条件分支。conv2d `if(rr>=0&&rr<N_eff...)` 中 rr 随迭代变；01_mm1 `if(A[i][k]==1)` 中 A[i][k] 随 i 变；shuffle0 `if(k>100)` 在非紧计算循环内。无干净 unswitch 机会 | 跳过     |
+| B2  | IndVarsSimplify    | SCEV 已识别 {start,+,step} PHI 链（SCEVAnalysis.cpp L159-200）；LSR/GEPStrengthReduce/LoopUnroll 均消费 SCEV。**IndVars 核心已被覆盖**。但发现 LSR 实质失效（见下）                   | 部分跳过 |
+| B3  | LoopSimplify/LCSSA | LICM 已按需创建 preheader（仅当有非 header 不变量）；SimplifyCFG.foldSinglePredBlock（L423）会折叠空 preheader。规范链无直接静态收益，仅基建。LoopFind 已合并同 header 循环           | 跳过     |
+| B4  | TRE 表达式重排     | RV64GC **无 Zba**（后端仅 slli/add/mul，无 sh3add），TRE 无融合目标                                                                                                                   | N/A 跳过 |
+| B5  | LoopInit           | 收益小                                                                                                                                                                                | 暂缓     |
+| B6  | LIVS for DSE       | 当前 DSE 启发式已可用，独立 LIVS 收益小                                                                                                                                               | 暂缓     |
+
+#### 关键发现：LSR 完全失效 + GEPStrengthReduce 多候选限制
+
+1. **LSR（LoopStrengthReduce.cpp）0/60 用例生效**：`findMulOfInductionVar`（L29-71）只匹配 `LOAD 自 info.var(alloca)`，但 mem2reg 在 LSR 之前运行（O2 阶段），此时 IV 已是 PHI。SCEV 的 `info.var` 是 PHI 节点，MUL 直接用 PHI 结果而非 LOAD → 永不匹配。汇编中 `lsr` 命名痕迹 = 0。
+2. **但 A3 教训限制收益**：BOOM 上 mul 单周期全流水，LSR（mul→add）运行时收益有限。静态数可能略降（mul+add→addi）但运行时可能持平。
+3. **GEPStrengthReduce 正常工作**（PHI 形式），但有两限制：
+   - `candidates.size() != 1` → 整循环跳过（L256-261）。conv2d 内层有 In[]+K[] 两个 GEP、h-5 有多个 GEP，全被跳过。
+   - 仅匹配 `GEP base, iv` 或 `GEP base, 0, iv`，不匹配 `GEP base, iv, const`（行主序 A[iv][const]）。
+4. **conv2d 内层循环已优化良好**（slli 移位），mul 多在外层或算法计算。h-5 内层有未削减步长 mul `a5*5600`。
+
+### 当前实验：GEPStrengthReduce 多候选放宽（B2 类）— 已完成，负面
+
+**假设**：寄存器分配器已升级为 call-aware 图着色，`candidates.size()!=1` 限制可能已可放宽。
+**做法**：放宽为允许 ≤4 候选。
+**结果**：**负面，已回退**。静态指令数 20130 → 21087（**+957，+4.75%**）。
+**根因**：每个额外候选新增 lsr.init + lsr.ptr PHI + lsr.inc 三条指令，多指针 PHI 增加寄存器压力导致溢出。BOOM 上 mul 单周期，GEP 强度削减（mul+add→指针 PHI+inc）不省延迟反增代码体积。
+**附带发现**：GEPStrengthReduce 单候选模式也是 0/60 生效——非平凡循环都有 2+ 数组访问（candidates ≥ 2 → 跳过），平凡循环的 GEP 已被 GEPFolding 折叠或模式不匹配。即整个强度削弱基建（LSR + GEPStrengthReduce）在当前用例集上实质未生效。
+
+### B 组最终裁决（2026-07-28）
+
+**B 组无可行优化**。核心原因：**BOOM 上 mul 单周期全流水**（A3 教训），所有 strength-reduction 类优化（B2 IndVars/LSR、GEPStrengthReduce 多候选）用多条指令换 1 条廉价 mul，净负收益。B1/B3/B4/B5/B6 因用例形态或架构限制无机会。
+
+**下一步方向**（待用户选择）：
+
+1. **C 组**：AliasAnalysis → GCM（GVN 完整配套），高复杂度高风险，但可能是最后的大收益来源
+2. **目标特定调优**：函数对齐（icache line）、指令调度优化、减少 spill
+3. **逐用例瓶颈分析**：挑 top-N 热点用例，针对性优化而非通用 pass
+4. **接受现状**：编译器已为该目标架构充分优化，A 组 -1.02% 已是近期可达收益
 
 ---
 
@@ -119,22 +147,14 @@
 
 ### 已完成
 
-- ~~第一批 A 组~~：A1 支配树 L/R + GVN 全支配、A2 纯函数识别、A4 PassManager 参数化（2026-07-28，净 -1.02%）
+- ~~第一批 A 组~~：A1 支配树 L/R + GVN 全支配、A2 纯函数识别、A4 PassManager 参数化（2026-07-28，净 -1.02%，已提交 b24d9ab）
+- ~~第二批 B 组~~：**评估完毕，无可行优化**（2026-07-28）。B2 强度削减类在 BOOM（mul 单周期）上净负收益；B1/B3/B4/B5/B6 因用例形态或架构限制无机会。详见"当前焦点"。
 
-### 第二批（中等复杂度循环）
+### 下一批（待用户选择）
 
-- **B3 LoopSimplify 前置链** → **B2 IndVarsSimplify**：规范循环后，现有 LSR/Unroll 更稳，IndVars 简化退出条件
-- **B1 LoopUnswitching**：在循环规范后实施
-
-### 第三批（独立收益）
-
-- **B5 LoopInit / B4 TRE / B6 LIVS**：小优化，按用例瓶颈选做
-
-### 第四批（大改，单独立项，需充分验证）
-
-- **C2 AliasAnalysis** → **C1 GCM**：GVN 的完整配套，性能上限提升关键
-- **C3 MemorySSA**：在 C2 之上
-- **C4 值域分析 / C5 后端 SSA / C6 LoopFusion**：长期规划
+- **C 组**：AliasAnalysis → GCM（高复杂度高风险，可能是最后大收益来源）
+- **目标特定调优**：函数对齐（icache）、指令调度、减少 spill
+- **逐用例瓶颈分析**：针对性优化而非通用 pass
 
 ---
 
@@ -144,3 +164,4 @@
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 2026-07-28 | 创建草纸。基于稳定版 `017ab02` 建 `opt-research-scratch` 分支。完成调研报告 vs 现有实现差距分析：核实调研文档"规划中"项中 GVN/GEPFolding/LICM may_alias/动态 preheader/icmp+br→beq/Peephole 融合套件 实际已实现；真实未实现项整理为 A/B/C/D 四组，给出推荐路线。                                                                                                                                                                                                                                                                                                                                                                            |
 | 2026-07-28 | **A 组完成**。A1 支配树 L/R 编码 + GVN 全支配合并（新增 `computeDomTreeLR`/`dominatesLR`，GVN 默认放开全支配、`OPT_GVN_IDOM_ONLY=1` 逃生）；A2 纯函数识别（新文件 PureFuncDetection.cpp，乐观初始化+迭代降级不动点，LICM 纯 CALL 可外提/不阻塞 LOAD、LoadElim 跨纯 CALL 保缓存）；A4 PassManager 参数化（新文件 PassManager.cpp，OPT_DISABLE/OPT_ENABLE + 别名归一化，兼容旧 OPT_DISABLE_GVN）。A3 放弃（BOOM mul 单周期，shift+add 更慢）。验证：功能 95/100 同基线、性能 60/60、静态指令 20337→20130（-1.02%），收益全部来自 GVN 全支配，微回归 crypto +1/sl +2 可接受。附带修复 test_perf_wsl.sh qemu 自动检测。待提交 + 待选 B 组目标。 |
+| 2026-07-28 | **B 组评估完毕，无可行优化**。深度代码+汇编实证：(1) B1 LoopUnswitching——测试用例无干净循环不变条件分支；(2) B2 IndVars——SCEV 已覆盖核心，LSR 虽 0/60 生效（PHI 形式不匹配）但 BOOM mul 单周期修复无收益；(3) B3 LoopSimplify——SimplifyCFG 折叠空 preheader，仅基建无静态收益；(4) B4 TRE——RV64GC 无 Zba，N/A。实验：GEPStrengthReduce 多候选放宽（≤4）→ 静态 20130→21087（+4.75%），已回退。GEPStrengthReduce 单候选亦 0/60 生效（非平凡循环均 2+ GEP 候选）。结论：BOOM mul 单周期使所有 strength-reduction 净负。临时脚本已清理。                                                                                                        |
