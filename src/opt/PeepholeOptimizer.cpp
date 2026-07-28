@@ -177,15 +177,37 @@ size_t findNextRealInst(const std::vector<std::string>& lines, size_t start) {
     return lines.size();
 }
 
+// 检查标签是否是函数退出标签（.Lfuncname_exit: 格式）
+bool isFuncExitLabel(const std::string& line) {
+    auto trimmed = line;
+    while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+        trimmed = trimmed.substr(1);
+    // 函数退出标签格式：.L<funcname>_exit:
+    // caller-saved 寄存器（t*, a*）在函数退出时必然死亡
+    return trimmed.size() > 6 &&
+           trimmed.substr(trimmed.size() - 6) == "_exit:";
+}
+
+// 判断寄存器是否是 caller-saved（t0-t6, a0-a7）
+bool isCallerSaved(const std::string& reg) {
+    return !reg.empty() && (reg[0] == 't' || reg[0] == 'a');
+}
+
 // 检查寄存器 reg 在 lines[start..] 到下一个标签（BB 边界）之间是否死亡
 // 死亡条件：被覆写（instrKillsReg）或到达 BB 末尾未被读取
 // 保守条件：遇到标签时返回 false（可能 live-out）
+// 例外：函数退出标签（_exit:）处 caller-saved 寄存器必然死亡
 // call 指令杀死 caller-saved 寄存器（t0-t6, a0-a7）
 bool isRegDeadInBB(const std::vector<std::string>& lines, size_t start, const std::string& reg) {
     for (size_t k = start; k < lines.size(); ++k) {
         const std::string& l = lines[k];
         if (l.empty()) continue;
-        if (isLabel(l)) return false;  // BB 边界：可能 live-out，保守返回 false
+        if (isLabel(l)) {
+            // 函数退出标签：caller-saved 寄存器（t*, a*）必然死亡
+            if (isFuncExitLabel(l) && isCallerSaved(reg))
+                return true;
+            return false;  // 其他标签：可能 live-out，保守返回 false
+        }
         size_t p = 0;
         while (p < l.size() && (l[p] == ' ' || l[p] == '\t')) ++p;
         if (p >= l.size()) continue;  // 纯空白
@@ -837,6 +859,44 @@ std::string peepholeOptimize(const std::string& asmCode) {
                         if (addRs1 == liRd && addRd != liRd) {
                             if (isRegDeadInBB(lines, i + 2, liRd)) {
                                 result.push_back("  neg     " + addRd + ", " + addRs2);
+                                ++i;
+                                matched = true;
+                            }
+                        }
+                    }
+                    // li rd, -1; subw rd, rd, rs → xori rd, rs, -1  (bitwise NOT, same reg)
+                    if (!matched && liImm == "-1" && tryMatch(lines[i + 1], "subw", addRd, addRs1, addRs2)) {
+                        if (liRd == addRd && addRs1 == liRd && addRs2 != liRd) {
+                            result.push_back("  xori    " + liRd + ", " + addRs2 + ", -1");
+                            ++i;
+                            matched = true;
+                        }
+                    }
+                    // li rd, -1; sub rd, rd, rs → xori rd, rs, -1  (64-bit NOT, same reg)
+                    if (!matched && liImm == "-1" && tryMatch(lines[i + 1], "sub", addRd, addRs1, addRs2)) {
+                        if (liRd == addRd && addRs1 == liRd && addRs2 != liRd) {
+                            result.push_back("  xori    " + liRd + ", " + addRs2 + ", -1");
+                            ++i;
+                            matched = true;
+                        }
+                    }
+                    // li rd, -1; subw rd2, rd, rs → xori rd2, rs, -1  (bitwise NOT, diff reg)
+                    // 安全条件：liRd 在 subw 之后必须死亡
+                    if (!matched && liImm == "-1" && tryMatch(lines[i + 1], "subw", addRd, addRs1, addRs2)) {
+                        if (addRs1 == liRd && addRd != liRd) {
+                            if (isRegDeadInBB(lines, i + 2, liRd)) {
+                                result.push_back("  xori    " + addRd + ", " + addRs2 + ", -1");
+                                ++i;
+                                matched = true;
+                            }
+                        }
+                    }
+                    // li rd, -1; sub rd2, rd, rs → xori rd2, rs, -1  (64-bit NOT, diff reg)
+                    // 安全条件：liRd 在 sub 之后必须死亡
+                    if (!matched && liImm == "-1" && tryMatch(lines[i + 1], "sub", addRd, addRs1, addRs2)) {
+                        if (addRs1 == liRd && addRd != liRd) {
+                            if (isRegDeadInBB(lines, i + 2, liRd)) {
+                                result.push_back("  xori    " + addRd + ", " + addRs2 + ", -1");
                                 ++i;
                                 matched = true;
                             }

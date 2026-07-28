@@ -62,6 +62,22 @@ P6 启用 vs 基线（P1+P2+P4），3 次取最小值：
 - **验证**：功能 95/100（同基线，失败均为预存），性能 60/60 全 pass
 - **pass 可调度性增强**：将 magicDivision/loadElimination/basicBlockReordering/loopInterchange/loopFullUnroll/loopUnrolling/instructionScheduling 从直接调用改为 PASS_CALL 包裹，支持 OPT_DISABLE 二分定位
 
+### 1.5 Peephole 优化 + 对齐修正（2026-07-29）
+
+**汇编分析发现的问题**：
+
+- crypto-1 的 `_not` 函数用 `li t0, -1; subw t3, t0, t4` 计算 ~t4（2 条指令），应为 `xori t3, t4, -1`（1 条）
+- crypto-1 的 `_xor` 函数用 `li t0, 0; subw t3, t0, t4` 计算 -t4（2 条指令），PeepholeOptimizer 已有此模式但未生效
+- 所有循环头使用 `.p2align 5`（32B 对齐），BOOM v2 取指带宽仅 16B，32B 对齐浪费 I-cache 空间
+
+**修复**：
+
+- **PeepholeOptimizer `isRegDeadInBB` 修复**：原实现在任何标签处保守返回 false（可能 live-out），导致 `li 0; subw rd2, rd, rs` → `negw rd2, rs` 模式在函数退出标签附近无法匹配（caller-saved 临时寄存器在 `_exit:` 标签处必然死亡）。新增 `isFuncExitLabel` + `isCallerSaved` 判断，函数退出标签处对 t*/a* 寄存器返回 true。修复后 crypto-1 生成 6 个 `negw`（原 `li 0; subw` 模式）。
+- **新增 `li -1; sub` → `xori` peephole 模式**：`li rd, -1; subw/sub rd2, rd, rs` → `xori rd2, rs, -1`（数学等价：-1 - x = ~x）。crypto-1 生成 4 个 `xori`，每个节省 1 条指令。
+- **循环头对齐从 `.p2align 5` 改为 `.p2align 4`**：BOOM v2 取指带宽 16B/周期，16B 对齐确保循环头不跨取指块边界。32B 对齐在 16B 取指单元上无额外收益，反而浪费 I-cache 空间（76 个循环头 × 最多 16B = ~1.2KB）。可用 `BOOM_ALIGN32=1` 强制 32B 做对照实验。
+
+**验证**：功能 95/100（同基线），性能 60/60 全 pass
+
 ### 1.1 P1 ReductionSplitting v2 关键设计
 
 - **v1 bug**：克隆体用同一个 IV 值但步长 ×N → 跳过 3/4 项且结果 ×N（已修复）

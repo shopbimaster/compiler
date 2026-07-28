@@ -930,11 +930,12 @@ std::string TargetCodeGen::emitGEPAddressToReg(IR::Instruction& gep,
 
 void TargetCodeGen::emitBasicBlock(IR::BasicBlock& bb) {
     currentBB = &bb;
-    // 循环头对齐：BOOM 取指带宽 16B/周期，32B 对齐确保循环头不跨取指块边界。
-    // P5 实验：默认 32B（.p2align 5），可用 BOOM_ALIGN32_OFF=1 回退到 16B 做对照。
+    // 循环头对齐：BOOM v2 取指带宽 16B/周期，16B 对齐（.p2align 4）确保循环头
+    // 不跨取指块边界。32B 对齐（.p2align 5）在 16B 取指单元上浪费 I-cache 空间。
+    // 可用 BOOM_ALIGN32=1 强制 32B 对齐做对照实验（BOOM v3 取指块可能 32B）。
     if (loopHeaders.count(&bb)) {
-        const char* a = std::getenv("BOOM_ALIGN32_OFF");
-        emitter.emitText((a && std::string(a) == "1") ? "  .p2align 4" : "  .p2align 5");
+        const char* a = std::getenv("BOOM_ALIGN32");
+        emitter.emitText((a && std::string(a) == "1") ? "  .p2align 5" : "  .p2align 4");
     }
     // Use .L prefix for local labels to avoid symbol conflicts across functions
     emitter.emitText(".L" + currentFunc->getName() + "_" + bb.getName() + ":");
