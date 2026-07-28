@@ -1,6 +1,7 @@
 #include "opt/Optimizer.h"
 #include "opt/LoopPatternAnalysis.h"
 #include "opt/MemoryAccessAnalysis.h"
+#include "opt/ScalarReductionAnalysis.h"
 
 #include <algorithm>
 #include <memory>
@@ -423,28 +424,10 @@ bool findFinalReduction(
         return false;
     }
 
-    auto* accumulatorLoad =
-        dynamic_cast<IR::Instruction*>(
-            add->getOperand(0) == loads[0]
-                ? add->getOperand(1)
-                : add->getOperand(0));
-    auto* accumulatorStore =
-        dynamic_cast<IR::Instruction*>(
-            add->getUses().front().user);
-    auto* accumulatorAddress = accumulatorLoad &&
-                                       accumulatorLoad->getOpcode() ==
-                                           Opc::LOAD &&
-                                       accumulatorLoad->getNumOperands() == 1
-        ? dynamic_cast<IR::Instruction*>(
-              accumulatorLoad->getOperand(0))
-        : nullptr;
-    if (!accumulatorStore ||
-        accumulatorStore->getOpcode() != Opc::STORE ||
-        accumulatorStore->getNumOperands() != 2 ||
-        accumulatorStore->getOperand(0) != add ||
-        !accumulatorAddress ||
-        accumulatorAddress->getOpcode() != Opc::ALLOCA ||
-        accumulatorStore->getOperand(1) != accumulatorAddress) {
+    ScalarReduction reduction;
+    if (!analyzeAllocaScalarReduction(
+            caller, add, loads[0], reduction) ||
+        reduction.kind != ScalarReductionKind::Add) {
         return false;
     }
 
@@ -459,29 +442,11 @@ bool findFinalReduction(
         return false;
     }
 
-    unsigned accumulatorStores = 0;
-    bool hasZeroInitialization = false;
-    for (auto& block : caller->getBlocks()) {
-        for (auto& instruction : block->getInstructions()) {
-            if (instruction->getOpcode() == Opc::STORE &&
-                instruction->getNumOperands() == 2 &&
-                instruction->getOperand(1) == accumulatorAddress) {
-                ++accumulatorStores;
-                if (isConstant(instruction->getOperand(0), 0)) {
-                    hasZeroInitialization = true;
-                }
-            }
-        }
-    }
-    if (accumulatorStores != 2 || !hasZeroInitialization) {
-        return false;
-    }
-
     for (auto* block : inner.body) {
         for (auto& instruction : block->getInstructions()) {
             if (instruction->getOpcode() == Opc::CALL ||
                 (instruction->getOpcode() == Opc::STORE &&
-                 instruction.get() != accumulatorStore)) {
+                 instruction.get() != reduction.updateStore)) {
                 return false;
             }
         }

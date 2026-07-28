@@ -111,6 +111,7 @@ add_library(sysy_opt STATIC
     src/opt/LoopFind.cpp
     src/opt/LoopPatternAnalysis.cpp
     src/opt/MemoryAccessAnalysis.cpp
+    src/opt/ScalarReductionAnalysis.cpp
     src/opt/SCEVAnalysis.cpp
     src/opt/LoopStrengthReduce.cpp
     src/opt/LoopFullUnroll.cpp
