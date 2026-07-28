@@ -325,8 +325,17 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
 
     emitPrologue(func);
 
-    for (auto& bb : func.getBlocks()) {
-        emitBasicBlock(*bb);
+    // Fall-through 优化：发射每个块前记录其物理下一个块，供 emitBr/emitCondBr
+    // 判断是否可省掉冗余 j。最后一个块之后紧接 func_exit 标签。
+    {
+        auto& blocks = func.getBlocks();
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            nextBB = (i + 1 < blocks.size()) ? blocks[i + 1].get() : nullptr;
+            nextIsExit = (i + 1 == blocks.size());
+            emitBasicBlock(*blocks[i]);
+        }
+        nextBB = nullptr;
+        nextIsExit = false;
     }
 
     for (auto& bb : func.getBlocks()) {
@@ -1481,18 +1490,59 @@ void TargetCodeGen::emitRet(IR::Instruction& inst) {
             emitter.emitText(code);
         }
     }
-    emitter.emitText("  j       " + currentFunc->getName() + "_exit");
+    // Fall-through 优化：最后一个块的 ret 直接 fall-through 到 func_exit
+    if (!nextIsExit) {
+        emitter.emitText("  j       " + currentFunc->getName() + "_exit");
+    }
 }
 
 void TargetCodeGen::emitBr(IR::Instruction& inst) {
     auto* target = dynamic_cast<IR::BasicBlock*>(inst.getOperand(0));
     emitPhiMovesForEdge(currentBB, target);
+    // Fall-through 优化：目标恰好是物理下一个块时省掉 j
+    if (target == nextBB) return;
     emitter.emitText("  j       .L" + currentFunc->getName() + "_" + target->getName());
 }
 
 void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
     auto* thenBB = dynamic_cast<IR::BasicBlock*>(inst.getOperand(1));
     auto* elseBB = dynamic_cast<IR::BasicBlock*>(inst.getOperand(2));
+
+    // ---- Fall-through 优化（BOOM 分支友好布局）----
+    // 若 elseBB 是物理下一个块：条件真跳走(then)，条件假 fall-through(else)
+    // 若 thenBB 是物理下一个块：反转条件，条件假跳走(else)，条件真 fall-through(then)
+    // 否则：两个分支都显式跳转（原行为）
+    const bool elseFall = (elseBB == nextBB);
+    const bool thenFall = (thenBB == nextBB);
+    IR::BasicBlock* fallBB = elseFall ? elseBB : (thenFall ? thenBB : elseBB);
+    IR::BasicBlock* awayBB = elseFall ? thenBB : (thenFall ? elseBB : thenBB);
+    bool doFallThrough = (elseFall || thenFall);
+    const bool reverseCond = thenFall;
+
+    // ★ 安全检查：away 边有 PHI moves 时不能 fall-through。
+    // 原因：away 边的 PHI moves + j awayBB 必须内联在当前块末尾，会物理拦截
+    // fall-through 路径（fall-through 会误执行 away 的 phi moves 和跳转）。
+    // 此时退化为非 fall-through 模式（显式 j fallBB 跳过 away 代码块）。
+    if (doFallThrough) {
+        auto awayIt = phiMoveMap.find({currentBB, awayBB});
+        if (awayIt != phiMoveMap.end() && !awayIt->second.empty()) {
+            doFallThrough = false;
+        }
+    }
+
+    // ★ 分支目标标签：
+    // - fall-through 时：条件分支直接跳到 awayBB 自身标签（无需 edgeLabel 中转，
+    //   避免 away 代码块内联拦截 fall-through 路径）
+    // - 非 fall-through 时：条件分支跳到 edgeLabel，由 edgeLabel 块执行 away phi moves + j
+    std::string awayTarget;
+    std::string edgeLabel;
+    if (doFallThrough) {
+        awayTarget = ".L" + currentFunc->getName() + "_" + awayBB->getName();
+    } else {
+        edgeLabel = ".L" + currentFunc->getName() + "_edge_" +
+                    std::to_string(labelCounter++);
+        awayTarget = edgeLabel;
+    }
 
     // 检查条件是否来自已内联的 ICMP 指令
     auto* condVal = inst.getOperand(0);
@@ -1504,76 +1554,74 @@ void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
 
         std::string code;
         std::string r0 = getValueReg(op0);
-        bool op0InReg = !r0.empty();
-        if (!op0InReg) {
+        if (r0.empty()) {
             code += loadToReg(op0, "t0");
             r0 = "t0";
         }
 
-        std::string edgeLabel = ".L" + currentFunc->getName() + "_edge_" +
-                                std::to_string(labelCounter++);
+        // 反转条件（thenBB fall-through 时）：eq<->ne, slt<->sge, sle<->sgt
+        std::string effCond = cond;
+        if (reverseCond) {
+            if (cond == "eq") effCond = "ne";
+            else if (cond == "ne") effCond = "eq";
+            else if (cond == "slt") effCond = "sge";
+            else if (cond == "sge") effCond = "slt";
+            else if (cond == "sle") effCond = "sgt";
+            else if (cond == "sgt") effCond = "sle";
+        }
 
         // 与常量 0 比较时使用 beqz/bnez
         auto* ci1 = dynamic_cast<IR::ConstantInt*>(op1);
-        if (ci1 && ci1->getValue() == 0 && (cond == "eq" || cond == "ne")) {
-            if (cond == "eq")
-                code += "  beqz    " + r0 + ", " + edgeLabel + "\n";
+        if (ci1 && ci1->getValue() == 0 && (effCond == "eq" || effCond == "ne")) {
+            if (effCond == "eq")
+                code += "  beqz    " + r0 + ", " + awayTarget + "\n";
             else
-                code += "  bnez    " + r0 + ", " + edgeLabel + "\n";
+                code += "  bnez    " + r0 + ", " + awayTarget + "\n";
         } else {
             // 两个寄存器操作数的分支指令
             std::string r1 = getValueReg(op1);
-            bool op1InReg = !r1.empty();
-            if (!op1InReg) {
+            if (r1.empty()) {
                 code += loadToReg(op1, "t1");
                 r1 = "t1";
             }
-            if (cond == "eq")
-                code += "  beq     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
-            else if (cond == "ne")
-                code += "  bne     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
-            else if (cond == "slt")
-                code += "  blt     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
-            else if (cond == "sle")
-                code += "  bge     " + r1 + ", " + r0 + ", " + edgeLabel + "\n";
-            else if (cond == "sgt")
-                code += "  blt     " + r1 + ", " + r0 + ", " + edgeLabel + "\n";
-            else if (cond == "sge")
-                code += "  bge     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+            if (effCond == "eq")
+                code += "  beq     " + r0 + ", " + r1 + ", " + awayTarget + "\n";
+            else if (effCond == "ne")
+                code += "  bne     " + r0 + ", " + r1 + ", " + awayTarget + "\n";
+            else if (effCond == "slt")
+                code += "  blt     " + r0 + ", " + r1 + ", " + awayTarget + "\n";
+            else if (effCond == "sle")
+                code += "  bge     " + r1 + ", " + r0 + ", " + awayTarget + "\n";
+            else if (effCond == "sgt")
+                code += "  blt     " + r1 + ", " + r0 + ", " + awayTarget + "\n";
+            else if (effCond == "sge")
+                code += "  bge     " + r0 + ", " + r1 + ", " + awayTarget + "\n";
             else
-                code += "  bne     " + r0 + ", " + r1 + ", " + edgeLabel + "\n";
+                code += "  bne     " + r0 + ", " + r1 + ", " + awayTarget + "\n";
         }
 
         emitter.emitText(code);
-
-        // False 分支：PHI moves + 跳转
-        emitPhiMovesForEdge(currentBB, elseBB);
-        emitter.emitText("  j       .L" + currentFunc->getName() + "_" + elseBB->getName());
-
-        // True 分支：标签 + PHI moves + 跳转
-        emitter.emitText(edgeLabel + ":");
-        emitPhiMovesForEdge(currentBB, thenBB);
-        emitter.emitText("  j       .L" + currentFunc->getName() + "_" + thenBB->getName());
-        return;
+    } else {
+        // 一般路径：加载条件到 t0，使用 bnez/beqz
+        std::string code;
+        code += loadToReg(inst.getOperand(0), "t0");
+        // 反转时用 beqz（条件假跳走），否则 bnez（条件真跳走）
+        code += std::string(reverseCond ? "  beqz    " : "  bnez    ") + "t0, " + awayTarget + "\n";
+        emitter.emitText(code);
     }
 
-    // 一般路径：加载条件到 t0，使用 bnez
-    std::string code;
-    code += loadToReg(inst.getOperand(0), "t0");
-
-    std::string edgeLabel = ".L" + currentFunc->getName() + "_edge_" +
-                            std::to_string(labelCounter++);
-    code += "  bnez    t0, " + edgeLabel + "\n";
-    emitter.emitText(code);
-
-    // False 分支：先发射 PHI moves，再跳转
-    emitPhiMovesForEdge(currentBB, elseBB);
-    emitter.emitText("  j       .L" + currentFunc->getName() + "_" + elseBB->getName());
-
-    // True 分支：标签 + PHI moves + 跳转
-    emitter.emitText(edgeLabel + ":");
-    emitPhiMovesForEdge(currentBB, thenBB);
-    emitter.emitText("  j       .L" + currentFunc->getName() + "_" + thenBB->getName());
+    // ★ Fall-through 分支：PHI moves + (可选)跳转
+    // fall 边的 phi moves 在 fall-through 路径上执行是正确的（为 fallBB 准备 phi 值）
+    emitPhiMovesForEdge(currentBB, fallBB);
+    if (!doFallThrough) {
+        // 非 fall-through：显式跳转到 fallBB（跳过下方的 edgeLabel 块）
+        emitter.emitText("  j       .L" + currentFunc->getName() + "_" + fallBB->getName());
+        // Away 分支：edgeLabel 标签 + PHI moves + 跳转
+        emitter.emitText(edgeLabel + ":");
+        emitPhiMovesForEdge(currentBB, awayBB);
+        emitter.emitText("  j       .L" + currentFunc->getName() + "_" + awayBB->getName());
+    }
+    // fall-through 时：fall phi moves 后直接落入 nextBB（fallBB），无 edgeLabel 块
 }
 
 std::string TargetCodeGen::getValueReg(IR::Value* val) {

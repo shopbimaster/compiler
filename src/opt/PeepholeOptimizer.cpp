@@ -299,8 +299,44 @@ std::string peepholeOptimize(const std::string& asmCode) {
         // 这些死 trampoline 会物理阻断 j 的 fall-through 优化
         // 删除后，现有的 j fall-through 模式会自动消除被阻断的 j
         // 典型场景：bXX then; j else; dead_trampoline: j then; else:
+        // ★ Fall-through 安全检查：若 trampoline 的前一个真实指令不是无条件控制转移
+        // （j/ret/jr/tail/ecall/ebreak），则前驱通过 fall-through 落入此 trampoline，
+        // 删除会导致 fall-through 误落入后续块。必须保留。
+        // 典型场景：TargetCodeGen fall-through 优化使 merge_8 落入 merge_5(trampoline)，
+        //   trampoline 重定向后 endif_4 不再引用 merge_5，但 merge_8 仍 fall-through 到它。
         // ★ QEMU 安全：运行在寄存器分配之后，不改变寄存器分配（规则 14）
         {
+            // 判断一行是否是无条件控制转移（执行后不会 fall-through 到下一行）
+            auto isUncondTransfer = [](const std::string& line) -> bool {
+                std::string opName = extractOpName(line);
+                return opName == "j" || opName == "ret" || opName == "jr" ||
+                       opName == "tail" || opName == "ecall" || opName == "ebreak";
+            };
+
+            // 判断 trampoline label（位于 lines[idx]）是否是 fall-through 目标
+            // 扫描 idx 之前的行，跳过空行/注释/指令/其他 label，找到第一个真实指令：
+            // - 若是无条件控制转移 → 不是 fall-through 目标（安全删除）
+            // - 若是其他指令或是条件分支 → 是 fall-through 目标（不可删除）
+            // - 若到达文件开头未找到指令 → 保守视为 fall-through 目标
+            auto isFallThroughTarget = [&](size_t idx) -> bool {
+                for (size_t k = idx; k > 0; --k) {
+                    const std::string& prev = lines[k - 1];
+                    if (isEmptyOrComment(prev)) continue;
+                    size_t p = 0;
+                    while (p < prev.size() && (prev[p] == ' ' || prev[p] == '\t')) ++p;
+                    if (p >= prev.size()) continue;  // 纯空白
+                    if (prev[p] == '#') continue;     // 注释
+                    if (prev[p] == '.') continue;     // 指令（.p2align 等）
+                    // 检查是否是另一个 label
+                    std::string t = prev;
+                    while (!t.empty() && (t[0] == ' ' || t[0] == '\t')) t = t.substr(1);
+                    if (!t.empty() && t.back() == ':') continue;  // 另一个 label，继续向前扫描
+                    // 找到真实指令
+                    return !isUncondTransfer(prev);
+                }
+                return true;  // 到达文件开头，保守视为 fall-through 目标
+            };
+
             // 1. 收集所有被引用的 label（从跳转指令中）
             std::set<std::string> referencedLabels;
             for (const auto& line : lines) {
@@ -322,7 +358,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 }
             }
 
-            // 2. 删除无人引用的 trampoline（label: j target）
+            // 2. 删除无人引用且非 fall-through 目标的 trampoline（label: j target）
             // trampoline 模式：label 行后紧跟一条 j target 指令（中间无其他指令）
             std::vector<std::string> compact;
             compact.reserve(lines.size());
@@ -342,8 +378,9 @@ std::string peepholeOptimize(const std::string& asmCode) {
                         std::string jRd, jRs, jImm;
                         if (tryMatch(lines[j], "j", jRd, jRs, jImm) && !jRd.empty()) {
                             // 是 trampoline 模式：label: j target
-                            // 如果 label 无人引用，删除整个 trampoline（label 行和 j 行）
-                            if (referencedLabels.find(labelName) == referencedLabels.end()) {
+                            // 删除条件：无人引用 AND 不是 fall-through 目标
+                            if (referencedLabels.find(labelName) == referencedLabels.end() &&
+                                !isFallThroughTarget(i)) {
                                 // 跳过 label 行和 j 行（以及中间的空行/注释）
                                 i = j;  // 跳过到 j 行（for 循环会 ++i）
                                 continue;

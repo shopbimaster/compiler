@@ -171,7 +171,9 @@ AsmInst parseInst(const std::string& line) {
 
 int latencyOf(const AsmInst& a) {
     if (a.isLoad) return 3;
-    if (a.op == "mul" || a.op == "mulw" || a.op == "mulh" || a.op == "smulh") return 3;
+    // BOOM: mul 单周期全流水（Port 0），latency=1。曾误设为 3，导致调度器
+    // 误判 mul 为长延迟指令而插入不必要填充，拉长关键路径。见 STATUS.md Bug-1。
+    if (a.op == "mul" || a.op == "mulw" || a.op == "mulh" || a.op == "smulh") return 1;
     if (a.op.rfind("div", 0) == 0 || a.op.rfind("rem", 0) == 0 ||
         a.op == "divw" || a.op == "remw") return 5;
     if (a.op.rfind("fdiv", 0) == 0 || a.op.rfind("fmul", 0) == 0) return 4;

@@ -40,6 +40,10 @@ private:
     CodeEmitter emitter;
     IR::Function* currentFunc = nullptr;
     IR::BasicBlock* currentBB = nullptr;
+    // Fall-through 优化：当前块物理上的下一个块（BOOM 分支友好布局）
+    // 当 BR/COND_BR 的跳转目标恰好是 nextBB 时，省掉冗余 j 指令。
+    IR::BasicBlock* nextBB = nullptr;
+    bool nextIsExit = false;  // 当前块是否为最后一块（其后紧接 func_exit 标签）
     int stackSize;
     int labelCounter;
     bool savesRA = false;  // true if function contains CALL instructions
