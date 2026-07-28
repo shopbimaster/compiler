@@ -29,6 +29,8 @@ IR::Function* createAffineRowSummaryFunction(
     auto* one = IR::ConstantInt::get(i32, 1);
     auto* indexStart = IR::ConstantInt::get(
         i32, summary.indexStart);
+    const std::string loopPredicate =
+        summary.inclusiveUpperBound ? "sle" : "slt";
 
     auto* entry = function->createBlock("entry");
     auto* iHeader = function->createBlock("summary.i.cond");
@@ -58,7 +60,8 @@ IR::Function* createAffineRowSummaryFunction(
     entry->pushBack(IR::Instruction::createBr(iHeader));
     iHeader->pushBack(indexI);
     auto* iCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexI, function->getArg(0), "slt");
+        Opc::ICMP, indexI, function->getArg(0),
+        loopPredicate);
     iHeader->pushBack(iCompare);
     iHeader->pushBack(
         IR::Instruction::createCondBr(iCompare, iBody, exit));
@@ -76,7 +79,8 @@ IR::Function* createAffineRowSummaryFunction(
     kHeader->pushBack(indexK);
     kHeader->pushBack(accumulation);
     auto* kCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexK, function->getArg(0), "slt");
+        Opc::ICMP, indexK, function->getArg(0),
+        loopPredicate);
     kHeader->pushBack(kCompare);
     kHeader->pushBack(
         IR::Instruction::createCondBr(
@@ -145,7 +149,7 @@ IR::Function* createAffineRowSummaryFunction(
 
 IR::Function* createRowSummaryFunction(
     IR::Module* module, IR::ArrayType* rowType,
-    int64_t start) {
+    int64_t start, bool inclusiveUpperBound) {
     auto* i32 = IR::IntegerType::I32;
     auto* rowPointer = IR::PointerType::get(rowType);
     auto* type = IR::FunctionType::get(
@@ -156,6 +160,8 @@ IR::Function* createRowSummaryFunction(
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
     auto* indexStart = IR::ConstantInt::get(i32, start);
+    const std::string loopPredicate =
+        inclusiveUpperBound ? "sle" : "slt";
     auto* entry = function->createBlock("entry");
     auto* iHeader = function->createBlock("rows.i.cond");
     auto* iBody = function->createBlock("rows.i.body");
@@ -182,7 +188,8 @@ IR::Function* createRowSummaryFunction(
     entry->pushBack(IR::Instruction::createBr(iHeader));
     iHeader->pushBack(indexI);
     auto* iCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexI, function->getArg(0), "slt");
+        Opc::ICMP, indexI, function->getArg(0),
+        loopPredicate);
     iHeader->pushBack(iCompare);
     iHeader->pushBack(
         IR::Instruction::createCondBr(iCompare, iBody, exit));
@@ -196,7 +203,8 @@ IR::Function* createRowSummaryFunction(
     jHeader->pushBack(indexJ);
     jHeader->pushBack(sum);
     auto* jCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexJ, function->getArg(0), "slt");
+        Opc::ICMP, indexJ, function->getArg(0),
+        loopPredicate);
     jHeader->pushBack(jCompare);
     jHeader->pushBack(
         IR::Instruction::createCondBr(
@@ -236,7 +244,8 @@ bool applyMatrixReductionPlan(
     auto* summaryFunction =
         createRowSummaryFunction(
             module, plan.kernel.rowType,
-            plan.kernel.indexStart);
+            plan.kernel.indexStart,
+            plan.kernel.inclusiveUpperBound);
     auto* summaryKernel =
         createAffineRowSummaryFunction(module, plan.kernel);
     auto* zero =
@@ -268,7 +277,10 @@ bool applyMatrixReductionPlan(
             plan.finalInnerBoundOperand,
             IR::ConstantInt::get(
                 IR::IntegerType::I32,
-                plan.kernel.indexStart + 1));
+                plan.kernel.indexStart +
+                    (plan.kernel.inclusiveUpperBound
+                         ? 0
+                         : 1)));
         return true;
     }
     return false;

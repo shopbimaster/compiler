@@ -21,9 +21,10 @@ bool isConstant(IR::Value* value, int64_t expected) {
     return constant && constant->getValue() == expected;
 }
 
-bool getCommonConstantStart(
+bool getCommonIterationDomain(
     const std::vector<const CanonicalCountedLoop*>& loops,
-    int64_t& start) {
+    int64_t& start,
+    bool& inclusiveUpperBound) {
     bool initialized = false;
     for (auto* loop : loops) {
         auto* constant =
@@ -32,8 +33,13 @@ bool getCommonConstantStart(
         if (!constant) return false;
         if (!initialized) {
             start = constant->getValue();
+            inclusiveUpperBound =
+                loop->inclusiveUpperBound;
             initialized = true;
-        } else if (constant->getValue() != start) {
+        } else if (
+            constant->getValue() != start ||
+            loop->inclusiveUpperBound !=
+                inclusiveUpperBound) {
             return false;
         }
     }
@@ -229,10 +235,11 @@ bool matchKernelFunction(
         return false;
     }
     int64_t indexStart = 0;
-    if (!getCommonConstantStart(
+    bool inclusiveUpperBound = false;
+    if (!getCommonIterationDomain(
             {&loopI, &loopJ, &loopK,
              &zeroLoopI, &zeroLoopJ},
-            indexStart) ||
+            indexStart, inclusiveUpperBound) ||
         indexStart < 0 ||
         indexStart >=
             std::numeric_limits<int32_t>::max()) {
@@ -276,6 +283,8 @@ bool matchKernelFunction(
     summary.rowType = rowType;
     summary.skippedScale = skippedCoefficient;
     summary.indexStart = indexStart;
+    summary.inclusiveUpperBound =
+        inclusiveUpperBound;
     return true;
 }
 
@@ -301,6 +310,7 @@ bool findFinalReduction(
     IR::GlobalVariable* matrix,
     IR::Value* size,
     int64_t expectedStart,
+    bool expectedInclusiveUpperBound,
     const std::vector<IR::Instruction*>& allowedCalls,
     IR::BasicBlock* loopPreheader,
     IR::Instruction*& finalLoad,
@@ -411,9 +421,13 @@ bool findFinalReduction(
         return false;
     }
     int64_t reductionStart = 0;
-    if (!getCommonConstantStart(
-            {&outer, &inner}, reductionStart) ||
-        reductionStart != expectedStart) {
+    bool reductionInclusiveUpperBound = false;
+    if (!getCommonIterationDomain(
+            {&outer, &inner}, reductionStart,
+            reductionInclusiveUpperBound) ||
+        reductionStart != expectedStart ||
+        reductionInclusiveUpperBound !=
+            expectedInclusiveUpperBound) {
         return false;
     }
 
@@ -618,6 +632,7 @@ bool matchCallChain(
         !findFinalReduction(
             module, caller, resultMatrix, size,
             kernel.indexStart,
+            kernel.inclusiveUpperBound,
             orderedCalls, loopPreheader,
             finalLoad, finalInnerCompare,
             finalInnerBoundOperand)) {

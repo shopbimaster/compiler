@@ -14,6 +14,7 @@ struct AffineKernelSummary {
     IR::ArrayType* rowType = nullptr;
     IR::ConstantInt* skippedScale = nullptr;
     int64_t indexStart = 0;
+    bool inclusiveUpperBound = false;
 };
 
 // A fully proven transformation plan. Building the plan performs all

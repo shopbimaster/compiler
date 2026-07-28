@@ -824,6 +824,13 @@ void test_counted_loop_nonzero_reversed_compare() {
     CHECK(loop.step == 1);
     CHECK(loop.boundOperand == 0);
     CHECK(loop.body.count(body) == 1);
+
+    compare->setName("sge");
+    Opt::CanonicalCountedLoop inclusiveLoop;
+    CHECK(Opt::analyzeCanonicalCountedLoop(
+        function, induction, bound, body, inclusiveLoop));
+    CHECK(inclusiveLoop.inclusiveUpperBound);
+    CHECK(inclusiveLoop.boundOperand == 0);
     PASS();
 }
 

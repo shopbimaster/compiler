@@ -20,6 +20,7 @@ struct CanonicalCountedLoop {
     IR::Value* bound = nullptr;
     int64_t step = 0;
     unsigned boundOperand = 1;
+    bool inclusiveUpperBound = false;
     std::unordered_set<IR::BasicBlock*> body;
 };
 

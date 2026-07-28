@@ -61,8 +61,21 @@ bool analyzeCanonicalCountedLoop(
         compare->getName() == "sgt" &&
         compare->getOperand(0) == bound &&
         compare->getOperand(1) == phi;
-    if (!directLessThan && !reversedGreaterThan) return false;
-    if (reversedGreaterThan) boundOperand = 0;
+    const bool directLessEqual =
+        compare->getName() == "sle" &&
+        compare->getOperand(0) == phi &&
+        compare->getOperand(1) == bound;
+    const bool reversedGreaterEqual =
+        compare->getName() == "sge" &&
+        compare->getOperand(0) == bound &&
+        compare->getOperand(1) == phi;
+    if (!directLessThan && !reversedGreaterThan &&
+        !directLessEqual && !reversedGreaterEqual) {
+        return false;
+    }
+    if (reversedGreaterThan || reversedGreaterEqual) {
+        boundOperand = 0;
+    }
 
     const NaturalLoop* naturalLoop = nullptr;
     auto loops = findNaturalLoops(function);
@@ -101,6 +114,8 @@ bool analyzeCanonicalCountedLoop(
     result.bound = bound;
     result.step = 1;
     result.boundOperand = boundOperand;
+    result.inclusiveUpperBound =
+        directLessEqual || reversedGreaterEqual;
     result.body = naturalLoop->body;
     return true;
 }
