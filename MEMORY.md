@@ -129,7 +129,28 @@ bash scripts/run_tests.sh func O1     # 功能 100 例
   原函数体的克隆版本（"fallback"），计算完成后写回表再返回。越界参数总是走
   原始递归路径，因此正确性与表大小无关，表大小只影响能省下多少重复计算。
 - 效果：knapsack 类小状态 DP 递归实测 770ms→230ms（本地单独用例）。
-- 验证：`cmake --build build_wsl` 通过；functional+performance 全量 160 例
+- **修复 `29dd5c4`（本轮）**：原实现里 fallback 克隆体内的自递归 CALL 仍指向
+  克隆体自身，等于递归全程绕开 memo 表——只有最外层那一次调用查表，子问题
+  一个都不缓存，加速几乎为零。改为让克隆体内的自递归调用**重新进入 wrapper**
+  （先查表），子问题才真正命中缓存。A/B 计时（`scripts/_ab_memo.sh`）：
+  knapsack_naive ON 0.07s vs OFF 1.64s，约 23×。
+- 本轮验证（三层，见下）：
+  1. `scripts/_ab_memo.sh`：墙钟 A/B，确认 memo 真的生效而非"编译期看着像生效"。
+  2. `scripts/_memo_coverage.sh`：先扫描哪些算例**真的触发** pass（asm 里有
+     `__opt_memo` 符号），再对每个触发算例做 ON/OFF 差分（stdout + 退出码）。
+     结果：functional+h_functional **140 例中触发数为 0**；只有 6 个性能算例触发
+     （`h-1-01/02/03`、`knapsack_naive-1/2/3`），6/6 与关闭 memo 的构建完全一致。
+     ⚠ 重要结论：功能测试套件对这个 pass **没有验证力**，别把"功能全过"当成
+     memo 正确性的证据；改动这个 pass 必须跑 `_memo_coverage.sh`。
+  3. `scripts/_func_regress.sh`：全量 140 例 -O1 回归，开/关 memo 均为
+     **132 PASS / 6 DIFF / 2 TIMEOUT**，失败清单逐一相同 → 零回归。
+- 踩坑（脚本判定，非编译器问题）：自建回归脚本最初把退出码直接 `echo` 追加到
+  程序 stdout 后面，而多数算例 stdout 结尾没有换行，于是退出码被粘到最后一行
+  （如期望 `...10\n0` 实际得到 `...100`），**23 个本来通过的算例被误报成 DIFF**。
+  修正：追加退出码前先检测末字节，缺换行时补一个。与 MEMORY 开头"判定要点"
+  一致——这个坑复现过两次，务必照抄现成脚本而不要临时手写比对。
+
+- 首次引入该 pass 时的验证记录（早于上述修复）：`cmake --build build_wsl` 通过；functional+performance 全量 160 例
   回归（超时阈值 40s，避开批量跑测试时 WSL 资源竞争造成的假性 TIMEOUT）
   Pass 156，仅 `55_sort_test1/62_percolation/68_brainfk/85_long_code` 四例老
   失败（基线本身既有问题，与本次改动无关），零新增退化。之前误判的
