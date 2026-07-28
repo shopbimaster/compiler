@@ -142,6 +142,7 @@ add_library(sysy_opt STATIC
     src/opt/RepeatedDivRemToNative.cpp
     src/opt/RecursiveCallGuard.cpp
     src/opt/MatrixReductionContraction.cpp
+    src/opt/MatrixReductionTransform.cpp
     src/opt/RadixSortLowering.cpp
     src/opt/BitOpPatternRecognition.cpp
     src/opt/PowerOfTwoDispatch.cpp

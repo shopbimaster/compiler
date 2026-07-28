@@ -32,4 +32,7 @@ struct MatrixReductionPlan {
 bool analyzeMatrixReductionPlan(
     IR::Module* module, MatrixReductionPlan& plan);
 
+bool applyMatrixReductionPlan(
+    IR::Module* module, const MatrixReductionPlan& plan);
+
 } // namespace Opt
