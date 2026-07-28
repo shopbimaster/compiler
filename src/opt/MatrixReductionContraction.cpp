@@ -421,8 +421,6 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
         }
         if (skippedCoefficient) break;
     }
-    if (!skippedCoefficient) return false;
-
     CanonicalLoop loopI;
     CanonicalLoop loopJ;
     CanonicalLoop loopK;
@@ -445,6 +443,39 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
             function, zeroOutput.indices[1], size,
             zeroStore->getParent(), zeroLoopJ)) {
         return false;
+    }
+
+    auto postDominators = computePostDominators(function);
+    auto* innerTerminator = loopJ.compare->getParent()
+        ? loopJ.compare->getParent()->getTerminator()
+        : nullptr;
+    auto* innerBodyEntry =
+        innerTerminator &&
+                innerTerminator->getOpcode() == Opc::COND_BR
+            ? dynamic_cast<IR::BasicBlock*>(
+                  innerTerminator->getOperand(1))
+            : nullptr;
+    if (!innerBodyEntry ||
+        !postDominators[innerBodyEntry].count(
+            updateStore->getParent())) {
+        return false;
+    }
+
+    if (!skippedCoefficient) {
+        auto* rowTerminator = loopI.compare->getParent()
+            ? loopI.compare->getParent()->getTerminator()
+            : nullptr;
+        auto* rowBodyEntry =
+            rowTerminator &&
+                    rowTerminator->getOpcode() == Opc::COND_BR
+                ? dynamic_cast<IR::BasicBlock*>(
+                      rowTerminator->getOperand(1))
+                : nullptr;
+        if (!rowBodyEntry ||
+            !postDominators[rowBodyEntry].count(
+                loopJ.compare->getParent())) {
+            return false;
+        }
     }
 
     match.function = function;
@@ -887,8 +918,6 @@ IR::Function* createAffineRowSummaryFunction(
     auto* i32 = IR::IntegerType::I32;
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
-    auto* skippedCoefficient = IR::ConstantInt::get(
-        i32, match.skippedCoefficient->getValue());
 
     auto* entry = function->createBlock("entry");
     auto* iHeader = function->createBlock("summary.i.cond");
@@ -912,9 +941,6 @@ IR::Function* createAffineRowSummaryFunction(
     accumulation->addOperand(iBody);
     accumulation->addOperand(nullptr);
     accumulation->addOperand(kBody);
-    auto* nextAccumulation = IR::Instruction::createSelect(
-        zero, accumulation, accumulation, "summary.acc.next");
-    accumulation->setOperand(2, nextAccumulation);
     iNext->setOperand(0, indexI);
     kNext->setOperand(0, indexK);
 
@@ -966,11 +992,17 @@ IR::Function* createAffineRowSummaryFunction(
     auto* updated = IR::Instruction::createBinOp(
         Opc::ADD, i32, "summary.updated",
         product, inputSum);
-    auto* skip = IR::Instruction::createCmp(
-        Opc::ICMP, coefficient, skippedCoefficient, "eq");
-    nextAccumulation->setOperand(0, skip);
-    nextAccumulation->setOperand(1, accumulation);
-    nextAccumulation->setOperand(2, updated);
+    IR::Instruction* skip = nullptr;
+    IR::Instruction* nextAccumulation = updated;
+    if (match.skippedCoefficient) {
+        auto* skippedCoefficient = IR::ConstantInt::get(
+            i32, match.skippedCoefficient->getValue());
+        skip = IR::Instruction::createCmp(
+            Opc::ICMP, coefficient, skippedCoefficient, "eq");
+        nextAccumulation = IR::Instruction::createSelect(
+            skip, accumulation, updated, "summary.acc.next");
+    }
+    accumulation->setOperand(2, nextAccumulation);
 
     kBody->pushBack(coefficientAddress);
     kBody->pushBack(coefficient);
@@ -979,8 +1011,10 @@ IR::Function* createAffineRowSummaryFunction(
     kBody->pushBack(inputSum);
     kBody->pushBack(product);
     kBody->pushBack(updated);
-    kBody->pushBack(skip);
-    kBody->pushBack(nextAccumulation);
+    if (skip) {
+        kBody->pushBack(skip);
+        kBody->pushBack(nextAccumulation);
+    }
     kBody->pushBack(kNext);
     kBody->pushBack(IR::Instruction::createBr(kHeader));
 
