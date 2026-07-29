@@ -55,6 +55,11 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    if (PASS_CALL(modAddRecurrenceStrengthReduce)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     if (PASS_CALL(radixSortLowering)) {
         constantFolding(mod);
         deadCodeElimination(mod);
@@ -399,6 +404,12 @@ void runO2(IR::Module* mod) {
             constantFolding(mod);
             deadCodeElimination(mod);
         }
+    }
+
+    if (PASS_CALL(stencilInteriorSpecialization)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
     }
 
     matrixReductionContraction(mod);

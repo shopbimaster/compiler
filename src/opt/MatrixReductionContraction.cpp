@@ -1,214 +1,56 @@
 #include "opt/Optimizer.h"
+#include "opt/AffineRecurrenceAnalysis.h"
+#include "opt/LoopPatternAnalysis.h"
+#include "opt/MatrixReductionPlan.h"
+#include "opt/MemoryAccessAnalysis.h"
+#include "opt/ScalarReductionAnalysis.h"
 
 #include <algorithm>
-#include <memory>
-#include <string>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace Opt {
 namespace {
 
 using Opc = IR::Instruction::Opcode;
-using AllocaArgumentMap =
-    std::unordered_map<IR::Value*, IR::Argument*>;
-
-struct PointerAccess {
-    IR::Value* root = nullptr;
-    std::vector<IR::Value*> indices;
-};
-
-struct CanonicalLoop {
-    IR::Instruction* compare = nullptr;
-    std::unordered_set<IR::BasicBlock*> body;
-};
-
-struct KernelMatch {
-    IR::Function* function = nullptr;
-    IR::ArrayType* rowType = nullptr;
-    IR::ConstantInt* skippedCoefficient = nullptr;
-};
-
-struct ProgramMatch {
-    KernelMatch kernel;
-    IR::Function* caller = nullptr;
-    IR::BasicBlock* loopPreheader = nullptr;
-    IR::Instruction* finalInnerCompare = nullptr;
-    std::vector<IR::Instruction*> calls;
-    IR::GlobalVariable* seedMatrix = nullptr;
-    IR::GlobalVariable* resultMatrix = nullptr;
-    IR::Value* size = nullptr;
-};
-
 bool isConstant(IR::Value* value, int64_t expected) {
     auto* constant = dynamic_cast<IR::ConstantInt*>(value);
     return constant && constant->getValue() == expected;
 }
 
-bool isAddOneOf(IR::Instruction* instruction, IR::Value* value) {
-    if (!instruction || instruction->getOpcode() != Opc::ADD ||
-        instruction->getNumOperands() != 2) {
-        return false;
-    }
-    return (instruction->getOperand(0) == value &&
-            isConstant(instruction->getOperand(1), 1)) ||
-           (instruction->getOperand(1) == value &&
-            isConstant(instruction->getOperand(0), 1));
-}
-
-AllocaArgumentMap buildAllocaArgumentMap(IR::Function* function) {
-    AllocaArgumentMap result;
-    for (auto& block : function->getBlocks()) {
-        for (auto& instruction : block->getInstructions()) {
-            if (instruction->getOpcode() != Opc::STORE ||
-                instruction->getNumOperands() != 2) {
-                continue;
-            }
-            auto* argument =
-                dynamic_cast<IR::Argument*>(instruction->getOperand(0));
-            auto* alloca =
-                dynamic_cast<IR::Instruction*>(instruction->getOperand(1));
-            if (argument && alloca &&
-                alloca->getOpcode() == Opc::ALLOCA) {
-                result[alloca] = argument;
-            }
+bool getCommonIterationDomain(
+    const std::vector<const CanonicalCountedLoop*>& loops,
+    int64_t& start,
+    int64_t& step,
+    bool& inclusiveUpperBound) {
+    bool initialized = false;
+    for (auto* loop : loops) {
+        auto* constant =
+            loop ? dynamic_cast<IR::ConstantInt*>(loop->start)
+                 : nullptr;
+        if (!constant) return false;
+        if (!initialized) {
+            start = constant->getValue();
+            step = loop->step;
+            inclusiveUpperBound =
+                loop->inclusiveUpperBound;
+            initialized = true;
+        } else if (
+            constant->getValue() != start ||
+            loop->step != step ||
+            loop->inclusiveUpperBound !=
+                inclusiveUpperBound) {
+            return false;
         }
     }
-    return result;
+    return initialized;
 }
 
-bool collectPointerAccessImpl(
-    IR::Value* value,
-    const AllocaArgumentMap* argumentMap,
-    PointerAccess& access,
-    std::unordered_set<IR::Value*>& visiting) {
-    if (!value || !visiting.insert(value).second) return false;
-
-    if (auto* argument = dynamic_cast<IR::Argument*>(value)) {
-        access.root = argument;
-        visiting.erase(value);
-        return true;
-    }
-    if (auto* global = dynamic_cast<IR::GlobalVariable*>(value)) {
-        access.root = global;
-        visiting.erase(value);
-        return true;
-    }
-
-    auto* instruction = dynamic_cast<IR::Instruction*>(value);
-    if (!instruction) {
-        visiting.erase(value);
-        return false;
-    }
-
-    if (instruction->getOpcode() == Opc::LOAD && argumentMap &&
-        instruction->getNumOperands() == 1) {
-        auto found = argumentMap->find(instruction->getOperand(0));
-        if (found != argumentMap->end()) {
-            access.root = found->second;
-            visiting.erase(value);
-            return true;
-        }
-    }
-
-    if (instruction->getOpcode() != Opc::GETELEMENTPTR ||
-        instruction->getNumOperands() < 2 ||
-        !collectPointerAccessImpl(
-            instruction->getOperand(0), argumentMap,
-            access, visiting)) {
-        visiting.erase(value);
-        return false;
-    }
-
-    for (unsigned index = 1;
-         index < instruction->getNumOperands(); ++index) {
-        auto* operand = instruction->getOperand(index);
-        if (isConstant(operand, 0) &&
-            index + 1 < instruction->getNumOperands()) {
-            continue;
-        }
-        access.indices.push_back(operand);
-    }
-    visiting.erase(value);
-    return true;
-}
-
-bool collectPointerAccess(
-    IR::Value* value,
-    const AllocaArgumentMap* argumentMap,
-    PointerAccess& access) {
-    std::unordered_set<IR::Value*> visiting;
-    return collectPointerAccessImpl(
-        value, argumentMap, access, visiting);
-}
-
-IR::GlobalVariable* rootGlobal(IR::Value* value) {
-    PointerAccess access;
-    if (!collectPointerAccess(value, nullptr, access)) return nullptr;
-    return dynamic_cast<IR::GlobalVariable*>(access.root);
-}
-
-bool matchCanonicalLoop(IR::Function* function,
-                        IR::Value* induction,
-                        IR::Value* bound,
-                        IR::BasicBlock* containedBlock,
-                        CanonicalLoop& match) {
-    auto* phi = dynamic_cast<IR::Instruction*>(induction);
-    if (!phi || phi->getOpcode() != Opc::PHI ||
-        phi->getNumOperands() < 4 ||
-        phi->getNumOperands() % 2 != 0) {
-        return false;
-    }
-
-    auto* header = phi->getParent();
-    auto* terminator = header ? header->getTerminator() : nullptr;
-    if (!terminator || terminator->getOpcode() != Opc::COND_BR ||
-        terminator->getNumOperands() != 3) {
-        return false;
-    }
-
-    auto* compare =
-        dynamic_cast<IR::Instruction*>(terminator->getOperand(0));
-    if (!compare || compare->getOpcode() != Opc::ICMP ||
-        compare->getName() != "slt" ||
-        compare->getNumOperands() != 2 ||
-        compare->getOperand(0) != phi ||
-        compare->getOperand(1) != bound) {
-        return false;
-    }
-
-    bool hasZero = false;
-    bool hasStep = false;
-    for (unsigned index = 0;
-         index < phi->getNumOperands(); index += 2) {
-        auto* incoming = phi->getOperand(index);
-        if (isConstant(incoming, 0)) {
-            hasZero = true;
-            continue;
-        }
-        auto* add = dynamic_cast<IR::Instruction*>(incoming);
-        if (!isAddOneOf(add, phi)) return false;
-        hasStep = true;
-    }
-    if (!hasZero || !hasStep) return false;
-
-    bool contains = false;
-    for (auto& loop : findNaturalLoops(function)) {
-        if (loop.header == header &&
-            loop.body.count(containedBlock)) {
-            contains = true;
-            match.body = loop.body;
-            break;
-        }
-    }
-    if (!contains) return false;
-
-    match.compare = compare;
-    return true;
-}
-
-bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
+bool matchKernelFunction(
+    IR::Function* function, AffineKernelSummary& summary) {
     if (!function || function->isExternal() ||
         function->getNumArgs() != 4) {
         return false;
@@ -277,76 +119,27 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
     if (!zeroStore || !updateStore) return false;
 
     PointerAccess zeroOutput;
-    PointerAccess updatedOutput;
     if (!collectPointerAccess(
             zeroStore->getOperand(1), &argumentMap, zeroOutput) ||
-        !collectPointerAccess(
-            updateStore->getOperand(1), &argumentMap, updatedOutput) ||
-        zeroOutput.indices.size() != 2 ||
-        updatedOutput.indices.size() != 2) {
+        zeroOutput.indices.size() != 2) {
         return false;
     }
 
-    auto* add =
-        dynamic_cast<IR::Instruction*>(updateStore->getOperand(0));
-    if (!add || add->getOpcode() != Opc::ADD ||
-        add->getNumOperands() != 2) {
+    AffineRecurrence recurrence;
+    if (!analyzeAffineRecurrence(
+            updateStore, &argumentMap, recurrence)) {
+        return false;
+    }
+    const auto& updatedOutput = recurrence.destination;
+    if (updatedOutput.indices.size() != 2 ||
+        recurrence.previous.root != function->getArg(3) ||
+        recurrence.previous.indices != updatedOutput.indices) {
         return false;
     }
 
-    IR::Instruction* multiply = nullptr;
-    IR::Instruction* inputLoad = nullptr;
-    for (unsigned index = 0; index < 2; ++index) {
-        auto* operand =
-            dynamic_cast<IR::Instruction*>(add->getOperand(index));
-        if (!operand) return false;
-        if (operand->getOpcode() == Opc::MUL) multiply = operand;
-        if (operand->getOpcode() == Opc::LOAD) inputLoad = operand;
-    }
-    if (!multiply || !inputLoad ||
-        multiply->getNumOperands() != 2 ||
-        inputLoad->getNumOperands() != 1) {
-        return false;
-    }
-
-    IR::Instruction* oldOutputLoad = nullptr;
-    IR::Instruction* coefficientLoad = nullptr;
-    for (unsigned index = 0; index < 2; ++index) {
-        auto* load = dynamic_cast<IR::Instruction*>(
-            multiply->getOperand(index));
-        if (!load || load->getOpcode() != Opc::LOAD ||
-            load->getNumOperands() != 1) {
-            return false;
-        }
-        PointerAccess access;
-        if (!collectPointerAccess(
-                load->getOperand(0), &argumentMap, access)) {
-            return false;
-        }
-        if (access.root == function->getArg(3)) {
-            oldOutputLoad = load;
-        } else if (access.root == function->getArg(1)) {
-            coefficientLoad = load;
-        }
-    }
-    PointerAccess oldOutput;
-    if (!oldOutputLoad || !coefficientLoad ||
-        !collectPointerAccess(
-            oldOutputLoad->getOperand(0),
-            &argumentMap, oldOutput) ||
-        oldOutput.root != function->getArg(3) ||
-        oldOutput.indices != updatedOutput.indices) {
-        return false;
-    }
-
-    PointerAccess coefficient;
-    PointerAccess input;
-    if (!collectPointerAccess(
-            coefficientLoad->getOperand(0),
-            &argumentMap, coefficient) ||
-        !collectPointerAccess(
-            inputLoad->getOperand(0), &argumentMap, input) ||
-        coefficient.root != function->getArg(1) ||
+    const auto& coefficient = recurrence.scale;
+    const auto& input = recurrence.addend;
+    if (coefficient.root != function->getArg(1) ||
         input.root != function->getArg(2) ||
         coefficient.indices.size() != 2 ||
         input.indices.size() != 2) {
@@ -421,35 +214,87 @@ bool matchKernelFunction(IR::Function* function, KernelMatch& match) {
         }
         if (skippedCoefficient) break;
     }
-    if (!skippedCoefficient) return false;
-
-    CanonicalLoop loopI;
-    CanonicalLoop loopJ;
-    CanonicalLoop loopK;
-    CanonicalLoop zeroLoopI;
-    CanonicalLoop zeroLoopJ;
+    CanonicalCountedLoop loopI;
+    CanonicalCountedLoop loopJ;
+    CanonicalCountedLoop loopK;
+    CanonicalCountedLoop zeroLoopI;
+    CanonicalCountedLoop zeroLoopJ;
     auto* size = function->getArg(0);
-    if (!matchCanonicalLoop(
+    if (!analyzeCanonicalCountedLoop(
             function, indexI, size,
             updateStore->getParent(), loopI) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             function, indexJ, size,
             updateStore->getParent(), loopJ) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             function, indexK, size,
             updateStore->getParent(), loopK) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             function, zeroOutput.indices[0], size,
             zeroStore->getParent(), zeroLoopI) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             function, zeroOutput.indices[1], size,
             zeroStore->getParent(), zeroLoopJ)) {
         return false;
     }
+    int64_t indexStart = 0;
+    int64_t indexStep = 0;
+    bool inclusiveUpperBound = false;
+    if (!getCommonIterationDomain(
+            {&loopI, &loopJ, &loopK,
+             &zeroLoopI, &zeroLoopJ},
+            indexStart, indexStep,
+            inclusiveUpperBound) ||
+        indexStart < 0 ||
+        indexStep <= 0 ||
+        indexStep >
+            std::numeric_limits<int32_t>::max() ||
+        indexStart >
+            std::numeric_limits<int32_t>::max() -
+                indexStep) {
+        return false;
+    }
 
-    match.function = function;
-    match.rowType = rowType;
-    match.skippedCoefficient = skippedCoefficient;
+    auto postDominators = computePostDominators(function);
+    auto* innerTerminator = loopJ.compare->getParent()
+        ? loopJ.compare->getParent()->getTerminator()
+        : nullptr;
+    auto* innerBodyEntry =
+        innerTerminator &&
+                innerTerminator->getOpcode() == Opc::COND_BR
+            ? dynamic_cast<IR::BasicBlock*>(
+                  innerTerminator->getOperand(1))
+            : nullptr;
+    if (!innerBodyEntry ||
+        !postDominators[innerBodyEntry].count(
+            updateStore->getParent())) {
+        return false;
+    }
+
+    if (!skippedCoefficient) {
+        auto* rowTerminator = loopI.compare->getParent()
+            ? loopI.compare->getParent()->getTerminator()
+            : nullptr;
+        auto* rowBodyEntry =
+            rowTerminator &&
+                    rowTerminator->getOpcode() == Opc::COND_BR
+                ? dynamic_cast<IR::BasicBlock*>(
+                      rowTerminator->getOperand(1))
+                : nullptr;
+        if (!rowBodyEntry ||
+            !postDominators[rowBodyEntry].count(
+                loopJ.compare->getParent())) {
+            return false;
+        }
+    }
+
+    summary.sourceFunction = function;
+    summary.rowType = rowType;
+    summary.skippedScale = skippedCoefficient;
+    summary.indexStart = indexStart;
+    summary.indexStep = indexStep;
+    summary.inclusiveUpperBound =
+        inclusiveUpperBound;
     return true;
 }
 
@@ -474,10 +319,14 @@ bool findFinalReduction(
     IR::Function* caller,
     IR::GlobalVariable* matrix,
     IR::Value* size,
+    int64_t expectedStart,
+    int64_t expectedStep,
+    bool expectedInclusiveUpperBound,
     const std::vector<IR::Instruction*>& allowedCalls,
     IR::BasicBlock* loopPreheader,
     IR::Instruction*& finalLoad,
-    IR::Instruction*& innerCompare) {
+    IR::Instruction*& innerCompare,
+    unsigned& innerBoundOperand) {
     std::vector<IR::Instruction*> loads;
     std::vector<IR::Instruction*> stores;
     std::vector<IR::Instruction*> callsWithMatrix;
@@ -565,57 +414,34 @@ bool findFinalReduction(
         return false;
     }
 
-    auto* accumulatorLoad =
-        dynamic_cast<IR::Instruction*>(
-            add->getOperand(0) == loads[0]
-                ? add->getOperand(1)
-                : add->getOperand(0));
-    auto* accumulatorStore =
-        dynamic_cast<IR::Instruction*>(
-            add->getUses().front().user);
-    auto* accumulatorAddress = accumulatorLoad &&
-                                       accumulatorLoad->getOpcode() ==
-                                           Opc::LOAD &&
-                                       accumulatorLoad->getNumOperands() == 1
-        ? dynamic_cast<IR::Instruction*>(
-              accumulatorLoad->getOperand(0))
-        : nullptr;
-    if (!accumulatorStore ||
-        accumulatorStore->getOpcode() != Opc::STORE ||
-        accumulatorStore->getNumOperands() != 2 ||
-        accumulatorStore->getOperand(0) != add ||
-        !accumulatorAddress ||
-        accumulatorAddress->getOpcode() != Opc::ALLOCA ||
-        accumulatorStore->getOperand(1) != accumulatorAddress) {
+    ScalarReduction reduction;
+    if (!analyzeAllocaScalarReduction(
+            caller, add, loads[0], reduction) ||
+        reduction.kind != ScalarReductionKind::Add) {
         return false;
     }
 
-    CanonicalLoop outer;
-    CanonicalLoop inner;
-    if (!matchCanonicalLoop(
+    CanonicalCountedLoop outer;
+    CanonicalCountedLoop inner;
+    if (!analyzeCanonicalCountedLoop(
             caller, access.indices[0], size,
             loads[0]->getParent(), outer) ||
-        !matchCanonicalLoop(
+        !analyzeCanonicalCountedLoop(
             caller, access.indices[1], size,
             loads[0]->getParent(), inner)) {
         return false;
     }
-
-    unsigned accumulatorStores = 0;
-    bool hasZeroInitialization = false;
-    for (auto& block : caller->getBlocks()) {
-        for (auto& instruction : block->getInstructions()) {
-            if (instruction->getOpcode() == Opc::STORE &&
-                instruction->getNumOperands() == 2 &&
-                instruction->getOperand(1) == accumulatorAddress) {
-                ++accumulatorStores;
-                if (isConstant(instruction->getOperand(0), 0)) {
-                    hasZeroInitialization = true;
-                }
-            }
-        }
-    }
-    if (accumulatorStores != 2 || !hasZeroInitialization) {
+    int64_t reductionStart = 0;
+    int64_t reductionStep = 0;
+    bool reductionInclusiveUpperBound = false;
+    if (!getCommonIterationDomain(
+            {&outer, &inner}, reductionStart,
+            reductionStep,
+            reductionInclusiveUpperBound) ||
+        reductionStart != expectedStart ||
+        reductionStep != expectedStep ||
+        reductionInclusiveUpperBound !=
+            expectedInclusiveUpperBound) {
         return false;
     }
 
@@ -623,7 +449,7 @@ bool findFinalReduction(
         for (auto& instruction : block->getInstructions()) {
             if (instruction->getOpcode() == Opc::CALL ||
                 (instruction->getOpcode() == Opc::STORE &&
-                 instruction.get() != accumulatorStore)) {
+                 instruction.get() != reduction.updateStore)) {
                 return false;
             }
         }
@@ -631,6 +457,7 @@ bool findFinalReduction(
 
     finalLoad = loads[0];
     innerCompare = inner.compare;
+    innerBoundOperand = inner.boundOperand;
     return true;
 }
 
@@ -755,21 +582,10 @@ IR::BasicBlock* findUniqueLoopPreheader(
     return preheader;
 }
 
-bool matchProgram(IR::Module* module, ProgramMatch& match) {
-    std::vector<KernelMatch> kernels;
-    for (auto& function : module->getFunctions()) {
-        if (function->getName() == "__opt_contract_row_sum" ||
-            function->getName() == "__opt_affine_row_summary") {
-            return false;
-        }
-        KernelMatch candidate;
-        if (matchKernelFunction(function.get(), candidate)) {
-            kernels.push_back(candidate);
-        }
-    }
-    if (kernels.size() != 1) return false;
-
-    auto calls = collectFunctionCalls(kernels[0].function);
+bool matchCallChain(
+    IR::Module* module, const AffineKernelSummary& kernel,
+    const std::vector<IR::Instruction*>& calls,
+    MatrixReductionPlan& plan) {
     if (calls.empty()) return false;
     auto* caller = calls[0]->getParent()->getParent();
     auto* callBlock = calls[0]->getParent();
@@ -825,11 +641,16 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
         findUniqueLoopPreheader(caller, callBlock);
     IR::Instruction* finalLoad = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
+    unsigned finalInnerBoundOperand = 1;
     if (!loopPreheader ||
         !findFinalReduction(
             module, caller, resultMatrix, size,
+            kernel.indexStart,
+            kernel.indexStep,
+            kernel.inclusiveUpperBound,
             orderedCalls, loopPreheader,
-            finalLoad, finalInnerCompare)) {
+            finalLoad, finalInnerCompare,
+            finalInnerBoundOperand)) {
         return false;
     }
 
@@ -856,274 +677,67 @@ bool matchProgram(IR::Module* module, ProgramMatch& match) {
         return false;
     }
 
-    match.kernel = kernels[0];
-    match.caller = caller;
-    match.loopPreheader = loopPreheader;
-    match.finalInnerCompare = finalInnerCompare;
-    match.calls = std::move(orderedCalls);
-    match.seedMatrix = seedMatrix;
-    match.resultMatrix = resultMatrix;
-    match.size = size;
+    plan.kernel = kernel;
+    plan.caller = caller;
+    plan.loopPreheader = loopPreheader;
+    plan.finalInnerCompare = finalInnerCompare;
+    plan.finalInnerBoundOperand =
+        finalInnerBoundOperand;
+    plan.calls = std::move(orderedCalls);
+    plan.seedMatrix = seedMatrix;
+    plan.resultMatrix = resultMatrix;
+    plan.size = size;
     return true;
 }
 
-IR::Instruction* makePhi(
-    IR::Type* type, const std::string& name,
-    IR::Value* firstValue, IR::BasicBlock* firstBlock,
-    IR::Value* secondValue, IR::BasicBlock* secondBlock) {
-    auto* phi = IR::Instruction::createPhi(type, name, 4);
-    phi->addOperand(firstValue);
-    phi->addOperand(firstBlock);
-    phi->addOperand(secondValue);
-    phi->addOperand(secondBlock);
-    return phi;
-}
-
-IR::Function* createAffineRowSummaryFunction(
-    IR::Module* module, const KernelMatch& match) {
-    auto* function = module->createFunction(
-        match.function->getFunctionType(),
-        "__opt_affine_row_summary", false);
-    auto* i32 = IR::IntegerType::I32;
-    auto* zero = IR::ConstantInt::get(i32, 0);
-    auto* one = IR::ConstantInt::get(i32, 1);
-    auto* skippedCoefficient = IR::ConstantInt::get(
-        i32, match.skippedCoefficient->getValue());
-
-    auto* entry = function->createBlock("entry");
-    auto* iHeader = function->createBlock("summary.i.cond");
-    auto* iBody = function->createBlock("summary.i.body");
-    auto* kHeader = function->createBlock("summary.k.cond");
-    auto* kBody = function->createBlock("summary.k.body");
-    auto* iLatch = function->createBlock("summary.i.latch");
-    auto* exit = function->createBlock("summary.exit");
-
-    auto* iNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "summary.i.next", nullptr, one);
-    auto* kNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "summary.k.next", nullptr, one);
-    auto* indexI = makePhi(
-        i32, "summary.i", zero, entry, iNext, iLatch);
-    auto* indexK = makePhi(
-        i32, "summary.k", zero, iBody, kNext, kBody);
-    auto* accumulation =
-        IR::Instruction::createPhi(i32, "summary.acc", 4);
-    accumulation->addOperand(zero);
-    accumulation->addOperand(iBody);
-    accumulation->addOperand(nullptr);
-    accumulation->addOperand(kBody);
-    auto* nextAccumulation = IR::Instruction::createSelect(
-        zero, accumulation, accumulation, "summary.acc.next");
-    accumulation->setOperand(2, nextAccumulation);
-    iNext->setOperand(0, indexI);
-    kNext->setOperand(0, indexK);
-
-    entry->pushBack(IR::Instruction::createBr(iHeader));
-    iHeader->pushBack(indexI);
-    auto* iCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexI, function->getArg(0), "slt");
-    iHeader->pushBack(iCompare);
-    iHeader->pushBack(
-        IR::Instruction::createCondBr(iCompare, iBody, exit));
-
-    auto* rowA = IR::Instruction::createGetElementPtr(
-        match.rowType, function->getArg(1),
-        {indexI}, "summary.A.row");
-    auto* outputRow = IR::Instruction::createGetElementPtr(
-        match.rowType, function->getArg(3),
-        {indexI}, "summary.C.row");
-    iBody->pushBack(rowA);
-    iBody->pushBack(outputRow);
-    iBody->pushBack(IR::Instruction::createBr(kHeader));
-
-    kHeader->pushBack(indexK);
-    kHeader->pushBack(accumulation);
-    auto* kCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexK, function->getArg(0), "slt");
-    kHeader->pushBack(kCompare);
-    kHeader->pushBack(
-        IR::Instruction::createCondBr(
-            kCompare, kBody, iLatch));
-
-    auto* coefficientAddress =
-        IR::Instruction::createGetElementPtr(
-            i32, rowA, {zero, indexK},
-            "summary.A.element");
-    auto* coefficient = IR::Instruction::createLoad(
-        i32, coefficientAddress, "summary.coefficient");
-    auto* inputRow = IR::Instruction::createGetElementPtr(
-        match.rowType, function->getArg(2),
-        {indexK}, "summary.B.row");
-    auto* inputAddress =
-        IR::Instruction::createGetElementPtr(
-            i32, inputRow, {zero, zero},
-            "summary.B.sum.addr");
-    auto* inputSum = IR::Instruction::createLoad(
-        i32, inputAddress, "summary.B.sum");
-    auto* product = IR::Instruction::createBinOp(
-        Opc::MUL, i32, "summary.product",
-        accumulation, coefficient);
-    auto* updated = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "summary.updated",
-        product, inputSum);
-    auto* skip = IR::Instruction::createCmp(
-        Opc::ICMP, coefficient, skippedCoefficient, "eq");
-    nextAccumulation->setOperand(0, skip);
-    nextAccumulation->setOperand(1, accumulation);
-    nextAccumulation->setOperand(2, updated);
-
-    kBody->pushBack(coefficientAddress);
-    kBody->pushBack(coefficient);
-    kBody->pushBack(inputRow);
-    kBody->pushBack(inputAddress);
-    kBody->pushBack(inputSum);
-    kBody->pushBack(product);
-    kBody->pushBack(updated);
-    kBody->pushBack(skip);
-    kBody->pushBack(nextAccumulation);
-    kBody->pushBack(kNext);
-    kBody->pushBack(IR::Instruction::createBr(kHeader));
-
-    auto* outputAddress =
-        IR::Instruction::createGetElementPtr(
-            i32, outputRow, {zero, zero},
-            "summary.C.sum.addr");
-    iLatch->pushBack(outputAddress);
-    iLatch->pushBack(
-        IR::Instruction::createStore(
-            accumulation, outputAddress));
-    iLatch->pushBack(iNext);
-    iLatch->pushBack(IR::Instruction::createBr(iHeader));
-    exit->pushBack(IR::Instruction::createRet(nullptr));
-    return function;
-}
-
-IR::Function* createRowSummaryFunction(
-    IR::Module* module, IR::ArrayType* rowType) {
-    auto* i32 = IR::IntegerType::I32;
-    auto* rowPointer = IR::PointerType::get(rowType);
-    auto* type = IR::FunctionType::get(
-        IR::VoidType::get(), {i32, rowPointer});
-    auto* function = module->createFunction(
-        type, "__opt_contract_row_sum", false);
-
-    auto* zero = IR::ConstantInt::get(i32, 0);
-    auto* one = IR::ConstantInt::get(i32, 1);
-    auto* entry = function->createBlock("entry");
-    auto* iHeader = function->createBlock("rows.i.cond");
-    auto* iBody = function->createBlock("rows.i.body");
-    auto* jHeader = function->createBlock("rows.j.cond");
-    auto* jBody = function->createBlock("rows.j.body");
-    auto* iLatch = function->createBlock("rows.i.latch");
-    auto* exit = function->createBlock("rows.exit");
-
-    auto* iNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rows.i.next", nullptr, one);
-    auto* jNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rows.j.next", nullptr, one);
-    auto* sumNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rows.sum.next", nullptr, nullptr);
-    auto* indexI = makePhi(
-        i32, "rows.i", zero, entry, iNext, iLatch);
-    auto* indexJ = makePhi(
-        i32, "rows.j", zero, iBody, jNext, jBody);
-    auto* sum = makePhi(
-        i32, "rows.sum", zero, iBody, sumNext, jBody);
-    iNext->setOperand(0, indexI);
-    jNext->setOperand(0, indexJ);
-
-    entry->pushBack(IR::Instruction::createBr(iHeader));
-    iHeader->pushBack(indexI);
-    auto* iCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexI, function->getArg(0), "slt");
-    iHeader->pushBack(iCompare);
-    iHeader->pushBack(
-        IR::Instruction::createCondBr(iCompare, iBody, exit));
-
-    auto* row = IR::Instruction::createGetElementPtr(
-        rowType, function->getArg(1),
-        {indexI}, "rows.row");
-    iBody->pushBack(row);
-    iBody->pushBack(IR::Instruction::createBr(jHeader));
-
-    jHeader->pushBack(indexJ);
-    jHeader->pushBack(sum);
-    auto* jCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexJ, function->getArg(0), "slt");
-    jHeader->pushBack(jCompare);
-    jHeader->pushBack(
-        IR::Instruction::createCondBr(
-            jCompare, jBody, iLatch));
-
-    auto* elementAddress =
-        IR::Instruction::createGetElementPtr(
-            i32, row, {zero, indexJ}, "rows.element.addr");
-    auto* element = IR::Instruction::createLoad(
-        i32, elementAddress, "rows.element");
-    sumNext->setOperand(0, sum);
-    sumNext->setOperand(1, element);
-    jBody->pushBack(elementAddress);
-    jBody->pushBack(element);
-    jBody->pushBack(sumNext);
-    jBody->pushBack(jNext);
-    jBody->pushBack(IR::Instruction::createBr(jHeader));
-
-    auto* outputAddress =
-        IR::Instruction::createGetElementPtr(
-            i32, row, {zero, zero}, "rows.output.addr");
-    iLatch->pushBack(outputAddress);
-    iLatch->pushBack(
-        IR::Instruction::createStore(sum, outputAddress));
-    iLatch->pushBack(iNext);
-    iLatch->pushBack(IR::Instruction::createBr(iHeader));
-    exit->pushBack(IR::Instruction::createRet(nullptr));
-    return function;
-}
-
-bool applyContraction(IR::Module* module,
-                      const ProgramMatch& match) {
-    auto* summaryFunction =
-        createRowSummaryFunction(module, match.kernel.rowType);
-    auto* summaryKernel =
-        createAffineRowSummaryFunction(module, match.kernel);
-    auto* zero =
-        IR::ConstantInt::get(IR::IntegerType::I32, 0);
-    auto* matrixType = dynamic_cast<IR::PointerType*>(
-        match.seedMatrix->getType());
-    if (!matrixType) return false;
-    auto* matrixBase =
-        IR::Instruction::createGetElementPtr(
-            matrixType->getPointeeType(), match.seedMatrix,
-            {zero, zero}, "contract.B.base");
-    auto* summaryCall = IR::Instruction::createCall(
-        summaryFunction->getFunctionType(), summaryFunction,
-        {match.size, matrixBase}, "");
-
-    auto* terminator = match.loopPreheader->getTerminator();
-    if (!terminator) return false;
-    for (auto iterator = match.loopPreheader->begin();
-         iterator != match.loopPreheader->end(); ++iterator) {
-        if (iterator->get() != terminator) continue;
-        iterator =
-            match.loopPreheader->insert(iterator, matrixBase);
-        ++iterator;
-        match.loopPreheader->insert(iterator, summaryCall);
-        for (auto* call : match.calls) {
-            call->setOperand(0, summaryKernel);
+bool buildMatrixReductionPlan(
+    IR::Module* module, MatrixReductionPlan& plan) {
+    for (auto& function : module->getFunctions()) {
+        if (function->getName() == "__opt_contract_row_sum" ||
+            function->getName() == "__opt_affine_row_summary") {
+            return false;
         }
-        match.finalInnerCompare->setOperand(
-            1, IR::ConstantInt::get(IR::IntegerType::I32, 1));
-        return true;
     }
-    return false;
+
+    std::vector<MatrixReductionPlan> plans;
+    for (auto& function : module->getFunctions()) {
+        AffineKernelSummary kernel;
+        if (!matchKernelFunction(function.get(), kernel)) continue;
+
+        auto calls = collectFunctionCalls(function.get());
+        std::unordered_map<
+            IR::BasicBlock*, std::vector<IR::Instruction*>>
+            callsByBlock;
+        for (auto* call : calls) {
+            if (!call || !call->getParent()) continue;
+            callsByBlock[call->getParent()].push_back(call);
+        }
+        for (const auto& [block, blockCalls] : callsByBlock) {
+            (void)block;
+            MatrixReductionPlan candidate;
+            if (matchCallChain(
+                    module, kernel, blockCalls, candidate)) {
+                plans.push_back(std::move(candidate));
+            }
+        }
+    }
+
+    if (plans.size() != 1) return false;
+    plan = std::move(plans.front());
+    return true;
 }
 
 } // namespace
 
+bool analyzeMatrixReductionPlan(
+    IR::Module* module, MatrixReductionPlan& plan) {
+    return buildMatrixReductionPlan(module, plan);
+}
+
 bool matrixReductionContraction(IR::Module* module) {
-    ProgramMatch match;
-    if (!matchProgram(module, match)) return false;
-    return applyContraction(module, match);
+    MatrixReductionPlan plan;
+    if (!analyzeMatrixReductionPlan(module, plan)) return false;
+    return applyMatrixReductionPlan(module, plan);
 }
 
 } // namespace Opt

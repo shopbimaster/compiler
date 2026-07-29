@@ -149,6 +149,8 @@ void runP3(IR::Module* mod);
 bool recursiveMulToNative(IR::Module* mod);
 bool recursiveModularMulToNative(IR::Module* mod);
 bool repeatedDivRemToNative(IR::Module* mod);
+bool modAddRecurrenceStrengthReduce(IR::Module* mod);
+bool stencilInteriorSpecialization(IR::Module* mod);
 bool hoistRecursiveCallGuards(IR::Module* mod);
 bool matrixReductionContraction(IR::Module* mod);
 bool radixSortLowering(IR::Module* mod);
