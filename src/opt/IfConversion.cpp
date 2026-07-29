@@ -76,14 +76,43 @@ bool ifConversion(IR::Module* mod) {
             if (!predBr || predBr->getOpcode() != IR::Instruction::Opcode::COND_BR)
                 continue;
 
-            // 条件分支必须同时指向 curr 和 singleSucc
+            // 条件分支的两个目标：一个必须是 curr，另一个是 otherDest
             IR::BasicBlock* trueDest = dynamic_cast<IR::BasicBlock*>(predBr->getOperand(1));
             IR::BasicBlock* falseDest = dynamic_cast<IR::BasicBlock*>(predBr->getOperand(2));
             if (!trueDest || !falseDest) continue;
 
-            bool currIsTrue = (trueDest == curr && falseDest == singleSucc);
-            bool currIsFalse = (falseDest == curr && trueDest == singleSucc);
+            bool currIsTrue = (trueDest == curr);
+            bool currIsFalse = (falseDest == curr);
             if (!currIsTrue && !currIsFalse) continue;
+
+            IR::BasicBlock* otherDest = currIsTrue ? falseDest : trueDest;
+
+            // otherDest 必须能到达 singleSucc（merge 块）。两种合法形态：
+            //   形态 1（原有）：otherDest == singleSucc，即 merge 块本身就是另一臂。
+            //     br cond, curr, singleSucc ；singleSucc 的 phi 含 [v, singlePred]
+            //   形态 2（新增，empty-else/then 菱形）：otherDest 是仅含无条件 BR 的空块，
+            //     且其目标 == singleSucc。典型场景：if (cond) { acc += expr; } 编译为
+            //     br cond, then, endif ; endif: br merge ; merge: phi [t, then], [acc, endif]
+            //     此形态下 endif 的 phi 条目值实际定义在支配 otherDest 的更早块中。
+            bool otherIsMerge = (otherDest == singleSucc);
+            bool otherIsEmptyMiddle = false;
+            if (!otherIsMerge) {
+                int otherInstCount = 0;
+                IR::BasicBlock* otherTarget = nullptr;
+                for (auto& oi : otherDest->getInstructions()) {
+                    auto oop = oi->getOpcode();
+                    if (oop == IR::Instruction::Opcode::BR) {
+                        otherTarget = dynamic_cast<IR::BasicBlock*>(oi->getOperand(0));
+                    } else if (oop != IR::Instruction::Opcode::COND_BR) {
+                        otherInstCount++;
+                    }
+                }
+                if (otherInstCount == 0 && otherTarget == singleSucc) {
+                    otherIsEmptyMiddle = true;
+                }
+            }
+            if (!otherIsMerge && !otherIsEmptyMiddle)
+                continue;
 
             // 检查 curr 中的指令是否安全
             bool safe = true;
@@ -104,9 +133,10 @@ bool ifConversion(IR::Module* mod) {
             auto* cond = predBr->getOperand(0);
             if (cond->getNumUses() != 1) continue;
 
-            // 确定 true/false 值的来源
-            IR::BasicBlock* trueInBB = currIsTrue ? curr : singlePred;
-            IR::BasicBlock* falseInBB = currIsTrue ? singlePred : curr;
+            // 确定"另一臂"对应的 phi 来源块：
+            //   形态 1：phi 条目标签为 singlePred（分支块本身直接跳到 merge）
+            //   形态 2：phi 条目标签为 otherDest（空中间块跳到 merge）
+            IR::BasicBlock* otherBB = otherIsMerge ? singlePred : otherDest;
 
             // 将 singleSucc 中的 phi 指令替换为 SELECT + 新 phi
             bool anyConverted = false;
@@ -114,18 +144,18 @@ bool ifConversion(IR::Module* mod) {
                 if (inst->getOpcode() != IR::Instruction::Opcode::PHI)
                     continue;
 
-                // 找到来自 singlePred 和 curr 的值
-                IR::Value* valFromPred = nullptr;
+                // 找到来自 otherBB 和 curr 的值
+                IR::Value* valFromOther = nullptr;
                 IR::Value* valFromCurr = nullptr;
                 for (unsigned i = 0; i < inst->getNumOperands(); i += 2) {
                     auto* bb = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
-                    if (bb == singlePred) valFromPred = inst->getOperand(i);
+                    if (bb == otherBB) valFromOther = inst->getOperand(i);
                     if (bb == curr) valFromCurr = inst->getOperand(i);
                 }
-                if (!valFromPred || !valFromCurr) continue;
+                if (!valFromOther || !valFromCurr) continue;
 
-                IR::Value* trueVal = currIsTrue ? valFromCurr : valFromPred;
-                IR::Value* falseVal = currIsTrue ? valFromPred : valFromCurr;
+                IR::Value* trueVal = currIsTrue ? valFromCurr : valFromOther;
+                IR::Value* falseVal = currIsTrue ? valFromOther : valFromCurr;
 
                 // 创建 SELECT: select cond, trueVal, falseVal
                 static int selCnt = 0;
@@ -146,11 +176,16 @@ bool ifConversion(IR::Module* mod) {
 
             if (!anyConverted) continue;
 
-            // 修改 CFG：将条件分支中对 singleSucc 的引用改为 curr
-            if (trueDest == singleSucc) {
+            // 修改 CFG：将条件分支中对 otherDest 的引用改为 curr。
+            //   形态 1：otherDest == singleSucc，改 singleSucc 引用 → curr（原有行为）
+            //   形态 2：otherDest == 空中间块，改 otherDest 引用 → curr（空块变不可达，
+            //           由后续 removeUnreachableBlocks 清理）
+            // 改后 predBr 形如 br cond, curr, curr，由 simplifyCFG 的
+            // foldSameTargetBranches 折叠为无条件 br curr，进而触发块合并。
+            if (trueDest == otherDest) {
                 predBr->setOperand(1, curr);
             }
-            if (falseDest == singleSucc) {
+            if (falseDest == otherDest) {
                 predBr->setOperand(2, curr);
             }
 

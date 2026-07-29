@@ -2818,8 +2818,12 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
     // eliminating 2 branches per select. This is QEMU-safe (only uses t0/t1,
     // does not change register allocation).
     std::string rd = getValueReg(&inst);
-    std::string dest = rd.empty() ? "t0" : rd;
     bool isFloat = inst.getType()->isFloat();
+    // For float SELECT, dest must be a float register (ft0 when spilled);
+    // integer SELECT uses t0 when spilled. fmv.s requires BOTH operands in
+    // float regs, so an integer dest for a float result is illegal on RV64
+    // (caused 95_float link errors: `fmv.s ft2, t0`).
+    std::string dest = rd.empty() ? (isFloat ? "ft0" : "t0") : rd;
 
     if (!isFloat) {
         auto* trueVal = inst.getOperand(1);
@@ -2951,42 +2955,103 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
             }
             // condNeedsLoad: fall back (not enough scratch regs)
         }
+
+        // Pattern E: general-case branchless select for integer operands not
+        // matched by A–D (both variables, or constants ≠ 0/1).
+        //   dest = fv + (tv - fv) * cond     (cond is 0/1)
+        //   subw  inter, tv, fv      ; inter = tv - fv  (tv consumed)
+        //   mulw  inter, inter, cond ; inter = (tv-fv) * cond  (BOOM: 1-cycle mul)
+        //   addw  dest, fv, inter    ; dest = fv + inter
+        // fv is read twice (subw, addw) so it must survive; tv is consumed by
+        // subw so its scratch doubles as the intermediate; cond is consumed by
+        // mulw. Scratch: t0/t1/t2 (t2 available per emitSelect contract).
+        //
+        // Load order is significant: emitStackLoad reuses t2 as a temp for large
+        // offsets, and loadToReg's alloca path reuses t1. So cond→t0 and tv→t1
+        // are loaded first (their temps may hit t2/t1 while free), and fv→t2 is
+        // loaded last (its load only touches t2, preserving cond/tv in t0/t1).
+        // When dest=="t0" (spill), t0 may hold cond (consumed before addw), so
+        // it stays free to receive the final result. t1 is always free for the
+        // dedicated intermediate when tv is in a register.
+        {
+            std::string condReg = getValueReg(inst.getOperand(0));
+            std::string tvReg   = getValueReg(trueVal);
+            std::string fvReg   = getValueReg(falseVal);
+
+            std::string code;
+            std::string cond = condReg;
+            std::string tv   = tvReg;
+            std::string fv   = fvReg;
+            std::string inter;
+
+            // Phase 1: load cond → t0 (may temp-clobber t2/t1; both free now).
+            if (cond.empty()) {
+                code += loadToReg(inst.getOperand(0), "t0");
+                cond = "t0";
+            }
+            // Phase 2: load tv → t1; its scratch is reused as the intermediate.
+            if (tv.empty()) {
+                code += loadToReg(trueVal, "t1");
+                tv = "t1"; inter = "t1";
+            }
+            // Phase 3: load fv → t2 last (only touches t2; cond/tv preserved).
+            if (fv.empty()) {
+                code += loadToReg(falseVal, "t2");
+                fv = "t2";
+            }
+            // Phase 4: tv was in a register → t1 is free; use it as intermediate.
+            if (inter.empty()) inter = "t1";
+
+            code += "  subw    " + inter + ", " + tv + ", " + fv + "\n";
+            code += "  mulw    " + inter + ", " + inter + ", " + cond + "\n";
+            code += "  addw    " + dest + ", " + fv + ", " + inter + "\n";
+            if (rd.empty()) code += storeFromReg(&inst, dest);
+            emitter.emitText(code);
+            return;
+        }
     }
 
-    // Fallback: branch-based lowering (for float or non-constant-operand integer)
+    // Fallback: branch-based lowering.
+    // Reached for float SELECT (integer SELECT is fully handled by Patterns A–E
+    // above, which always return). Kept general for any future integer case.
+    //
+    // ★ Float scratch discipline: cond is integer (0/1 from ICMP), loaded into
+    //   t0 and dead after beqz. trueVal/falseVal are float and MUST be loaded
+    //   into a FLOAT scratch register — mixing fmv.s with an integer source
+    //   (e.g. `fmv.s ft2, t0`) is illegal on RV64 and caused 95_float link
+    //   errors. dest is already a float register for float SELECT (ft0/rd).
     static int selectLabelCounter = 0;
     int labelId = selectLabelCounter++;
     std::string labelFalse = ".Lselect_false_" + std::to_string(labelId);
     std::string labelEnd   = ".Lselect_end_"   + std::to_string(labelId);
+
+    // Float scratch for loading spilled trueVal/falseVal (ft1 is the established
+    // float-op scratch, see emitBinaryFloatOp). Must differ from dest.
+    std::string fscratch = (isFloat && dest == "ft0") ? "ft1" : "ft0";
 
     std::string code;
     std::string condReg = getValueReg(inst.getOperand(0));
     std::string trueReg = getValueReg(inst.getOperand(1));
     std::string falseReg = getValueReg(inst.getOperand(2));
 
-    // 1. Load cond into its register or t0
+    // 1. Load cond (integer 0/1) into its register or t0
     std::string cond = condReg;
     if (cond.empty()) {
         code += loadToReg(inst.getOperand(0), "t0");
         cond = "t0";
     }
 
-    // 2. beqz cond, false_label  (cond is dead after this)
+    // 2. beqz cond, false_label  (cond is dead after this; t0 free for reuse)
     code += "  beqz    " + cond + ", " + labelFalse + "\n";
 
     // 3. True path: load trueVal and move to dest
-    //    cond is dead, so t0 is free for reuse (if cond was in t0)
     std::string tv = trueReg;
     if (tv.empty()) {
-        code += loadToReg(inst.getOperand(1), "t0");
-        tv = "t0";
+        code += loadToReg(inst.getOperand(1), isFloat ? fscratch : "t0");
+        tv = isFloat ? fscratch : "t0";
     }
     if (dest != tv) {
-        if (isFloat) {
-            code += "  fmv.s   " + dest + ", " + tv + "\n";
-        } else {
-            code += "  mv      " + dest + ", " + tv + "\n";
-        }
+        code += std::string("  ") + (isFloat ? "fmv.s" : "mv") + "  " + dest + ", " + tv + "\n";
     }
     code += "  j       " + labelEnd + "\n";
 
@@ -2994,15 +3059,11 @@ void TargetCodeGen::emitSelect(IR::Instruction& inst) {
     code += labelFalse + ":\n";
     std::string fv = falseReg;
     if (fv.empty()) {
-        code += loadToReg(inst.getOperand(2), "t0");
-        fv = "t0";
+        code += loadToReg(inst.getOperand(2), isFloat ? fscratch : "t0");
+        fv = isFloat ? fscratch : "t0";
     }
     if (dest != fv) {
-        if (isFloat) {
-            code += "  fmv.s   " + dest + ", " + fv + "\n";
-        } else {
-            code += "  mv      " + dest + ", " + fv + "\n";
-        }
+        code += std::string("  ") + (isFloat ? "fmv.s" : "mv") + "  " + dest + ", " + fv + "\n";
     }
     code += labelEnd + ":\n";
 

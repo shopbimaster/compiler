@@ -103,6 +103,20 @@ std::vector<IR::Instruction*> scheduleSegment(const std::vector<IR::Instruction*
         }
     }
 
+    // 防御：如果有循环依赖（PHI 回边等）导致 schedule 不完整，
+    // 追加未调度的指令（保持原顺序），避免指令丢失。
+    // 指令丢失会导致 scheduleBB 的 extracted 中残留 unique_ptr，
+    // 函数结束时销毁互相引用的指令 → use-after-free。
+    if (schedule.size() < seg.size()) {
+        for (auto* inst : seg) {
+            bool scheduled = false;
+            for (auto* s : schedule) {
+                if (s == inst) { scheduled = true; break; }
+            }
+            if (!scheduled) schedule.push_back(inst);
+        }
+    }
+
     // 如果顺序没变，返回原顺序
     if (schedule == seg) return seg;
     return schedule;

@@ -227,6 +227,122 @@ bool isRegDeadInBB(const std::vector<std::string>& lines, size_t start, const st
     return false;  // 到达文件末尾，保守返回 false（可能 live-out）
 }
 
+// ★ 全局死寄存器检查：从 startIdx 开始，沿所有可达路径扫描，
+// 如果 reg 在所有路径上都被重定义（kill）后才被读取，则返回 true。
+// 使用 worklist 处理分支，visited 集合避免重复分析。
+// 这是 isRegDeadInBB 的跨基本块补充：isRegDeadInBB 在标签处保守返回 false，
+// 而 isRegDeadGlobal 会沿跳转目标继续追踪，正确处理跨 BB 的寄存器死亡。
+//
+// 典型场景：addw t3, s5, t4; mv s4, t3; ...; j .Lloop_cond
+//   isRegDeadInBB 遇到 .Lloop_cond: 标签返回 false（保守），
+//   但 t3 在循环回边后被重定义，isRegDeadGlobal 追踪到 kill 返回 true。
+bool isRegDeadGlobal(const std::vector<std::string>& lines, size_t startIdx,
+                     const std::string& reg,
+                     const std::unordered_map<std::string, size_t>& labelMap) {
+    if (reg.empty()) return false;
+
+    std::set<size_t> visited;
+    std::vector<size_t> worklist;
+    worklist.push_back(startIdx);
+
+    while (!worklist.empty()) {
+        size_t pos = worklist.back();
+        worklist.pop_back();
+
+        for (size_t k = pos; k < lines.size(); ++k) {
+            // 已分析过的位置：从它出发 reg 已确认死亡（否则早已 return false）
+            if (visited.count(k)) {
+                break;
+            }
+            visited.insert(k);
+
+            const std::string& l = lines[k];
+            if (l.empty()) continue;
+
+            // 标签
+            if (isLabel(l)) {
+                std::string trimmed = l;
+                while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+                    trimmed = trimmed.substr(1);
+                // 非 .L 标签 = 函数入口/全局符号 = 函数边界
+                if (!trimmed.empty() && trimmed[0] != '.') {
+                    break;  // 函数边界，此路径结束
+                }
+                continue;  // 局部标签，继续 fall-through
+            }
+
+            size_t p = 0;
+            while (p < l.size() && (l[p] == ' ' || l[p] == '\t')) ++p;
+            if (p >= l.size()) continue;  // 纯空白
+            if (l[p] == '#') continue;    // 注释
+            if (l[p] == '.') continue;    // 指令（.p2align 等）
+
+            std::string opN = extractOpName(l);
+
+            // call：杀死 caller-saved 寄存器（t0-t6, a0-a7, ra）
+            if (opN == "call") {
+                if (reg[0] == 't' || reg[0] == 'a' || reg == "ra") {
+                    break;  // caller-saved 被 call 杀死
+                }
+                continue;  // callee-saved 跨 call 存活，继续扫描
+            }
+
+            // ret/jr/tail：函数退出/间接跳转 - 此路径结束
+            if (opN == "ret" || opN == "jr" || opN == "tail") {
+                break;
+            }
+
+            // 检查 reg 是否在此指令中出现
+            if (regInStr(l, reg)) {
+                if (instrKillsReg(l, reg)) {
+                    break;  // reg 被重定义（kill）- 此路径上 reg 死亡
+                }
+                return false;  // reg 被读取 - 存活！
+            }
+
+            // 无条件跳转 j：添加目标到 worklist，停止 fall-through
+            if (opN == "j") {
+                std::string jRd, jRs, jImm;
+                if (tryMatch(l, "j", jRd, jRs, jImm) && !jRd.empty()) {
+                    auto it = labelMap.find(jRd);
+                    if (it != labelMap.end()) {
+                        worklist.push_back(it->second);
+                    }
+                    // 目标不在 labelMap（外部函数）= 死路径
+                }
+                break;  // 无 fall-through
+            }
+
+            // 条件分支：添加目标到 worklist，继续 fall-through
+            if (opN == "beqz" || opN == "bnez" || opN == "blez" || opN == "bgez" ||
+                opN == "bltz" || opN == "bgtz") {
+                std::string brRs, brLabel;
+                if (tryMatchBranch(l, opN, brRs, brLabel) && !brLabel.empty()) {
+                    auto it = labelMap.find(brLabel);
+                    if (it != labelMap.end()) {
+                        worklist.push_back(it->second);
+                    }
+                }
+                continue;  // fall-through 也可能
+            }
+            if (opN == "beq" || opN == "bne" || opN == "blt" || opN == "bge" ||
+                opN == "bltu" || opN == "bgeu") {
+                std::string brRd, brRs, brLabel;
+                if (tryMatch(l, opN, brRd, brRs, brLabel) && !brLabel.empty()) {
+                    auto it = labelMap.find(brLabel);
+                    if (it != labelMap.end()) {
+                        worklist.push_back(it->second);
+                    }
+                }
+                continue;  // fall-through 也可能
+            }
+
+            // 普通指令：继续扫描
+        }
+    }
+    return true;  // 所有路径上 reg 都被 kill 才被读取 → 死亡
+}
+
 
 std::string peepholeOptimize(const std::string& asmCode) {
     auto lines = splitLines(asmCode);
@@ -783,6 +899,18 @@ std::string peepholeOptimize(const std::string& asmCode) {
             lines = std::move(compact);
         }
 
+        // ★ 构建 label → index 映射，供 isRegDeadGlobal 跨 BB 追踪使用
+        std::unordered_map<std::string, size_t> labelMap;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (isLabel(lines[i])) {
+                std::string trimmed = lines[i];
+                while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+                    trimmed = trimmed.substr(1);
+                std::string labelName = trimmed.substr(0, trimmed.size() - 1);
+                labelMap[labelName] = i;
+            }
+        }
+
         std::vector<std::string> result;
         result.reserve(lines.size());
 
@@ -1198,7 +1326,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
                                 }
                                 if (usedAsSrc &&
                                     opRd != mvRs &&  // op 不能覆写 rs
-                                    isRegDeadInBB(lines, i + 2, mvRd)) {
+                                    (isRegDeadInBB(lines, i + 2, mvRd) ||
+                                     isRegDeadGlobal(lines, i + 2, mvRd, labelMap))) {
                                     std::string newLine = "  " + opName + "    " + opRd + ", " + newRs;
                                     if (!newRs2.empty()) {
                                         newLine += ", " + newRs2;
@@ -1235,7 +1364,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
                             auto closePos = stOff.find(')', parenPos);
                             std::string addrReg = stOff.substr(parenPos + 1, closePos - parenPos - 1);
                             // rd 不能出现在地址中
-                            if (addrReg != mvRd && isRegDeadInBB(lines, i + 2, mvRd)) {
+                            if (addrReg != mvRd && (isRegDeadInBB(lines, i + 2, mvRd) ||
+                                                     isRegDeadGlobal(lines, i + 2, mvRd, labelMap))) {
                                 result.push_back("  " + opName + "      " + mvRs + ", " + stOff);
                                 ++i;
                                 matched = true;
@@ -1312,13 +1442,15 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 if (tryMatch(lines[i], "mv", mvRd, mvRs, imm)) {
                     std::string brRs, brLabel;
                     if (tryMatchBranch(lines[i + 1], "bnez", brRs, brLabel) && brRs == mvRd) {
-                        if (isRegDeadInBB(lines, i + 2, mvRd)) {
+                        if (isRegDeadInBB(lines, i + 2, mvRd) ||
+                            isRegDeadGlobal(lines, i + 2, mvRd, labelMap)) {
                             result.push_back("  bnez    " + mvRs + ", " + brLabel);
                             ++i;
                             matched = true;
                         }
                     } else if (tryMatchBranch(lines[i + 1], "beqz", brRs, brLabel) && brRs == mvRd) {
-                        if (isRegDeadInBB(lines, i + 2, mvRd)) {
+                        if (isRegDeadInBB(lines, i + 2, mvRd) ||
+                            isRegDeadGlobal(lines, i + 2, mvRd, labelMap)) {
                             result.push_back("  beqz    " + mvRs + ", " + brLabel);
                             ++i;
                             matched = true;
@@ -1367,8 +1499,13 @@ std::string peepholeOptimize(const std::string& asmCode) {
 
             // <op> rd, rs, rs2/imm; mv rd2, rd → <op> rd2, rs, rs2/imm
             if (!matched) {
+                // 跳过空白/注释/对齐指令寻找下一条真实指令，但遇到标签（BB 边界）即停止。
+                // 标签意味着 mv 处于基本块起点，可能有多个前驱；若 OP 仅在其中一条路径上
+                // 执行（OP 不支配 mv），跨标签融合会使未经过 OP 的路径丢失对 rd 的写入。
+                // （h-9-01 回归根因：addiw s4; .Lmerge_17:; mv s6,s4 中 endif 路径跳过 addiw）
                 size_t nextIdx = i + 1;
-                while (nextIdx < lines.size() && isEmptyOrComment(lines[nextIdx])) {
+                while (nextIdx < lines.size() && isEmptyOrComment(lines[nextIdx]) &&
+                       !isLabel(lines[nextIdx])) {
                     nextIdx++;
                 }
                 if (nextIdx < lines.size()) {
@@ -1395,8 +1532,9 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     if (isThreeReg && tryMatch(lines[nextIdx], "mv", mvRd, mvRs, imm)) {
                         if (mvRs == opRd) {
                             // 安全条件：opRd 在 mv 之后必须死亡（合并后 opRd 不再被写入）
-                            // 使用 isRegDeadInBB 正确处理 BB 边界（标签行以 . 开头会被 isEmptyOrComment 误跳过）
-                            if (isRegDeadInBB(lines, nextIdx + 1, opRd)) {
+                            // 先用 isRegDeadInBB 快速检查（BB 内），不够再用 isRegDeadGlobal 跨 BB 追踪
+                            if (isRegDeadInBB(lines, nextIdx + 1, opRd) ||
+                                isRegDeadGlobal(lines, nextIdx + 1, opRd, labelMap)) {
                                 result.push_back("  " + opName + "    " + mvRd + ", " + opRs + ", " + opRs2);
                                 for (size_t j = i + 1; j < nextIdx; ++j) {
                                     result.push_back(lines[j]);
@@ -1418,7 +1556,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
                             if (tryMatch(lines[nextIdx], "mv", mvRd, mvRs, imm)) {
                                 if (mvRs == opRd) {
                                     // 安全条件：opRd 在 mv 之后必须死亡
-                                    if (isRegDeadInBB(lines, nextIdx + 1, opRd)) {
+                                    if (isRegDeadInBB(lines, nextIdx + 1, opRd) ||
+                                        isRegDeadGlobal(lines, nextIdx + 1, opRd, labelMap)) {
                                         result.push_back("  " + opName + "    " + mvRd + ", " + opRs + ", " + opRs2);
                                         for (size_t j = i + 1; j < nextIdx; ++j) {
                                             result.push_back(lines[j]);

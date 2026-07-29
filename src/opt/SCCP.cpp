@@ -356,7 +356,13 @@ bool sccpOnFunction(IR::Function* func) {
     std::queue<IR::Instruction*> ssaWorklist;
 
     // 当新块变为可执行时，其后继块的 PHI 节点需要重新求值，
-    // 因为新的入边可能提供了常量值。PHI 节点始终位于 BB 指令列表开头。
+    // 因为新的入边可能提供了常量值。
+    // ★ 不能假设 PHI 在块首：IfConversion 的 empty-else 转换 + SimplifyCFG 的
+    //   foldSinglePredBlock 会把指令合并到 PHI 之前（如 and_merge 块中 GEP/LOAD
+    //   排在 t24.phi 之前），破坏 "PHI 必须在块首" 不变量。若此处遇非 PHI 即
+    //   break，会漏掉后置 PHI，导致 SCCP 不重求值 → 误判常量（59_sort_test5 根因：
+    //   and_rhs_3 变可执行后 t24.phi 未重求值，保持错误的 CONSTANT(0)）。
+    //   因此扫描全部指令收集 PHI。
     auto enqueueSuccessorPhis = [&](IR::BasicBlock* bb) {
         auto* term = bb->getTerminator();
         if (!term) return;
@@ -377,7 +383,7 @@ bool sccpOnFunction(IR::Function* func) {
             for (auto& inst : succ->getInstructions()) {
                 if (inst->getOpcode() == IR::Instruction::Opcode::PHI)
                     ssaWorklist.push(inst.get());
-                else break; // PHI nodes always come first
+                // 不 break：PHI 可能不在块首（见上方注释）
             }
         }
     };

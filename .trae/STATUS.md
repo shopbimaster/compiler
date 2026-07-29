@@ -78,6 +78,51 @@ P6 启用 vs 基线（P1+P2+P4），3 次取最小值：
 
 **验证**：功能 95/100（同基线），性能 60/60 全 pass
 
+### 1.6 条件归约 IfConversion + Pattern E 无分支 SELECT（2026-07-29）
+
+**目标**：消除循环中 `if (cond) { acc += expr; }` 的分支，转化为无分支 `acc += expr * cond`，避免 BOOM 14 周期误预测惩罚。
+
+**改动 1 — IfConversion 扩展 empty-else 菱形**（[IfConversion.cpp](file:///d:/VSCodeProjects/compiler/src/opt/IfConversion.cpp)）：
+
+- 原仅处理"另一臂 == merge 块"的形态 1；新增**形态 2**：另一臂是仅含 `br merge` 的空中间块（`endif`）。
+- 典型场景：`if (cond) { acc += expr; }` 编译为 `br cond, then, endif; endif: br merge; merge: phi [t,then],[acc,endif]`。
+- 形态 2 的 phi 来源块为 `otherDest`（空中间块），非 `singlePred`。
+- CFG 修改：将条件分支对 `otherDest` 的引用改为 `curr` → `br cond, curr, curr`，由 simplifyCFG 的 `foldSameTargetBranches` 折叠为无条件 `br curr`，进而合并块使循环体变单 BB。
+
+**改动 2 — Pattern E 通用无分支 SELECT**（[TargetCodeGen.cpp:2955](file:///d:/VSCodeProjects/compiler/src/backend/TargetCodeGen.cpp)）：
+
+- 整数 SELECT（A/B/C/D 模式未命中时）用 `dest = fv + (tv - fv) * cond`：
+  - `subw inter, tv, fv; mulw inter, inter, cond; addw dest, fv, inter`
+  - BOOM mul 单周期全流水，3 条指令无分支。
+- 加载顺序精心设计：cond→t0、tv→t1（scratch 复用为 inter）、fv→t2 最后加载，避免 emitStackLoad 复用 t2/loadToReg 复用 t1 的冲突。
+
+**改动 3 — float SELECT 修复**（[TargetCodeGen.cpp:2820](file:///d:/VSCodeProjects/compiler/src/backend/TargetCodeGen.cpp)）：
+
+- **bug**：float SELECT 走 fallback 分支路径时，spilled trueVal/falseVal 被 `loadToReg(..., "t0")` 加载到整数寄存器，再 `fmv.s ft2, t0` → RV64 非法操作数（95_float 链接错误）。
+- **修复**：(1) `dest` 对 float SELECT 用 `ft0`（spilled 时）而非 `t0`；(2) float tv/fv 用 float scratch（`ft0`/`ft1`）加载，保证 `fmv.s` 两操作数均为浮点寄存器。
+- Pattern E 已在 `if (!isFloat)` 守卫内，仅整数生效；float 走 fallback 分支路径（现已修正）。
+
+**改动 4 — SCCP enqueueSuccessorPhis 修复**（[SCCP.cpp](file:///d:/VSCodeProjects/compiler/src/opt/SCCP.cpp)）：
+
+- **bug**：`enqueueSuccessorPhis` 遇非 PHI 指令即 `break`，假设 PHI 必在块首。IfConversion 形态 2 + simplifyCFG `foldSinglePredBlock` 会把指令合并到 PHI 之前，破坏该不变量 → 漏掉后置 PHI 重求值 → 误判常量（59_sort_test5 排序错误，`t24.phi` 被误判为 CONSTANT(0)）。
+- **修复**：扫描块内全部指令收集 PHI（不 break），与 SimplifyCFG 的 `normalizePhiNodes`/`nullifyPhiEntriesForPredecessor` 一致。
+
+**配套**：Optimizer.cpp 用 `PASS_CALL(ifConversion)` 包裹支持 `OPT_DISABLE`；`IFCONV_NOSIMPLE=1` 跳过 ifConversion 后的 simplifyCFG 做对照。
+
+**验证**：
+
+- huffman-01 `_and`/`_or`/`_xor` 主循环变为**单 BB 无分支**：`subw/mulw/addw` 替代 `bnez`，回边为无条件 `j`。
+- 功能 **97/100**（较基线 95 提升：85_long_code/86_long_code2 超时解除；3 DIFF 均预存：62_percolation/68_brainfk/71_full_conn）。
+- 95_float 修复后 PASS；59_sort_test5 PASS；crypto-1/2/3 PASS；huffman-01 PASS。
+
+### 1.7 71_full_conn 预存回归诊断（2026-07-29，未修复，待单独处理）
+
+- **症状**：`model(a)` 返回 1（"cat"）应为 0（"dog"），所有 -O1 模式均错；-O0 正确。
+- **二分定位**：017ab02 PASS → b24d9ab FAIL（A 组：支配树 L/R + GVN 全支配）。9e690c4/aaf20de/当前均 FAIL。
+- **非因**：逐个 `OPT_DISABLE` 关闭 ifConversion/earlyReturnToSelect/sccp/inlineExpansion/mem2reg/globalValueNumbering 均仍 FAIL → 非 GVN pass 本身，疑似 A1 支配树 L/R 区间编码 bug 影响某个使用 dominance 的 pass。
+- **与本轮 IfConversion 工作无关**：b24d9ab 已提交且推送，71 在本轮改动前后均 FAIL。
+- **后续**：需单独排查支配树 L/R 编码（A1）对 GVN/SCEV 等 dominance 查询的影响。
+
 ### 1.1 P1 ReductionSplitting v2 关键设计
 
 - **v1 bug**：克隆体用同一个 IV 值但步长 ×N → 跳过 3/4 项且结果 ×N（已修复）

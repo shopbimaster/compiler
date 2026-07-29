@@ -362,9 +362,14 @@ void runO2(IR::Module* mod) {
     // 阶段 6：全局清理与最终优化
     // ================================================================
 
-    // 6a. IfConversion：条件转换
-    if (ifConversion(mod)) {
-        simplifyCFG(mod);  // 清理 IfConversion 产生的同目标 COND_BR
+    // 6a. IfConversion：条件转换（含 empty-else 菱形 → 条件归约无分支化）
+    //     simplifyCFG 折叠 IfConversion 产生的同目标 COND_BR 并合并块，
+    //     使条件归约循环体变为单 BB（利于 LoopUnrolling/双发射）。
+    //     ★ SCCP 的 enqueueSuccessorPhis 已修复为不假设 PHI 在块首
+    //       （foldSinglePredBlock 会把指令合并到 PHI 之前），故 simplifyCFG
+    //       可安全运行，不会导致 SCCP 误判 t24.phi 为常量。
+    if (PASS_CALL(ifConversion)) {
+        if (!std::getenv("IFCONV_NOSIMPLE")) simplifyCFG(mod);  // 调试开关：跳过 simplifyCFG 对照
         constantFolding(mod);
         deadCodeElimination(mod);
     }
