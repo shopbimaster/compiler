@@ -8,10 +8,211 @@
 #include "opt/Optimizer.h"
 #include <climits>
 #include <cstdint>
+#include <set>
 #include <vector>
 
 namespace Opt {
 namespace {
+
+// ================================================================
+// 非负值分析：计算可证明为非负的 Value 集合
+// 用于 SDIV/SREM 强度削减（x/2^n → x>>n, x%2^n → x&(2^n-1)）
+//
+// 传播规则（基于 C 有符号整数溢出是 UB 的假设）：
+//   - ConstantInt >= 0 → 非负
+//   - ICMP 结果（0 或 1）→ 非负
+//   - ADD x,y → 若 x,y 均非负 → 非负（溢出为 UB）
+//   - MUL x,y → 若 x,y 均非负 → 非负（溢出为 UB）
+//   - SUB x,c → 若 x 非负且 c <= 0 → 非负（x - 负数 = x + 正数）
+//   - SDIV x,c → 若 x 非负且 c > 0 → 非负
+//   - SREM x,c → 若 x 非负且 c > 0 → 非负
+//   - ASHR x,c → 若 x 非负 → 非负
+//   - SHL x,c → 若 x 非负 → 非负（溢出为 UB）
+//   - AND/OR/XOR x,y → 若 x,y 均非负 → 非负
+//   - SELECT → 若两个分支均非负 → 非负
+//   - PHI → 若所有 incoming value 均非负 → 非负（归纳证明）
+//   - ALLOCA/LOAD → 若 alloca 的所有 STORE 均为非负值 → LOAD 非负
+// ================================================================
+using NonNegSet = std::set<IR::Value*>;
+
+// 非负 alloca 集合：所有 STORE 到此 alloca 的值均为非负
+// 从非负 alloca LOAD 的值也是非负
+// 使用归纳证明：初始值非负 + 变换保持非负 → 所有 LOAD 非负
+std::set<IR::Instruction*> g_nonNegAllocas;
+
+bool isNonNegativeValue(IR::Value* v, const NonNegSet& nonNeg);
+
+// 检查指令 inst 的结果是否非负（给定当前 nonNeg 集合）
+bool computeInstNonNeg(IR::Instruction* inst, const NonNegSet& nonNeg) {
+    using Opc = IR::Instruction::Opcode;
+    auto op = inst->getOpcode();
+
+    // ICMP 结果总是 0 或 1 → 非负
+    if (op == Opc::ICMP) return true;
+
+    // LOAD from non-negative alloca → 非负
+    if (op == Opc::LOAD && inst->getNumOperands() >= 1) {
+        auto* ptr = inst->getOperand(0);
+        if (auto* ptrInst = dynamic_cast<IR::Instruction*>(ptr)) {
+            if (g_nonNegAllocas.count(ptrInst)) return true;
+        }
+    }
+
+    if (inst->getNumOperands() < 2) {
+        // SELECT 有 3 个操作数
+        if (op == Opc::SELECT && inst->getNumOperands() >= 3) {
+            return isNonNegativeValue(inst->getOperand(1), nonNeg) &&
+                   isNonNegativeValue(inst->getOperand(2), nonNeg);
+        }
+        return false;
+    }
+
+    auto* l = inst->getOperand(0);
+    auto* r = inst->getOperand(1);
+
+    switch (op) {
+    case Opc::ADD:
+        return isNonNegativeValue(l, nonNeg) && isNonNegativeValue(r, nonNeg);
+    case Opc::MUL:
+        return isNonNegativeValue(l, nonNeg) && isNonNegativeValue(r, nonNeg);
+    case Opc::SUB: {
+        bool lNN = isNonNegativeValue(l, nonNeg);
+        if (!lNN) return false;
+        if (auto* rc = dynamic_cast<IR::ConstantInt*>(r)) {
+            return rc->getValue() <= 0;
+        }
+        return false;
+    }
+    case Opc::SDIV: {
+        bool lNN = isNonNegativeValue(l, nonNeg);
+        if (!lNN) return false;
+        if (auto* rc = dynamic_cast<IR::ConstantInt*>(r)) {
+            return rc->getValue() > 0;
+        }
+        return isNonNegativeValue(r, nonNeg);
+    }
+    case Opc::SREM: {
+        bool lNN = isNonNegativeValue(l, nonNeg);
+        if (!lNN) return false;
+        if (auto* rc = dynamic_cast<IR::ConstantInt*>(r)) {
+            return rc->getValue() > 0;
+        }
+        return false;
+    }
+    case Opc::ASHR:
+        return isNonNegativeValue(l, nonNeg);
+    case Opc::SHL:
+        return isNonNegativeValue(l, nonNeg);
+    case Opc::AND:
+    case Opc::OR:
+    case Opc::XOR:
+        return isNonNegativeValue(l, nonNeg) && isNonNegativeValue(r, nonNeg);
+    default:
+        return false;
+    }
+}
+
+bool isNonNegativeValue(IR::Value* v, const NonNegSet& nonNeg) {
+    if (!v) return false;
+    if (nonNeg.count(v)) return true;
+    if (auto* ci = dynamic_cast<IR::ConstantInt*>(v)) {
+        return ci->getValue() >= 0;
+    }
+    // 检查是否是从非负 alloca 的 LOAD
+    if (auto* inst = dynamic_cast<IR::Instruction*>(v)) {
+        if (inst->getOpcode() == IR::Instruction::Opcode::LOAD && inst->getNumOperands() >= 1) {
+            auto* ptr = inst->getOperand(0);
+            if (auto* ptrInst = dynamic_cast<IR::Instruction*>(ptr)) {
+                if (g_nonNegAllocas.count(ptrInst)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// 检查 alloca 是否为非负：所有 STORE 到此 alloca 的值均为非负
+// 使用假设归纳：假设此 alloca 非负 → LOAD 非负 → 变换结果非负 → STORE 非负
+bool isAllocaNonNeg(IR::Instruction* alloca, const NonNegSet& nonNeg) {
+    using Opc = IR::Instruction::Opcode;
+    // 临时假设此 alloca 非负
+    g_nonNegAllocas.insert(alloca);
+
+    auto* func = alloca->getParent() ? alloca->getParent()->getParent() : nullptr;
+    if (!func) {
+        g_nonNegAllocas.erase(alloca);
+        return false;
+    }
+
+    bool allStoresNonNeg = true;
+    int storeCount = 0;
+    for (auto& bb : func->getBlocks()) {
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() == Opc::STORE && inst->getNumOperands() >= 2) {
+                // STORE val, ptr
+                if (inst->getOperand(1) == alloca) {
+                    ++storeCount;
+                    if (!isNonNegativeValue(inst->getOperand(0), nonNeg)) {
+                        allStoresNonNeg = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!allStoresNonNeg) break;
+    }
+
+    if (!allStoresNonNeg || storeCount == 0) {
+        g_nonNegAllocas.erase(alloca);
+        return false;
+    }
+    // 保留 alloca 在 g_nonNegAllocas 中（假设成立）
+    return true;
+}
+
+// 计算模块中所有可证明为非负的 Value（固定点迭代）
+NonNegSet computeNonNegative(IR::Module* mod) {
+    NonNegSet nonNeg;
+    g_nonNegAllocas.clear();
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto& func : mod->getFunctions()) {
+            if (func->isExternal()) continue;
+            for (auto& bb : func->getBlocks()) {
+                for (auto& inst : bb->getInstructions()) {
+                    if (nonNeg.count(inst.get())) continue;
+                    using Opc = IR::Instruction::Opcode;
+                    auto op = inst->getOpcode();
+
+                    if (op == Opc::PHI) {
+                        bool allNN = true;
+                        for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                            if (!isNonNegativeValue(inst->getOperand(i), nonNeg)) {
+                                allNN = false;
+                                break;
+                            }
+                        }
+                        if (allNN && inst->getNumOperands() >= 2) {
+                            nonNeg.insert(inst.get());
+                            changed = true;
+                        }
+                    } else if (op == Opc::ALLOCA) {
+                        // 尝试证明此 alloca 非负
+                        // ★ 已证明非负的 alloca 在 g_nonNegAllocas 中，跳过避免重复处理
+                        if (g_nonNegAllocas.count(inst.get())) continue;
+                        if (isAllocaNonNeg(inst.get(), nonNeg)) {
+                            changed = true;
+                        }
+                    } else if (computeInstNonNeg(inst.get(), nonNeg)) {
+                        nonNeg.insert(inst.get());
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    return nonNeg;
+}
 
 // ---- 判断 int64_t 是否等于 2^n，若是则返回 n ----
 int isPowerOfTwo(int64_t val) {
@@ -46,7 +247,7 @@ void replaceWithNewInst(
 
 // ---- 尝试对一条指令做代数化简，成功返回 true ----
 // ---- 新指令会被插入到 BB 中，旧指令被删除 ----
-bool trySimplify(IR::Instruction* inst) {
+bool trySimplify(IR::Instruction* inst, const NonNegSet& nonNeg) {
     auto op = inst->getOpcode();
     using Opc = IR::Instruction::Opcode;
     auto* bb = inst->getParent();
@@ -95,6 +296,34 @@ bool trySimplify(IR::Instruction* inst) {
                     }
                 }
             }
+        }
+    }
+
+    // ================================================================
+    // 互反恒等式消除：x + (-x) → 0
+    // 其中 -x = SUB(0, x)。GVN 合并等价的 _and(a,b) 后，内联的 _or(a,b) 展开
+    // 为 _xor(_xor(a,b), _and(a,b))，其中 _xor(x,y) = -x - y = SUB(0, ADD(x,y))，
+    // 最终产生 ADD(t, SUB(0, t)) 模式。此化简将 _or 结果折叠为常量 0。
+    // ================================================================
+    if (op == Opc::ADD) {
+        auto isNegOf = [](IR::Value* maybeNeg, IR::Value* x) -> bool {
+            auto* negInst = dynamic_cast<IR::Instruction*>(maybeNeg);
+            if (!negInst || negInst->getOpcode() != Opc::SUB) return false;
+            if (negInst->getNumOperands() < 2) return false;
+            auto* subL = negInst->getOperand(0);
+            auto* subR = negInst->getOperand(1);
+            auto* ci = dynamic_cast<IR::ConstantInt*>(subL);
+            return ci && ci->getValue() == 0 && subR == x;
+        };
+        if (isNegOf(r, l) || isNegOf(l, r)) {
+            auto* zero = IR::ConstantInt::get(
+                dynamic_cast<IR::IntegerType*>(inst->getType()), 0);
+            inst->replaceAllUsesWith(zero);
+            inst->dropAllUses();
+            for (auto it = bb->begin(); it != bb->end(); ++it) {
+                if (it->get() == inst) { bb->erase(it); break; }
+            }
+            return true;
         }
     }
 
@@ -225,11 +454,9 @@ bool trySimplify(IR::Instruction* inst) {
             auto* i32 = dynamic_cast<IR::IntegerType*>(rc->getType());
             if (!i32) return false;
 
-            // 检查左操作数是否可证明为非负（仅常量检查）
-            bool lhsNonNeg = false;
-            if (auto* lc = dynamic_cast<IR::ConstantInt*>(l)) {
-                lhsNonNeg = (lc->getValue() >= 0);
-            }
+            // 检查左操作数是否可证明为非负
+            // 使用非负值分析（含 PHI 归纳、ADD/MUL/SDIV 传播）
+            bool lhsNonNeg = isNonNegativeValue(l, nonNeg);
 
             if (op == Opc::SDIV && lhsNonNeg) {
                 // x / 2^n  →  x >> n    (仅 x >= 0 时正确)
@@ -568,12 +795,17 @@ bool algebraicSimplification(IR::Module* mod) {
     bool anyChanged = false;
     while (changed) {
         changed = false;
+        // ★ 每轮重算非负值集合：trySimplify 会删除/插入指令，若仅算一次，
+        //   nonNeg 中的 IR::Value* 可能指向已释放指令；一旦该地址被新指令
+        //   复用，nonNeg.count() 会误判 → SDIV 强度削减产生错码。
+        //   每轮重算保证 nonNeg 只含当前存活指令，O(N) 开销可接受。
+        NonNegSet nonNeg = computeNonNegative(mod);
         for (auto& func : mod->getFunctions()) {
             if (func->isExternal()) continue;
             for (auto& bb : func->getBlocks()) {
                 for (auto it = bb->begin(); it != bb->end(); ) {
                     // 强度削减会修改 BB 结构，需重新扫描
-                    if (trySimplify(it->get())) {
+                    if (trySimplify(it->get(), nonNeg)) {
                         changed = true;
                         anyChanged = true;
                         it = bb->begin(); // 从头重扫

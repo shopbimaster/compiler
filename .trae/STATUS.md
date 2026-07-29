@@ -131,6 +131,24 @@ P6 启用 vs 基线（P1+P2+P4），3 次取最小值：
 - **与本轮 IfConversion 工作无关**：b24d9ab 已提交且推送，71 在本轮改动前后均 FAIL。
 - **后续**：需单独排查支配树 L/R 编码（A1）对 GVN/SCEV 等 dominance 查询的影响。
 
+### 1.9 test18 TLE 诊断与修复（2026-07-29）
+
+**症状**：FPGA test18 报告 5 个 TLE：`03_sort1/2/3`、`h-1-01`、`crypto-1`（均 300s 超时）。test16（599e662）同批用例分别为 0.13s/1.17s/5.2s。
+
+**根因诊断（关键证据）**：
+
+- **h-1-01 二进制与 test16 完全相同**：逐项 `OPT_DISABLE` 关闭 P1/P2/P4/P6/P8 后汇编 `diff` 完全一致（131 条指令，fun 已 TCE 为循环）。h-1-01 不被本轮任何优化触碰 → test16 能跑 1.17s，test18 却 TLE，**只可能是 test18 用了过期/破损构建**（符合 project_memory 记录的 WSL/git mtime 陷阱：部分文件未重编导致行为与源码不一致）。
+- **QEMU 复测全部正确且快**：当前构建（22:53，含未提交改动）对 5 个用例输出全 MATCH，h-1-01=0.11s / crypto-1=0.11s / 03_sort1=0.11s。交叉比对 test16 FPGA/QEMU 倍率（03_sort≈1.2×、h-1≈10×、crypto≈49×），当前构建在 FPGA 预计 0.13s/1.1s/5s，远未到 300s。
+- crypto-1 在 test13/14/17 多次 WA（LSR bug 期），进一步佐证 test18 来自破损中间构建。
+
+**实际改进（降低 FPGA I-cache 风险，非 TLE 根因但属真实收益）**：
+
+- **P2 LoopUnrolling 体积上限**（[LoopUnrolling.cpp](file:///d:/VSCodeProjects/compiler/src/opt/LoopUnrolling.cpp)）：展开后体指令数 ≤ 48 才允许该 factor，否则降级。原 P2 把 crypto-1 的 16 元素拷贝冷循环展开 16× 产生 ~112 条指令，使 pseudo_md5 从 548 膨胀到 727 条。加 cap 后 **crypto-1: 727→576**（-20.8%），03_sort 692→652，h-1-01 不变（131）。小循环仍享展开收益，大循环不再污染 I-cache。
+- **AlgebraicSimplification 安全修复**：`nonNeg` 集合改为每轮重算（原仅算一次，trySimplify 删/插指令后 `IR::Value*` 可能悬空，地址复用会致 SDIV 强度削减误判错码）。O(N) 开销可接受，大用例编译仍 <410ms。
+- **Optimizer.cpp**：GVN 后追加一次 `algebraicSimplification`，使 GVN 合并等价 `_and(a,b)` 后能匹配 `x+(0-x)→0`，折叠 crypto-1 的 `_or` 为常量 0。
+
+**验证（当前构建）**：功能 97/100（3 预存 DIFF）、h_functional O1 36/40（4 预存）、性能 60/60，5 个 TLE 用例 QEMU 输出全 MATCH。待 FPGA 重测确认。
+
 ### 1.1 P1 ReductionSplitting v2 关键设计
 
 - **v1 bug**：克隆体用同一个 IV 值但步长 ×N → 跳过 3/4 项且结果 ×N（已修复）

@@ -309,6 +309,25 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
         return false;
     }
 
+    // ★ P2-tune: 统计循环体（非终止）指令数，用于代码体积上限检查
+    //   展开后体积 = bodyInstCount * factor。BOOM I-cache 仅 32KB（16B/周期取指），
+    //   过大的展开体会污染 I-cache：如 crypto-1 的 16 元素拷贝循环（冷循环，每次
+    //   外层迭代仅执行 1 轮）被展开 16× 产生 ~112 条指令，使 pseudo_md5 从 548
+    //   膨胀到 727 条，挤占热点循环的 I-cache 空间。对低频循环得不偿失。
+    //   策略：展开后体指令数 ≤ MAX_UNROLLED_BODY 才允许该 factor，否则降级。
+    size_t bodyInstCount = 0;
+    for (auto& inst : bodyBB->getInstructions()) {
+        auto op = inst->getOpcode();
+        if (op == IR::Instruction::Opcode::BR ||
+            op == IR::Instruction::Opcode::COND_BR ||
+            op == IR::Instruction::Opcode::RET) continue;
+        ++bodyInstCount;
+    }
+    const size_t MAX_UNROLLED_BODY = 48;
+    auto bodyFits = [&](unsigned f) -> bool {
+        return bodyInstCount * f <= MAX_UNROLLED_BODY;
+    };
+
     // 推导或使用预设迭代次数
     int tc = loop.tripCount;
     if (tc < 0) tc = inferTripCount(loop.header, loop.body, func);
@@ -321,16 +340,18 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     // 按从大到小尝试因子，最大 16×（P2: 原 8×）
     // 包含质数因子 5 和 7，支持 tc 为质数的循环完全展开
     // （如 conv2d 的 KSIZE=5 循环，如果循环体是单 BB）
+    // ★ P2-tune: 同时要求展开后体指令数 ≤ MAX_UNROLLED_BODY，避免 I-cache 污染
     unsigned factor = 0;
     static const unsigned candidates[] = {16, 12, 8, 6, 4, 3, 2};
     for (unsigned f : candidates) {
-        if (tc % f == 0 && tc >= f) {
+        if (tc % f == 0 && tc >= f && bodyFits(f)) {
             factor = f;
             break;
         }
     }
     // 如果没有整除因子且 tc ≤ 8，完全展开（支持质数 tc：5, 7）
-    if (factor == 0 && tc <= 8) {
+    // 同样受 bodyFits 约束
+    if (factor == 0 && tc <= 8 && bodyFits(static_cast<unsigned>(tc))) {
         factor = static_cast<unsigned>(tc);
     }
     if (factor == 0) return false;
@@ -396,11 +417,12 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
             factor = 12;
         }
         // 逐步降级，找最大的满足 liveRegs(f) ≤ REG_BUDGET 的因子
-        if (liveRegs(factor) > REG_BUDGET || invariants > INVARIANT_LIMIT) {
+        // ★ P2-tune: 降级时同样要求 bodyFits(f)，避免降级后仍过大
+        if (liveRegs(factor) > REG_BUDGET || invariants > INVARIANT_LIMIT || !bodyFits(factor)) {
             unsigned downgraded = 0;
             for (unsigned f : {12, 8, 6, 4, 3, 2}) {
                 if (tc % f == 0 && tc >= f && liveRegs(f) <= REG_BUDGET &&
-                    invariants <= INVARIANT_LIMIT) {
+                    invariants <= INVARIANT_LIMIT && bodyFits(f)) {
                     downgraded = f;
                     break;
                 }
