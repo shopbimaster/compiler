@@ -408,6 +408,14 @@ void runO2(IR::Module* mod) {
             constantFolding(mod);
             deadCodeElimination(mod);
         }
+        // GVN 将重复的等价计算（如内联后多处出现的 _and(a,b)）CSE 合并为同一
+        // IR 指令后，algebraicSimplification 才能匹配 x + (0-x) = 0 等需要值等价
+        // 的模式。crypto-1 的 _or(a,b) = _xor(_xor(a,b), _and(a,b)) 在 GVN 合并
+        // 两个 _and(a,b) 后可化简为常量 0，消除每轮迭代 ~9 条冗余指令。
+        if (algebraicSimplification(mod)) {
+            constantFolding(mod);
+            deadCodeElimination(mod);
+        }
     }
 
     matrixReductionContraction(mod);
