@@ -391,6 +391,12 @@ void runO2(IR::Module* mod) {
         }
     }
 
+    if (stencilInteriorSpecialization(mod)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     matrixReductionContraction(mod);
 }
 
