@@ -65,3 +65,6 @@ build-grammar-test/
 
 # Reference solutions (third-party)
 Solutions/
+
+# Private session memory (not for repo)
+MEMORY.md
