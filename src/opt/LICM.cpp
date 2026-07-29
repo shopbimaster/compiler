@@ -35,12 +35,20 @@ std::unordered_set<IR::GlobalVariable*> collectStoredGlobals(IR::Function* func)
 
 // ================================================================
 // 检查循环体中是否包含 CALL 指令
+// pureFuncs 非空时，纯函数 CALL 不计入（纯函数无副作用，不阻塞
+// LOAD 外提，且自身可被外提）
 // ================================================================
-bool loopHasCalls(const NaturalLoop& loop) {
+bool loopHasCalls(const NaturalLoop& loop,
+                  const std::unordered_set<IR::Function*>* pureFuncs = nullptr) {
     for (auto* bb : loop.body) {
         for (auto& inst : bb->getInstructions()) {
-            if (inst->getOpcode() == IR::Instruction::Opcode::CALL)
+            if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
+                if (pureFuncs) {
+                    auto* callee = dynamic_cast<IR::Function*>(inst->getOperand(0));
+                    if (callee && pureFuncs->count(callee)) continue;  // 纯 CALL 跳过
+                }
                 return true;
+            }
         }
     }
     return false;
@@ -50,6 +58,8 @@ bool loopHasCalls(const NaturalLoop& loop) {
 // 不变量判定：所有操作数是常量 || 在循环外定义 || 已标不变量
 // 增强：使用模块级只读全局变量分析，允许在循环含 CALL 时仍提升
 //       只读全局变量的 LOAD（因为 CALL 不可能修改只读全局变量）
+// A2：纯函数 CALL（不读写全局、无副作用）在参数全为不变量时可外提；
+//     hasCalls 现在仅统计非纯 CALL（纯 CALL 不阻塞 LOAD 外提）
 // ================================================================
 bool isLoopInvariant(
     IR::Instruction* inst,
@@ -57,14 +67,37 @@ bool isLoopInvariant(
     const std::unordered_set<IR::Instruction*>& invariants,
     const std::unordered_set<IR::GlobalVariable*>& storedGlobals,
     const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals,
-    bool hasCalls) {
+    bool hasCalls,
+    const std::unordered_set<IR::Function*>& pureFuncs) {
     auto op = inst->getOpcode();
     using Opc = IR::Instruction::Opcode;
     // 不可外提的副作用指令
-    if (op == Opc::PHI || op == Opc::STORE || op == Opc::CALL ||
+    if (op == Opc::PHI || op == Opc::STORE ||
         op == Opc::BR || op == Opc::COND_BR || op == Opc::RET ||
         op == Opc::ALLOCA)
         return false;
+
+    // A2：纯函数 CALL — 结果只依赖参数，参数全为不变量时可外提
+    if (op == Opc::CALL) {
+        auto* callee = dynamic_cast<IR::Function*>(inst->getOperand(0));
+        if (!callee || !pureFuncs.count(callee)) return false;  // 非纯/不可解析 → 不外提
+        // 纯 CALL：落入下方通用操作数不变量检查（跳过 operand 0 = callee）
+        for (unsigned i = 1; i < inst->getNumOperands(); ++i) {
+            auto* opVal = inst->getOperand(i);
+            if (!opVal) continue;
+            if (dynamic_cast<IR::ConstantInt*>(opVal)) continue;
+            if (dynamic_cast<IR::ConstantFloat*>(opVal)) continue;
+            if (dynamic_cast<IR::GlobalVariable*>(opVal)) return false;  // 纯函数不读全局，但保守起见不传全局地址
+            if (dynamic_cast<IR::Function*>(opVal)) continue;
+            if (auto* defInst = dynamic_cast<IR::Instruction*>(opVal)) {
+                auto* defBB = defInst->getParent();
+                if (defBB && loop.body.count(defBB)) {
+                    if (!invariants.count(defInst)) return false;
+                }
+            }
+        }
+        return true;
+    }
 
     // LOAD 指令：加载自全局变量或 ALLOCA 时，检查是否可外提
     if (op == Opc::LOAD) {
@@ -75,7 +108,7 @@ bool isLoopInvariant(
             if (storedGlobals.count(gv)) return false;
             // 增强：如果全局变量在整个模块中都是只读的，即使循环有 CALL 也可以外提
             if (moduleReadOnlyGlobals.count(gv)) return true;
-            // 否则，如果循环有 CALL，保守不提升
+            // 否则，如果循环有非纯 CALL，保守不提升
             if (hasCalls) return false;
             return true;
         }
@@ -147,7 +180,8 @@ bool isLoopValid(const NaturalLoop& loop, IR::Function* func) {
 //   3. 前驱的 terminator 必须有效且确实引用 header
 // ================================================================
 bool hoistLoopInvariants(NaturalLoop& loop, IR::Function* func,
-                         const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals) {
+                         const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals,
+                         const std::unordered_set<IR::Function*>& pureFuncs) {
     static int preheaderCounter = 0;
     // 头块是入口块 → 跳过
     if (loop.header == func->getEntryBlock()) return false;
@@ -165,14 +199,15 @@ bool hoistLoopInvariants(NaturalLoop& loop, IR::Function* func,
 
     // 2. 迭代标记不变量直到收敛
     auto storedGlobals = collectStoredGlobals(func);
-    bool hasCalls = loopHasCalls(loop);
+    // A2：仅统计非纯 CALL — 纯 CALL 不阻塞 LOAD 外提
+    bool hasCalls = loopHasCalls(loop, &pureFuncs);
     std::unordered_set<IR::Instruction*> invariants;
     bool changed = true;
     while (changed) {
         changed = false;
         for (auto* inst : loopInsts) {
             if (!invariants.count(inst) &&
-                isLoopInvariant(inst, loop, invariants, storedGlobals, moduleReadOnlyGlobals, hasCalls)) {
+                isLoopInvariant(inst, loop, invariants, storedGlobals, moduleReadOnlyGlobals, hasCalls, pureFuncs)) {
                 invariants.insert(inst);
                 changed = true;
             }
@@ -276,7 +311,8 @@ bool hoistLoopInvariants(NaturalLoop& loop, IR::Function* func,
 // 单函数 LICM（从最内层循环开始处理，使用 NaturalLoop 森林）
 // ================================================================
 bool licmOnFunction(IR::Function* func,
-                    const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals) {
+                    const std::unordered_set<IR::GlobalVariable*>& moduleReadOnlyGlobals,
+                    const std::unordered_set<IR::Function*>& pureFuncs) {
     if (func->isExternal()) return false;
     if (func->getBlocks().empty()) return false;
 
@@ -289,7 +325,7 @@ bool licmOnFunction(IR::Function* func,
         if (loop.body.size() <= 1) continue;
         // 安全检查：处理内层循环后，外层循环可能已被修改
         if (!isLoopValid(loop, func)) continue;
-        if (hoistLoopInvariants(loop, func, moduleReadOnlyGlobals)) {
+        if (hoistLoopInvariants(loop, func, moduleReadOnlyGlobals, pureFuncs)) {
             changed = true;
         }
     }
@@ -301,6 +337,8 @@ bool licmOnFunction(IR::Function* func,
 bool loopInvariantCodeMotion(IR::Module* mod) {
     // 计算模块级只读全局变量（一次分析，所有函数复用）
     auto moduleReadOnlyGlobals = readOnlyGlobalAnalysis(mod);
+    // A2：模块级纯函数识别（一次分析，所有函数复用）
+    auto pureFuncs = detectPureFunctions(mod);
 
     bool changed = true;
     bool anyChanged = false;
@@ -311,7 +349,7 @@ bool loopInvariantCodeMotion(IR::Module* mod) {
         }
         changed = false;
         for (auto& func : mod->getFunctions()) {
-            if (licmOnFunction(func.get(), moduleReadOnlyGlobals)) {
+            if (licmOnFunction(func.get(), moduleReadOnlyGlobals, pureFuncs)) {
                 changed = true;
                 anyChanged = true;
             }
