@@ -190,11 +190,6 @@ bool mem2regOnFunction(IR::Function* func) {
         bool isEntryAlloca = (allocaIdx < numEntryAllocas);
         ++allocaIdx;
         if (!isEntryAlloca) {
-            // Temporary diagnosis: comma-separated alloca names to leave in memory.
-            if (const char* skip = std::getenv("M2R_SKIP_NONENTRY")) {
-                if (std::string(skip).find(alloca->getName()) != std::string::npos)
-                    continue;
-            }
             if (entryPhiUsed == SIZE_MAX) entryPhiUsed = phiNodeCount;  // 锁定一次
             // 非 entry 段：额外预算耗尽则完全跳过（含零-PHI 提升），
             // 保证 budget=0 时逐字节等价 v4.1.0（仅 entry）。

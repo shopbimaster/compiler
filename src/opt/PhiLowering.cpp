@@ -17,8 +17,6 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
-#include <cstdlib>
-#include <string>
 #include <vector>
 #include <unordered_map>
 
@@ -41,9 +39,6 @@ bool phiLowering(IR::Module* mod) {
         for (auto& bb : func->getBlocks()) {
             for (auto& inst : bb->getInstructions()) {
                 if (inst->getOpcode() == IR::Instruction::Opcode::PHI) {
-                    if (const char* match = std::getenv("DEBUG_LOWER_PHI_MATCH")) {
-                        if (inst->getName().find(match) == std::string::npos) continue;
-                    }
                     phis.push_back({inst.get(), bb.get()});
                 }
             }
