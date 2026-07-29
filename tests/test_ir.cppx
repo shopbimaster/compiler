@@ -842,6 +842,88 @@ void test_counted_loop_nonzero_reversed_compare() {
     PASS();
 }
 
+void test_mod_add_recurrence_strength_reduce() {
+    TEST("ModAddRecurrence 通用闭式快路径");
+    Module mod;
+    auto* state = mod.createGlobalVariable(
+        PointerType::get(IntegerType::I32), "sequence_state",
+        false, ConstantInt::get(IntegerType::I32, 0));
+    auto* function = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}),
+        "advance_sequence");
+    auto* entry = function->createBlock("entry");
+    auto* header = function->createBlock("loop.header");
+    auto* body = function->createBlock("loop.body");
+    auto* exit = function->createBlock("exit");
+
+    auto* bound = Instruction::createAlloca(
+        IntegerType::I32, "bound");
+    auto* induction = Instruction::createAlloca(
+        IntegerType::I32, "induction");
+    entry->pushBack(bound);
+    entry->pushBack(Instruction::createStore(
+        ConstantInt::get(IntegerType::I32, 5), bound));
+    entry->pushBack(induction);
+    entry->pushBack(Instruction::createStore(
+        ConstantInt::get(IntegerType::I32, 0), induction));
+    entry->pushBack(Instruction::createBr(header));
+
+    auto* index = Instruction::createLoad(
+        IntegerType::I32, induction, "index");
+    auto* limit = Instruction::createLoad(
+        IntegerType::I32, bound, "limit");
+    auto* compare = Instruction::createCmp(
+        Instruction::Opcode::ICMP, index, limit, "slt");
+    header->pushBack(index);
+    header->pushBack(limit);
+    header->pushBack(compare);
+    header->pushBack(
+        Instruction::createCondBr(compare, body, exit));
+
+    auto* current = Instruction::createLoad(
+        IntegerType::I32, state, "current");
+    auto* added = Instruction::createBinOp(
+        Instruction::Opcode::ADD, IntegerType::I32,
+        "added", current,
+        ConstantInt::get(IntegerType::I32, 7));
+    auto* reloaded = Instruction::createLoad(
+        IntegerType::I32, state, "reloaded");
+    auto* reduced = Instruction::createBinOp(
+        Instruction::Opcode::SREM, IntegerType::I32,
+        "reduced", reloaded,
+        ConstantInt::get(IntegerType::I32, 97));
+    auto* bodyIndex = Instruction::createLoad(
+        IntegerType::I32, induction, "body.index");
+    auto* next = Instruction::createBinOp(
+        Instruction::Opcode::ADD, IntegerType::I32,
+        "next", bodyIndex,
+        ConstantInt::get(IntegerType::I32, 1));
+    body->pushBack(current);
+    body->pushBack(added);
+    body->pushBack(Instruction::createStore(added, state));
+    body->pushBack(reloaded);
+    body->pushBack(reduced);
+    body->pushBack(Instruction::createStore(reduced, state));
+    body->pushBack(bodyIndex);
+    body->pushBack(next);
+    body->pushBack(Instruction::createStore(next, induction));
+    body->pushBack(Instruction::createBr(header));
+
+    auto* result = Instruction::createLoad(
+        IntegerType::I32, state, "result");
+    exit->pushBack(result);
+    exit->pushBack(Instruction::createRet(result));
+
+    CHECK(Opt::modAddRecurrenceStrengthReduce(&mod));
+    std::string transformed = mod.dump();
+    CHECK(transformed.find("modrec.fast") != std::string::npos);
+    CHECK(transformed.find("modrec.max_trips") !=
+          std::string::npos);
+    CHECK(transformed.find("br i1 %modrec.safe") !=
+          std::string::npos);
+    PASS();
+}
+
 // ================================================================
 // main
 // ================================================================
@@ -882,6 +964,9 @@ int main() {
 
     std::cout << "\n[Loop Pattern Analysis]\n";
     test_counted_loop_nonzero_reversed_compare();
+
+    std::cout << "\n[Modular Recurrence]\n";
+    test_mod_add_recurrence_strength_reduce();
 
     std::cout << "\n=== 结果: " << passed << " passed, "
               << failed << " failed ===\n";
