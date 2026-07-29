@@ -1436,22 +1436,34 @@ std::string peepholeOptimize(const std::string& asmCode) {
 
             // mv rd, rs; bnez rd, label → bnez rs, label
             // mv rd, rs; beqz rd, label → beqz rs, label
-            // 安全条件：mvRd 在 branch 之后必须死亡（branch 不定义寄存器，mvRd 可能 live-out）
+            // 安全条件：mvRd 在 branch 的两条路径（fall-through 和 branch-taken）之后
+            // 都必须死亡（branch 不定义寄存器，mvRd 可能 live-out）。
+            // ★ isRegDeadGlobal 从 i+2 开始只追踪 fall-through 路径——branch 指令在
+            //   i+1，不在扫描范围内，故 branch-taken 目标不会被加入 worklist。
+            //   必须显式检查 branch-taken 路径：从 brLabel 对应位置起 isRegDeadGlobal。
+            //   11_BST -O0 回归根因：bnez s2,.Lmain_endif_46 的 fall-through 是 return 0
+            //   （s2 在 epilogue 被 ld 覆写→误判死亡），但 branch-taken 路径的 while 循环
+            //   bge s0,s2 仍读取 s2 → s2 实际存活，mv s2,t3（STORE 到 promoted alloca n）
+            //   不能消除。
             if (!matched && i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {
                 std::string mvRd, mvRs;
                 if (tryMatch(lines[i], "mv", mvRd, mvRs, imm)) {
                     std::string brRs, brLabel;
-                    if (tryMatchBranch(lines[i + 1], "bnez", brRs, brLabel) && brRs == mvRd) {
-                        if (isRegDeadInBB(lines, i + 2, mvRd) ||
-                            isRegDeadGlobal(lines, i + 2, mvRd, labelMap)) {
-                            result.push_back("  bnez    " + mvRs + ", " + brLabel);
-                            ++i;
-                            matched = true;
+                    bool isBnez = tryMatchBranch(lines[i + 1], "bnez", brRs, brLabel) && brRs == mvRd;
+                    bool isBeqz = !isBnez && tryMatchBranch(lines[i + 1], "beqz", brRs, brLabel) && brRs == mvRd;
+                    if (isBnez || isBeqz) {
+                        // 检查 fall-through 路径（i+2 起）
+                        bool deadFall = isRegDeadInBB(lines, i + 2, mvRd) ||
+                                        isRegDeadGlobal(lines, i + 2, mvRd, labelMap);
+                        // 检查 branch-taken 路径（brLabel 目标起）
+                        bool deadTaken = false;
+                        auto it = labelMap.find(brLabel);
+                        if (it != labelMap.end()) {
+                            deadTaken = isRegDeadGlobal(lines, it->second, mvRd, labelMap);
                         }
-                    } else if (tryMatchBranch(lines[i + 1], "beqz", brRs, brLabel) && brRs == mvRd) {
-                        if (isRegDeadInBB(lines, i + 2, mvRd) ||
-                            isRegDeadGlobal(lines, i + 2, mvRd, labelMap)) {
-                            result.push_back("  beqz    " + mvRs + ", " + brLabel);
+                        if (deadFall && deadTaken) {
+                            result.push_back("  " + std::string(isBnez ? "bnez" : "beqz") +
+                                             "    " + mvRs + ", " + brLabel);
                             ++i;
                             matched = true;
                         }

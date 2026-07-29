@@ -115,7 +115,15 @@ P6 启用 vs 基线（P1+P2+P4），3 次取最小值：
 - 功能 **97/100**（较基线 95 提升：85_long_code/86_long_code2 超时解除；3 DIFF 均预存：62_percolation/68_brainfk/71_full_conn）。
 - 95_float 修复后 PASS；59_sort_test5 PASS；crypto-1/2/3 PASS；huffman-01 PASS。
 
-### 1.7 71_full_conn 预存回归诊断（2026-07-29，未修复，待单独处理）
+### 1.7 Peephole mv+branch copy propagation 修复（2026-07-29）
+
+- **症状**：`11_BST` -O0 输出 "10 65 88"（仅 3 个值，应为 100 个有序值）。`run_tests.sh hfunc` 默认 O0，故用户报告 11_BST 不通过。
+- **根因**：PeepholeOptimizer 的 `mv rd,rs; bnez/beqz rd,label → bnez/beqz rs,label` 模式用 `isRegDeadGlobal(lines, i+2, mvRd)` 检查 liveness，但 `i+2` 是 branch 之后（fall-through 路径起点），`isRegDeadGlobal` 从此处扫描不会经过 i+1 的 branch 指令，故 **branch-taken 目标不会被加入 worklist**。对 11_BST main 的 `if(!n) return 0`：fall-through 是 `return 0`（s2 在 epilogue 被 `ld` 覆写→误判死亡），但 branch-taken 路径的 while 循环 `bge s0,s2` 仍读取 s2 → s2 实际存活，`mv s2,t3`（STORE 到 promoted alloca n）被错误消除。
+- **修复**：显式检查 branch-taken 路径——从 `brLabel` 在 labelMap 中的位置起调用 `isRegDeadGlobal`，仅当 fall-through 和 branch-taken 两条路径上 mvRd 均死亡才执行替换。
+- **验证**：11_BST -O0/-O1 均 PASS；h_functional O0 从 39/40 提升到 **40/40**；func O1 97/100（3 预存 DIFF 不变）；perf O1 60/60。无回归。
+- **注意**：h_functional O1 的 12_DSU/21_union_find/30_many_dimensions/35_math 在基线（68f1428）即失败，非本次引入。
+
+### 1.8 71_full_conn 预存回归诊断（2026-07-29，未修复，待单独处理）
 
 - **症状**：`model(a)` 返回 1（"cat"）应为 0（"dog"），所有 -O1 模式均错；-O0 正确。
 - **二分定位**：017ab02 PASS → b24d9ab FAIL（A 组：支配树 L/R + GVN 全支配）。9e690c4/aaf20de/当前均 FAIL。
