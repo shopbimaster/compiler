@@ -1,0 +1,21 @@
+int state;
+
+int recursive_value(int depth, int bias) {
+    if (depth == 0) {
+        return state + bias;
+    }
+    return recursive_value(depth - 1, bias);
+}
+
+int main() {
+    int iteration = 0;
+    int result = 0;
+    while (iteration < 2) {
+        state = (iteration + 1) * 10;
+        result = recursive_value(1, 0);
+        iteration = iteration + 1;
+    }
+    putint(result);
+    putch(10);
+    return 0;
+}
