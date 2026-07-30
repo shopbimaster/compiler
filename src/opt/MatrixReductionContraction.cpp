@@ -561,7 +561,7 @@ bool findFinalReduction(
     IR::BasicBlock* loopPreheader,
     IR::Instruction*& finalLoad,
     IR::Instruction*& innerCompare,
-    unsigned& innerBoundOperand) {
+    IR::Value*& innerInduction) {
     std::vector<IR::Instruction*> loads;
     std::vector<IR::Instruction*> stores;
     std::vector<IR::Instruction*> callsWithMatrix;
@@ -689,10 +689,35 @@ bool findFinalReduction(
             }
         }
     }
+    auto* innerTerminator = inner.header
+        ? inner.header->getTerminator()
+        : nullptr;
+    auto* innerBodyEntry =
+        innerTerminator &&
+                innerTerminator->getOpcode() == Opc::COND_BR
+            ? dynamic_cast<IR::BasicBlock*>(
+                  innerTerminator->getOperand(1))
+            : nullptr;
+    auto* innerExit =
+        innerTerminator &&
+                innerTerminator->getOpcode() == Opc::COND_BR
+            ? dynamic_cast<IR::BasicBlock*>(
+                  innerTerminator->getOperand(2))
+            : nullptr;
+    if (!innerTerminator ||
+        !innerBodyEntry || !innerExit ||
+        !inner.body.count(innerBodyEntry) ||
+        inner.body.count(innerExit) ||
+        inner.compare->getNumUses() != 1 ||
+        inner.compare->getUses().front().user !=
+            innerTerminator ||
+        inner.compare->getUses().front().operandNo != 0) {
+        return false;
+    }
 
     finalLoad = loads[0];
     innerCompare = inner.compare;
-    innerBoundOperand = inner.boundOperand;
+    innerInduction = inner.induction;
     return true;
 }
 
@@ -898,7 +923,7 @@ bool matchCallChain(
         findUniqueLoopPreheader(caller, callBlock);
     IR::Instruction* finalLoad = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
-    unsigned finalInnerBoundOperand = 1;
+    IR::Value* finalInnerInduction = nullptr;
     if (!loopPreheader ||
         !findFinalReduction(
             module, caller, resultMatrix, size,
@@ -907,7 +932,7 @@ bool matchCallChain(
             kernel.inclusiveUpperBound,
             orderedCalls, loopPreheader,
             finalLoad, finalInnerCompare,
-            finalInnerBoundOperand)) {
+            finalInnerInduction)) {
         return false;
     }
 
@@ -938,8 +963,7 @@ bool matchCallChain(
     plan.caller = caller;
     plan.loopPreheader = loopPreheader;
     plan.finalInnerCompare = finalInnerCompare;
-    plan.finalInnerBoundOperand =
-        finalInnerBoundOperand;
+    plan.finalInnerInduction = finalInnerInduction;
     plan.calls = std::move(orderedCalls);
     plan.seedMatrix = seedMatrix;
     plan.resultMatrix = resultMatrix;

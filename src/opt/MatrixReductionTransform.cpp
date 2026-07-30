@@ -334,13 +334,12 @@ bool applyMatrixReductionPlan(
             call->setOperand(0, summaryKernel);
         }
         plan.finalInnerCompare->setOperand(
-            plan.finalInnerBoundOperand,
-            IR::ConstantInt::get(
-                IR::IntegerType::I32,
-                plan.kernel.indexStart +
-                    (plan.kernel.inclusiveUpperBound
-                         ? 0
-                         : 1)));
+            0, plan.finalInnerInduction);
+        plan.finalInnerCompare->setOperand(
+            1, IR::ConstantInt::get(
+                   IR::IntegerType::I32,
+                   plan.kernel.indexStart));
+        plan.finalInnerCompare->setName("eq");
         return true;
     }
     return false;

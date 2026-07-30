@@ -33,7 +33,7 @@ struct MatrixReductionPlan {
     IR::Function* caller = nullptr;
     IR::BasicBlock* loopPreheader = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
-    unsigned finalInnerBoundOperand = 1;
+    IR::Value* finalInnerInduction = nullptr;
     std::vector<IR::Instruction*> calls;
     IR::GlobalVariable* seedMatrix = nullptr;
     IR::GlobalVariable* resultMatrix = nullptr;
