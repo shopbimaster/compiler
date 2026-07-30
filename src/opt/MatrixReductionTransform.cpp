@@ -61,7 +61,18 @@ IR::Function* createAffineRowSummaryFunction(
         i32, "summary.k", indexStart, iBody, kNext, kBody);
     auto* accumulation =
         IR::Instruction::createPhi(i32, "summary.acc", 4);
-    accumulation->addOperand(zero);
+    IR::Instruction* initialRowSum = nullptr;
+    IR::Value* initialAccumulation = zero;
+    if (summary.initialValue &&
+        summary.initialValue->getValue() != 0) {
+        auto* fillValue = IR::ConstantInt::get(
+            i32, summary.initialValue->getValue());
+        initialRowSum = IR::Instruction::createBinOp(
+            Opc::MUL, i32, "summary.initial.row.sum",
+            sizeArgument, fillValue);
+        initialAccumulation = initialRowSum;
+    }
+    accumulation->addOperand(initialAccumulation);
     accumulation->addOperand(iBody);
     accumulation->addOperand(nullptr);
     accumulation->addOperand(kBody);
@@ -85,6 +96,9 @@ IR::Function* createAffineRowSummaryFunction(
         {indexI}, "summary.C.row");
     iBody->pushBack(rowA);
     iBody->pushBack(outputRow);
+    if (initialRowSum) {
+        iBody->pushBack(initialRowSum);
+    }
     iBody->pushBack(IR::Instruction::createBr(kHeader));
 
     kHeader->pushBack(indexK);

@@ -180,22 +180,27 @@ bool matchKernelFunction(
     }
     if (outputStores.size() != 2) return false;
 
-    IR::Instruction* zeroStore = nullptr;
-    IR::Instruction* updateStore = nullptr;
+    IR::Instruction* initialStore = nullptr;
+    IR::Instruction* updateStore = recurrence.store;
+    IR::ConstantInt* initialValue = nullptr;
     for (auto* store : outputStores) {
-        if (isConstant(store->getOperand(0), 0)) {
-            zeroStore = store;
-        } else {
-            updateStore = store;
+        if (store == updateStore) continue;
+        if (initialStore) return false;
+        initialValue = dynamic_cast<IR::ConstantInt*>(
+            store->getOperand(0));
+        if (!initialValue ||
+            initialValue->getType() != IR::IntegerType::I32) {
+            return false;
         }
+        initialStore = store;
     }
-    if (!zeroStore || !updateStore) return false;
-    if (updateStore != recurrence.store) return false;
+    if (!initialStore || !initialValue) return false;
 
-    PointerAccess zeroOutput;
+    PointerAccess initialOutput;
     if (!collectPointerAccess(
-            zeroStore->getOperand(1), &argumentMap, zeroOutput) ||
-        zeroOutput.indices.size() != 2) {
+            initialStore->getOperand(1), &argumentMap,
+            initialOutput) ||
+        initialOutput.indices.size() != 2) {
         return false;
     }
 
@@ -286,8 +291,8 @@ bool matchKernelFunction(
     CanonicalCountedLoop loopI;
     CanonicalCountedLoop loopJ;
     CanonicalCountedLoop loopK;
-    CanonicalCountedLoop zeroLoopI;
-    CanonicalCountedLoop zeroLoopJ;
+    CanonicalCountedLoop initialLoopI;
+    CanonicalCountedLoop initialLoopJ;
     IR::Argument* sizeArgument = nullptr;
     for (unsigned index = 0;
          index < function->getNumArgs(); ++index) {
@@ -299,8 +304,8 @@ bool matchKernelFunction(
         CanonicalCountedLoop candidateLoopI;
         CanonicalCountedLoop candidateLoopJ;
         CanonicalCountedLoop candidateLoopK;
-        CanonicalCountedLoop candidateZeroLoopI;
-        CanonicalCountedLoop candidateZeroLoopJ;
+        CanonicalCountedLoop candidateInitialLoopI;
+        CanonicalCountedLoop candidateInitialLoopJ;
         if (!analyzeCanonicalCountedLoop(
                 function, indexI, candidate,
                 updateStore->getParent(),
@@ -314,13 +319,13 @@ bool matchKernelFunction(
                 updateStore->getParent(),
                 candidateLoopK) ||
             !analyzeCanonicalCountedLoop(
-                function, zeroOutput.indices[0],
-                candidate, zeroStore->getParent(),
-                candidateZeroLoopI) ||
+                function, initialOutput.indices[0],
+                candidate, initialStore->getParent(),
+                candidateInitialLoopI) ||
             !analyzeCanonicalCountedLoop(
-                function, zeroOutput.indices[1],
-                candidate, zeroStore->getParent(),
-                candidateZeroLoopJ)) {
+                function, initialOutput.indices[1],
+                candidate, initialStore->getParent(),
+                candidateInitialLoopJ)) {
             continue;
         }
         if (sizeArgument) return false;
@@ -328,8 +333,8 @@ bool matchKernelFunction(
         loopI = std::move(candidateLoopI);
         loopJ = std::move(candidateLoopJ);
         loopK = std::move(candidateLoopK);
-        zeroLoopI = std::move(candidateZeroLoopI);
-        zeroLoopJ = std::move(candidateZeroLoopJ);
+        initialLoopI = std::move(candidateInitialLoopI);
+        initialLoopJ = std::move(candidateInitialLoopJ);
     }
     if (!sizeArgument) return false;
 
@@ -353,7 +358,7 @@ bool matchKernelFunction(
     bool inclusiveUpperBound = false;
     if (!getCommonIterationDomain(
             {&loopI, &loopJ, &loopK,
-             &zeroLoopI, &zeroLoopJ},
+             &initialLoopI, &initialLoopJ},
             indexStart, indexStep,
             inclusiveUpperBound) ||
         indexStart < 0 ||
@@ -363,6 +368,11 @@ bool matchKernelFunction(
         indexStart >
             std::numeric_limits<int32_t>::max() -
                 indexStep) {
+        return false;
+    }
+    if (initialValue->getValue() != 0 &&
+        (indexStart != 0 || indexStep != 1 ||
+         inclusiveUpperBound)) {
         return false;
     }
 
@@ -401,6 +411,7 @@ bool matchKernelFunction(
 
     summary.sourceFunction = function;
     summary.rowType = rowType;
+    summary.initialValue = initialValue;
     summary.skippedScale = skippedCoefficient;
     summary.sizeArgumentIndex =
         sizeArgument->getIndex();

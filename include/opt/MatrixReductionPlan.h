@@ -12,6 +12,7 @@ namespace Opt {
 struct AffineKernelSummary {
     IR::Function* sourceFunction = nullptr;
     IR::ArrayType* rowType = nullptr;
+    IR::ConstantInt* initialValue = nullptr;
     IR::ConstantInt* skippedScale = nullptr;
     unsigned sizeArgumentIndex = 0;
     unsigned scaleArgumentIndex = 0;
