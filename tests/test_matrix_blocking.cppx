@@ -1,6 +1,8 @@
 #include "ir/IRBuilder.h"
+#include "opt/MemoryAccessAnalysis.h"
 #include "opt/Optimizer.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -8,8 +10,12 @@ namespace {
 
 struct OptimizationResult {
     std::string ir;
-    bool helperPrefersExpandedRegisters = false;
+    bool inPlaceHelperPrefersExpandedRegisters = false;
+    bool conditionalHelperPrefersExpandedRegisters = false;
     bool anyFunctionPrefersExpandedRegisters = false;
+    bool writesDeadY = false;
+    bool callsHotLeafF = false;
+    bool callsHotLoopTest = false;
 };
 
 OptimizationResult optimizeToO2(const std::string& source) {
@@ -20,10 +26,33 @@ OptimizationResult optimizeToO2(const std::string& source) {
     OptimizationResult result;
     result.ir = module->dump();
     for (const auto& function : module->getFunctions()) {
+        for (const auto& block : function->getBlocks()) {
+            for (const auto& instruction : block->getInstructions()) {
+                if (instruction->getOpcode() ==
+                        IR::Instruction::Opcode::CALL &&
+                    instruction->getNumOperands() != 0) {
+                    const auto& callee = instruction->getOperand(0)->getName();
+                    result.callsHotLeafF |= callee == "f";
+                    result.callsHotLoopTest |= callee == "loop_test";
+                }
+                if (instruction->getOpcode() !=
+                        IR::Instruction::Opcode::STORE ||
+                    instruction->getNumOperands() != 2) {
+                    continue;
+                }
+                auto* global = Opt::rootGlobal(instruction->getOperand(1));
+                if (global && global->getName() == "y") {
+                    result.writesDeadY = true;
+                }
+            }
+        }
         if (!function->prefersExpandedLeafRegisters()) continue;
         result.anyFunctionPrefersExpandedRegisters = true;
         if (function->getName() == "__opt_inplace_matrix_block4") {
-            result.helperPrefersExpandedRegisters = true;
+            result.inPlaceHelperPrefersExpandedRegisters = true;
+        }
+        if (function->getName() == "__opt_conditional_matrix_mask4") {
+            result.conditionalHelperPrefersExpandedRegisters = true;
         }
     }
     return result;
@@ -32,6 +61,12 @@ OptimizationResult optimizeToO2(const std::string& source) {
 } // namespace
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("M2R_NONENTRY_ALLPASS", "1");
+#else
+    setenv("M2R_NONENTRY_ALLPASS", "1", 1);
+#endif
+
     const OptimizationResult inPlace = optimizeToO2(
         "../test/performance/many_mat_cal-1.sy");
     if (inPlace.ir.find("__opt_inplace_matrix_block4") ==
@@ -39,23 +74,68 @@ int main() {
         std::cerr << "in-place matrix reduction did not trigger blocking\n";
         return 1;
     }
-    if (!inPlace.helperPrefersExpandedRegisters) {
+    if (!inPlace.inPlaceHelperPrefersExpandedRegisters) {
         std::cerr << "blocked helper is missing its leaf-register hint\n";
         return 1;
     }
+    if (inPlace.ir.find("__opt_conditional_matrix_mask4") !=
+        std::string::npos) {
+        std::cerr << "in-place kernel triggered conditional blocking\n";
+        return 1;
+    }
 
-    const OptimizationResult outOfPlace = optimizeToO2(
+    const OptimizationResult conditional = optimizeToO2(
         "../test/performance/matmul1.sy");
-    if (outOfPlace.ir.find("__opt_inplace_matrix_block4") !=
+    if (conditional.ir.find("__opt_inplace_matrix_block4") !=
         std::string::npos) {
         std::cerr << "out-of-place matrix kernel triggered in-place blocking\n";
         return 1;
     }
-    if (outOfPlace.anyFunctionPrefersExpandedRegisters) {
+    if (conditional.ir.find("__opt_conditional_matrix_mask4") ==
+        std::string::npos) {
+        std::cerr << "conditional matrix reduction did not trigger blocking\n";
+        return 1;
+    }
+    if (!conditional.conditionalHelperPrefersExpandedRegisters) {
+        std::cerr << "conditional helper is missing its leaf-register hint\n";
+        return 1;
+    }
+
+    const OptimizationResult negative = optimizeToO2(
+        "../test/performance/conv2d-1.sy");
+    if (negative.ir.find("__opt_inplace_matrix_block4") !=
+            std::string::npos ||
+        negative.ir.find("__opt_conditional_matrix_mask4") !=
+            std::string::npos) {
+        std::cerr << "unrelated matrix kernel triggered blocking\n";
+        return 1;
+    }
+    if (negative.anyFunctionPrefersExpandedRegisters) {
         std::cerr << "leaf-register hint escaped the blocked helper\n";
         return 1;
     }
 
-    std::cout << "In-place matrix blocking trigger checks passed\n";
+    const OptimizationResult triangular = optimizeToO2(
+        "../test/performance/transpose0.sy");
+    if (triangular.ir.find("triangular.limit") == std::string::npos) {
+        std::cerr << "triangular copy did not restrict its inner loop\n";
+        return 1;
+    }
+
+    const OptimizationResult deadGlobal = optimizeToO2(
+        "../test/performance/sl1.sy");
+    if (deadGlobal.writesDeadY) {
+        std::cerr << "write-only global array stores were not eliminated\n";
+        return 1;
+    }
+
+    const OptimizationResult hotInline = optimizeToO2(
+        "../test/performance/h-4-01.sy");
+    if (hotInline.callsHotLeafF || hotInline.callsHotLoopTest) {
+        std::cerr << "unique hot-loop leaf calls were not inlined\n";
+        return 1;
+    }
+
+    std::cout << "Optimization trigger checks passed\n";
     return 0;
 }

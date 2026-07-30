@@ -143,6 +143,8 @@ add_library(sysy_opt STATIC
     src/opt/ModAddRecurrence.cpp
     src/opt/StencilInteriorSpecialization.cpp
     src/opt/InPlaceMatrixBlocking.cpp
+    src/opt/ConditionalMatrixBlocking.cpp
+    src/opt/TriangularCopyOptimization.cpp
     src/opt/RecursiveCallGuard.cpp
     src/opt/MatrixReductionContraction.cpp
     src/opt/MatrixReductionTransform.cpp
@@ -152,6 +154,7 @@ add_library(sysy_opt STATIC
     src/opt/PowerOfTwoDispatch.cpp
     src/opt/GlobalVariablePromotion.cpp
     src/opt/GlobalConstantPropagation.cpp
+    src/opt/DeadGlobalStoreElimination.cpp
     src/opt/Mem2Reg.cpp
     src/opt/GVN.cpp
     src/opt/PhiLowering.cpp

@@ -19,6 +19,8 @@ namespace {
 const unsigned MAX_INLINE_INSTS_SINGLE = 20;
 const unsigned MAX_INLINE_INSTS_MULTI = 120;
 const unsigned MAX_INLINE_BBS_MULTI = 15;
+const unsigned MAX_HOT_INLINE_INSTS_MULTI = 160;
+const unsigned MAX_HOT_INLINE_BBS_MULTI = 24;
 // 多BB函数在同一caller中被调用超过此次数则不内联，避免代码膨胀导致性能下降
 // 但小函数（≤30指令）豁免此限制，因为它们的内联收益远大于代码膨胀代价
 const unsigned MAX_MULTI_BB_CALL_SITES = 2;
@@ -55,7 +57,8 @@ unsigned countInstructions(IR::Function* func) {
     return n;
 }
 
-bool isInlineCandidate(IR::Function* func) {
+bool isInlineCandidateWithLimits(IR::Function* func, unsigned maxBlocks,
+                                 unsigned maxInstructions) {
     if (func->isExternal()) return false;
     if (!isLeafCall(func)) return false;
     auto numBBs = func->getBlocks().size();
@@ -64,7 +67,17 @@ bool isInlineCandidate(IR::Function* func) {
         return numInsts <= MAX_INLINE_INSTS_SINGLE;
     }
     // 多 BB 函数：限制 BB 数和指令数，避免控制流过于复杂
-    return numBBs <= MAX_INLINE_BBS_MULTI && numInsts <= MAX_INLINE_INSTS_MULTI;
+    return numBBs <= maxBlocks && numInsts <= maxInstructions;
+}
+
+bool isInlineCandidate(IR::Function* func) {
+    return isInlineCandidateWithLimits(
+        func, MAX_INLINE_BBS_MULTI, MAX_INLINE_INSTS_MULTI);
+}
+
+bool isHotInlineCandidate(IR::Function* func) {
+    return isInlineCandidateWithLimits(
+        func, MAX_HOT_INLINE_BBS_MULTI, MAX_HOT_INLINE_INSTS_MULTI);
 }
 
 // 从 RETURN 指令提取返回值
@@ -620,13 +633,17 @@ bool inlineExpansion(IR::Module* mod) {
 
     // 识别可内联的候选函数
     std::unordered_set<IR::Function*> candidates;
+    std::unordered_set<IR::Function*> normalCandidates;
 
     auto& funcs = mod->getFunctions();
 
     for (auto& func : funcs) {
         if (!func) continue;
-        if (isInlineCandidate(func.get())) {
+        if (isHotInlineCandidate(func.get())) {
             candidates.insert(func.get());
+        }
+        if (isInlineCandidate(func.get())) {
+            normalCandidates.insert(func.get());
         }
     }
 
@@ -644,6 +661,11 @@ bool inlineExpansion(IR::Module* mod) {
             if (func->isExternal()) continue;
             // 跳过候选函数自身（避免内联到自身）
             if (candidates.count(func)) continue;
+
+            std::unordered_set<IR::BasicBlock*> loopBlocks;
+            for (const auto& loop : findNaturalLoops(func)) {
+                loopBlocks.insert(loop.body.begin(), loop.body.end());
+            }
 
             // 统计当前 caller 中各候选 callee 的调用次数
             std::unordered_map<IR::Function*, unsigned> callCount;
@@ -693,10 +715,22 @@ bool inlineExpansion(IR::Module* mod) {
                     if (inst->getOpcode() == IR::Instruction::Opcode::CALL) {
                         auto* calleeVal = inst->getOperand(0);
                         auto* calleeFunc = dynamic_cast<IR::Function*>(calleeVal);
-                        if (calleeFunc && candidates.count(calleeFunc) && !skipMultiBB.count(calleeFunc)) {
+                        bool normalCandidate = calleeFunc &&
+                            normalCandidates.count(calleeFunc);
+                        bool uniqueHotCall = calleeFunc &&
+                            callCount[calleeFunc] == 1 &&
+                            loopBlocks.count(bb.get());
+                        if (calleeFunc && candidates.count(calleeFunc) &&
+                            (normalCandidate || uniqueHotCall) &&
+                            !skipMultiBB.count(calleeFunc)) {
                             if (std::getenv("DEBUG_INLINE")) {
                                 std::cerr << "[InlineExpansion] Inlining " << calleeFunc->getName()
-                                          << " into " << func->getName() << "\n";
+                                          << " into " << func->getName()
+                                          << " (" << calleeFunc->getBlocks().size()
+                                          << " blocks, " << countInstructions(calleeFunc)
+                                          << " instructions"
+                                          << (normalCandidate ? "" : ", hot-loop")
+                                          << ")\n";
                             }
                             if (tryInlineCall(inst, calleeFunc)) {
                                 changed = true;
@@ -714,9 +748,13 @@ bool inlineExpansion(IR::Module* mod) {
         // 内联后重新识别候选函数（之前不是叶子的函数可能变成叶子）
         if (changed) {
             candidates.clear();
+            normalCandidates.clear();
             for (auto& func : mod->getFunctions()) {
-                if (isInlineCandidate(func.get())) {
+                if (isHotInlineCandidate(func.get())) {
                     candidates.insert(func.get());
+                }
+                if (isInlineCandidate(func.get())) {
+                    normalCandidates.insert(func.get());
                 }
             }
         }

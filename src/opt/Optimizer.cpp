@@ -167,6 +167,13 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    // Remove stores to globals whose complete pointer-use graph is proven to
+    // contain no read or escape. This also exposes dead address arithmetic.
+    if (PASS_CALL(deadGlobalStoreElimination)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     // Cache-local scalar expansion for a strictly proven in-place matrix
     // product. Run after SSA construction so loop/reduction legality is
     // explicit, but before the iterative cleanup phases so the generated
@@ -216,6 +223,24 @@ void runO2(IR::Module* mod) {
 
         if (!phase2Changed) break;
     }
+
+    // Restrict a proven lower-triangular copy to its useful j range before
+    // later loop and address optimizations obscure the original guard.
+    if (PASS_CALL(triangularCopyOptimization)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // Fuse adjacent output columns for a strictly proven conditional matrix
+    // reduction. Phase 2 first exposes the reduction as SSA; this still runs
+    // before MagicDivision lowers the remainder operation used by the matcher.
+    if (PASS_CALL(conditionalMatrixBlocking)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     // ================================================================
     // 阶段 3：算术优化（在值传播之前！）
     //   关键设计决策：算术优化产生新常量，SCCP 需要在这些常量产生后
