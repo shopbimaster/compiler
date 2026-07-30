@@ -1,6 +1,7 @@
 #include "opt/MatrixReductionPlan.h"
 
 #include <string>
+#include <vector>
 
 namespace Opt {
 namespace {
@@ -63,6 +64,7 @@ IR::Function* createAffineRowSummaryFunction(
         IR::Instruction::createPhi(i32, "summary.acc", 4);
     IR::Instruction* initialRowSum = nullptr;
     IR::Value* initialAccumulation = zero;
+    std::vector<IR::Instruction*> initialSetup;
     IR::Value* fillValue = nullptr;
     if (summary.initialValueIsArgument) {
         fillValue = function->getArg(
@@ -73,9 +75,29 @@ IR::Function* createAffineRowSummaryFunction(
             i32, summary.initialValue->getValue());
     }
     if (fillValue) {
+        IR::Value* iterationCount = sizeArgument;
+        if (summary.indexStart != 0 ||
+            summary.indexStep != 1) {
+            auto* one = IR::ConstantInt::get(i32, 1);
+            auto* distance = IR::Instruction::createBinOp(
+                Opc::SUB, i32, "summary.iter.distance",
+                sizeArgument, indexStart);
+            auto* adjusted = IR::Instruction::createBinOp(
+                Opc::SUB, i32, "summary.iter.adjusted",
+                distance, one);
+            auto* quotient = IR::Instruction::createBinOp(
+                Opc::SDIV, i32, "summary.iter.quotient",
+                adjusted, indexStep);
+            auto* count = IR::Instruction::createBinOp(
+                Opc::ADD, i32, "summary.iter.count",
+                quotient, one);
+            initialSetup = {
+                distance, adjusted, quotient, count};
+            iterationCount = count;
+        }
         initialRowSum = IR::Instruction::createBinOp(
             Opc::MUL, i32, "summary.initial.row.sum",
-            sizeArgument, fillValue);
+            iterationCount, fillValue);
         initialAccumulation = initialRowSum;
     }
     accumulation->addOperand(initialAccumulation);
@@ -102,6 +124,9 @@ IR::Function* createAffineRowSummaryFunction(
         {indexI}, "summary.C.row");
     iBody->pushBack(rowA);
     iBody->pushBack(outputRow);
+    for (auto* instruction : initialSetup) {
+        iBody->pushBack(instruction);
+    }
     if (initialRowSum) {
         iBody->pushBack(initialRowSum);
     }
@@ -315,7 +340,7 @@ bool applyMatrixReductionPlan(
                 plan.kernel.indexStart +
                     (plan.kernel.inclusiveUpperBound
                          ? 0
-                         : plan.kernel.indexStep)));
+                         : 1)));
         return true;
     }
     return false;

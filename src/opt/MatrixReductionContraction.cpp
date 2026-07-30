@@ -471,8 +471,7 @@ bool matchKernelFunction(
     }
     if ((initialValueArgument ||
          initialValue->getValue() != 0) &&
-        (indexStart != 0 || indexStep != 1 ||
-         inclusiveUpperBound)) {
+        inclusiveUpperBound) {
         return false;
     }
 

@@ -1,0 +1,76 @@
+const int WIDTH = 8;
+
+int coefficient[WIDTH][WIDTH];
+int carrier[WIDTH][WIDTH];
+int temporary[WIDTH][WIDTH];
+
+void affine_step(
+    int size,
+    int scale[][WIDTH],
+    int input[][WIDTH],
+    int output[][WIDTH]) {
+    int i = 1;
+    while (i < size) {
+        int j = 1;
+        while (j < size) {
+            output[i][j] = 4;
+            j = j + 2;
+        }
+        i = i + 2;
+    }
+
+    int k = 1;
+    while (k < size) {
+        i = 1;
+        while (i < size) {
+            if (scale[i][k] != 1) {
+                int j = 1;
+                while (j < size) {
+                    output[i][j] =
+                        output[i][j] * scale[i][k] +
+                        input[k][j];
+                    j = j + 2;
+                }
+            }
+            i = i + 2;
+        }
+        k = k + 2;
+    }
+}
+
+int main() {
+    int size = getint();
+    int i = 1;
+    while (i < size) {
+        int j = 1;
+        while (j < size) {
+            coefficient[i][j] = (i + j) % 3 + 1;
+            carrier[i][j] = i * size + j + 1;
+            j = j + 2;
+        }
+        i = i + 2;
+    }
+
+    int round = 0;
+    while (round < 2) {
+        affine_step(
+            size, coefficient, carrier, temporary);
+        affine_step(
+            size, coefficient, temporary, carrier);
+        round = round + 1;
+    }
+
+    int result = 0;
+    i = 1;
+    while (i < size) {
+        int j = 1;
+        while (j < size) {
+            result = result + carrier[i][j];
+            j = j + 2;
+        }
+        i = i + 2;
+    }
+    putint(result);
+    putch(10);
+    return 0;
+}
