@@ -13,6 +13,10 @@ struct AffineKernelSummary {
     IR::Function* sourceFunction = nullptr;
     IR::ArrayType* rowType = nullptr;
     IR::ConstantInt* skippedScale = nullptr;
+    unsigned sizeArgumentIndex = 0;
+    unsigned scaleArgumentIndex = 0;
+    unsigned addendArgumentIndex = 0;
+    unsigned destinationArgumentIndex = 0;
     int64_t indexStart = 0;
     int64_t indexStep = 1;
     bool inclusiveUpperBound = false;

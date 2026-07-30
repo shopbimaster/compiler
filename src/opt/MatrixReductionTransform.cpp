@@ -30,6 +30,14 @@ IR::Function* createAffineRowSummaryFunction(
         i32, summary.indexStart);
     auto* indexStep = IR::ConstantInt::get(
         i32, summary.indexStep);
+    auto* sizeArgument =
+        function->getArg(summary.sizeArgumentIndex);
+    auto* scaleArgument =
+        function->getArg(summary.scaleArgumentIndex);
+    auto* addendArgument =
+        function->getArg(summary.addendArgumentIndex);
+    auto* destinationArgument =
+        function->getArg(summary.destinationArgumentIndex);
     const std::string loopPredicate =
         summary.inclusiveUpperBound ? "sle" : "slt";
 
@@ -63,17 +71,17 @@ IR::Function* createAffineRowSummaryFunction(
     entry->pushBack(IR::Instruction::createBr(iHeader));
     iHeader->pushBack(indexI);
     auto* iCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexI, function->getArg(0),
+        Opc::ICMP, indexI, sizeArgument,
         loopPredicate);
     iHeader->pushBack(iCompare);
     iHeader->pushBack(
         IR::Instruction::createCondBr(iCompare, iBody, exit));
 
     auto* rowA = IR::Instruction::createGetElementPtr(
-        summary.rowType, function->getArg(1),
+        summary.rowType, scaleArgument,
         {indexI}, "summary.A.row");
     auto* outputRow = IR::Instruction::createGetElementPtr(
-        summary.rowType, function->getArg(3),
+        summary.rowType, destinationArgument,
         {indexI}, "summary.C.row");
     iBody->pushBack(rowA);
     iBody->pushBack(outputRow);
@@ -82,7 +90,7 @@ IR::Function* createAffineRowSummaryFunction(
     kHeader->pushBack(indexK);
     kHeader->pushBack(accumulation);
     auto* kCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexK, function->getArg(0),
+        Opc::ICMP, indexK, sizeArgument,
         loopPredicate);
     kHeader->pushBack(kCompare);
     kHeader->pushBack(
@@ -96,7 +104,7 @@ IR::Function* createAffineRowSummaryFunction(
     auto* coefficient = IR::Instruction::createLoad(
         i32, coefficientAddress, "summary.coefficient");
     auto* inputRow = IR::Instruction::createGetElementPtr(
-        summary.rowType, function->getArg(2),
+        summary.rowType, addendArgument,
         {indexK}, "summary.B.row");
     auto* inputAddress =
         IR::Instruction::createGetElementPtr(

@@ -49,32 +49,53 @@ bool getCommonIterationDomain(
     return initialized;
 }
 
+bool isSemanticallyUnusedArgument(
+    IR::Argument* argument,
+    const AllocaArgumentMap& argumentMap) {
+    if (!argument) return false;
+
+    for (const auto& use : argument->getUses()) {
+        auto* instruction =
+            dynamic_cast<IR::Instruction*>(use.user);
+        if (!instruction ||
+            instruction->getOpcode() != Opc::STORE ||
+            instruction->getNumOperands() != 2 ||
+            use.operandNo != 0) {
+            return false;
+        }
+        auto found = argumentMap.find(
+            instruction->getOperand(1));
+        if (found == argumentMap.end() ||
+            found->second != argument) {
+            return false;
+        }
+    }
+
+    for (const auto& [alloca, mappedArgument] : argumentMap) {
+        if (mappedArgument != argument) continue;
+        for (const auto& use : alloca->getUses()) {
+            auto* instruction =
+                dynamic_cast<IR::Instruction*>(use.user);
+            if (!instruction ||
+                instruction->getOpcode() != Opc::STORE ||
+                instruction->getNumOperands() != 2 ||
+                use.operandNo != 1 ||
+                instruction->getOperand(0) != argument) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool matchKernelFunction(
     IR::Function* function, AffineKernelSummary& summary) {
-    if (!function || function->isExternal() ||
-        function->getNumArgs() != 4) {
+    if (!function || function->isExternal()) {
         return false;
     }
 
     auto* functionType = function->getFunctionType();
-    const auto& parameters = functionType->getParamTypes();
-    if (!functionType->getReturnType()->isVoid() ||
-        parameters.size() != 4 ||
-        parameters[0] != IR::IntegerType::I32 ||
-        parameters[1] != parameters[2] ||
-        parameters[1] != parameters[3]) {
-        return false;
-    }
-
-    auto* rowPointer =
-        dynamic_cast<IR::PointerType*>(parameters[1]);
-    auto* rowType = rowPointer
-        ? dynamic_cast<IR::ArrayType*>(
-              rowPointer->getPointeeType())
-        : nullptr;
-    if (!rowType ||
-        rowType->getElementType() != IR::IntegerType::I32 ||
-        rowType->getNumElements() < 2) {
+    if (!functionType->getReturnType()->isVoid()) {
         return false;
     }
     for (auto& block : function->getBlocks()) {
@@ -84,6 +105,58 @@ bool matchKernelFunction(
     }
 
     auto argumentMap = buildAllocaArgumentMap(function);
+    std::vector<AffineRecurrence> recurrences;
+    for (auto& block : function->getBlocks()) {
+        for (auto& instruction : block->getInstructions()) {
+            AffineRecurrence recurrence;
+            if (analyzeAffineRecurrence(
+                    instruction.get(), &argumentMap,
+                    recurrence) &&
+                dynamic_cast<IR::Argument*>(
+                    recurrence.destination.root) &&
+                dynamic_cast<IR::Argument*>(
+                    recurrence.scale.root) &&
+                dynamic_cast<IR::Argument*>(
+                    recurrence.addend.root)) {
+                recurrences.push_back(std::move(recurrence));
+            }
+        }
+    }
+    if (recurrences.size() != 1) return false;
+
+    const auto& recurrence = recurrences.front();
+    auto* destinationArgument =
+        dynamic_cast<IR::Argument*>(
+            recurrence.destination.root);
+    auto* scaleArgument =
+        dynamic_cast<IR::Argument*>(recurrence.scale.root);
+    auto* addendArgument =
+        dynamic_cast<IR::Argument*>(recurrence.addend.root);
+    if (!destinationArgument || !scaleArgument ||
+        !addendArgument ||
+        destinationArgument == scaleArgument ||
+        destinationArgument == addendArgument ||
+        scaleArgument == addendArgument) {
+        return false;
+    }
+
+    auto* rowPointer =
+        dynamic_cast<IR::PointerType*>(
+            destinationArgument->getType());
+    auto* rowType = rowPointer
+        ? dynamic_cast<IR::ArrayType*>(
+              rowPointer->getPointeeType())
+        : nullptr;
+    if (!rowType ||
+        rowType->getElementType() != IR::IntegerType::I32 ||
+        rowType->getNumElements() < 2 ||
+        scaleArgument->getType() !=
+            destinationArgument->getType() ||
+        addendArgument->getType() !=
+            destinationArgument->getType()) {
+        return false;
+    }
+
     std::vector<IR::Instruction*> outputStores;
     for (auto& block : function->getBlocks()) {
         for (auto& instruction : block->getInstructions()) {
@@ -95,7 +168,7 @@ bool matchKernelFunction(
             if (collectPointerAccess(
                     instruction->getOperand(1),
                     &argumentMap, access)) {
-                if (access.root == function->getArg(3)) {
+                if (access.root == destinationArgument) {
                     outputStores.push_back(instruction.get());
                 } else if (
                     dynamic_cast<IR::Argument*>(access.root) ||
@@ -117,6 +190,7 @@ bool matchKernelFunction(
         }
     }
     if (!zeroStore || !updateStore) return false;
+    if (updateStore != recurrence.store) return false;
 
     PointerAccess zeroOutput;
     if (!collectPointerAccess(
@@ -125,22 +199,17 @@ bool matchKernelFunction(
         return false;
     }
 
-    AffineRecurrence recurrence;
-    if (!analyzeAffineRecurrence(
-            updateStore, &argumentMap, recurrence)) {
-        return false;
-    }
     const auto& updatedOutput = recurrence.destination;
     if (updatedOutput.indices.size() != 2 ||
-        recurrence.previous.root != function->getArg(3) ||
+        recurrence.previous.root != destinationArgument ||
         recurrence.previous.indices != updatedOutput.indices) {
         return false;
     }
 
     const auto& coefficient = recurrence.scale;
     const auto& input = recurrence.addend;
-    if (coefficient.root != function->getArg(1) ||
-        input.root != function->getArg(2) ||
+    if (coefficient.root != scaleArgument ||
+        input.root != addendArgument ||
         coefficient.indices.size() != 2 ||
         input.indices.size() != 2) {
         return false;
@@ -188,7 +257,7 @@ bool matchKernelFunction(
             if (!collectPointerAccess(
                     comparedLoad->getOperand(0),
                     &argumentMap, comparedAccess) ||
-                comparedAccess.root != function->getArg(1) ||
+                comparedAccess.root != scaleArgument ||
                 comparedAccess.indices != coefficient.indices) {
                 continue;
             }
@@ -219,24 +288,66 @@ bool matchKernelFunction(
     CanonicalCountedLoop loopK;
     CanonicalCountedLoop zeroLoopI;
     CanonicalCountedLoop zeroLoopJ;
-    auto* size = function->getArg(0);
-    if (!analyzeCanonicalCountedLoop(
-            function, indexI, size,
-            updateStore->getParent(), loopI) ||
-        !analyzeCanonicalCountedLoop(
-            function, indexJ, size,
-            updateStore->getParent(), loopJ) ||
-        !analyzeCanonicalCountedLoop(
-            function, indexK, size,
-            updateStore->getParent(), loopK) ||
-        !analyzeCanonicalCountedLoop(
-            function, zeroOutput.indices[0], size,
-            zeroStore->getParent(), zeroLoopI) ||
-        !analyzeCanonicalCountedLoop(
-            function, zeroOutput.indices[1], size,
-            zeroStore->getParent(), zeroLoopJ)) {
-        return false;
+    IR::Argument* sizeArgument = nullptr;
+    for (unsigned index = 0;
+         index < function->getNumArgs(); ++index) {
+        auto* candidate = function->getArg(index);
+        if (candidate->getType() != IR::IntegerType::I32) {
+            continue;
+        }
+
+        CanonicalCountedLoop candidateLoopI;
+        CanonicalCountedLoop candidateLoopJ;
+        CanonicalCountedLoop candidateLoopK;
+        CanonicalCountedLoop candidateZeroLoopI;
+        CanonicalCountedLoop candidateZeroLoopJ;
+        if (!analyzeCanonicalCountedLoop(
+                function, indexI, candidate,
+                updateStore->getParent(),
+                candidateLoopI) ||
+            !analyzeCanonicalCountedLoop(
+                function, indexJ, candidate,
+                updateStore->getParent(),
+                candidateLoopJ) ||
+            !analyzeCanonicalCountedLoop(
+                function, indexK, candidate,
+                updateStore->getParent(),
+                candidateLoopK) ||
+            !analyzeCanonicalCountedLoop(
+                function, zeroOutput.indices[0],
+                candidate, zeroStore->getParent(),
+                candidateZeroLoopI) ||
+            !analyzeCanonicalCountedLoop(
+                function, zeroOutput.indices[1],
+                candidate, zeroStore->getParent(),
+                candidateZeroLoopJ)) {
+            continue;
+        }
+        if (sizeArgument) return false;
+        sizeArgument = candidate;
+        loopI = std::move(candidateLoopI);
+        loopJ = std::move(candidateLoopJ);
+        loopK = std::move(candidateLoopK);
+        zeroLoopI = std::move(candidateZeroLoopI);
+        zeroLoopJ = std::move(candidateZeroLoopJ);
     }
+    if (!sizeArgument) return false;
+
+    for (unsigned index = 0;
+         index < function->getNumArgs(); ++index) {
+        auto* argument = function->getArg(index);
+        if (argument == sizeArgument ||
+            argument == scaleArgument ||
+            argument == addendArgument ||
+            argument == destinationArgument) {
+            continue;
+        }
+        if (!isSemanticallyUnusedArgument(
+                argument, argumentMap)) {
+            return false;
+        }
+    }
+
     int64_t indexStart = 0;
     int64_t indexStep = 0;
     bool inclusiveUpperBound = false;
@@ -291,6 +402,14 @@ bool matchKernelFunction(
     summary.sourceFunction = function;
     summary.rowType = rowType;
     summary.skippedScale = skippedCoefficient;
+    summary.sizeArgumentIndex =
+        sizeArgument->getIndex();
+    summary.scaleArgumentIndex =
+        scaleArgument->getIndex();
+    summary.addendArgumentIndex =
+        addendArgument->getIndex();
+    summary.destinationArgumentIndex =
+        destinationArgument->getIndex();
     summary.indexStart = indexStart;
     summary.indexStep = indexStep;
     summary.inclusiveUpperBound =
@@ -582,6 +701,16 @@ IR::BasicBlock* findUniqueLoopPreheader(
     return preheader;
 }
 
+IR::Value* callArgument(
+    IR::Instruction* call, unsigned argumentIndex) {
+    if (!call ||
+        call->getOpcode() != Opc::CALL ||
+        argumentIndex + 1 >= call->getNumOperands()) {
+        return nullptr;
+    }
+    return call->getOperand(argumentIndex + 1);
+}
+
 bool matchCallChain(
     IR::Module* module, const AffineKernelSummary& kernel,
     const std::vector<IR::Instruction*>& calls,
@@ -592,7 +721,8 @@ bool matchCallChain(
     if (!caller || !callBlock) return false;
     std::unordered_set<IR::Instruction*> callSet;
     for (auto* call : calls) {
-        if (call->getNumOperands() != 5 ||
+        if (call->getNumOperands() !=
+                kernel.sourceFunction->getNumArgs() + 1 ||
             call->getParent()->getParent() != caller ||
             call->getParent() != callBlock) {
             return false;
@@ -608,12 +738,18 @@ bool matchCallChain(
     }
     if (orderedCalls.size() != calls.size()) return false;
 
-    auto* size = orderedCalls.front()->getOperand(1);
+    auto* size = callArgument(
+        orderedCalls.front(),
+        kernel.sizeArgumentIndex);
     auto* coefficientMatrix =
-        rootGlobal(orderedCalls.front()->getOperand(2));
+        rootGlobal(callArgument(
+            orderedCalls.front(),
+            kernel.scaleArgumentIndex));
     auto* seedMatrix =
-        rootGlobal(orderedCalls.front()->getOperand(3));
-    if (!coefficientMatrix || !seedMatrix ||
+        rootGlobal(callArgument(
+            orderedCalls.front(),
+            kernel.addendArgumentIndex));
+    if (!size || !coefficientMatrix || !seedMatrix ||
         coefficientMatrix == seedMatrix) {
         return false;
     }
@@ -622,10 +758,15 @@ bool matchCallChain(
     std::unordered_set<IR::GlobalVariable*> carrierMatrices = {
         seedMatrix};
     for (auto* call : orderedCalls) {
-        auto* inputMatrix = rootGlobal(call->getOperand(3));
-        auto* outputMatrix = rootGlobal(call->getOperand(4));
-        if (call->getOperand(1) != size ||
-            rootGlobal(call->getOperand(2)) != coefficientMatrix ||
+        auto* inputMatrix = rootGlobal(callArgument(
+            call, kernel.addendArgumentIndex));
+        auto* outputMatrix = rootGlobal(callArgument(
+            call, kernel.destinationArgumentIndex));
+        if (callArgument(
+                call, kernel.sizeArgumentIndex) != size ||
+            rootGlobal(callArgument(
+                call, kernel.scaleArgumentIndex)) !=
+                coefficientMatrix ||
             inputMatrix != currentMatrix ||
             !outputMatrix ||
             outputMatrix == inputMatrix ||
