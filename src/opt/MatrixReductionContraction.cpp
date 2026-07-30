@@ -309,7 +309,8 @@ bool matchKernelFunction(
         for (auto& owned : block->getInstructions()) {
             auto* compare = owned.get();
             if (compare->getOpcode() != Opc::ICMP ||
-                compare->getName() != "eq" ||
+                (compare->getName() != "eq" &&
+                 compare->getName() != "ne") ||
                 compare->getNumOperands() != 2) {
                 continue;
             }
@@ -341,14 +342,32 @@ bool matchKernelFunction(
             auto* terminator = compare->getParent()
                 ? compare->getParent()->getTerminator()
                 : nullptr;
-            auto* falseTarget = terminator &&
-                                        terminator->getOpcode() ==
-                                            Opc::COND_BR
-                ? dynamic_cast<IR::BasicBlock*>(
-                      terminator->getOperand(2))
-                : nullptr;
-            if (falseTarget &&
-                dominators[updateStore->getParent()].count(falseTarget)) {
+            if (!terminator ||
+                terminator->getOpcode() != Opc::COND_BR) {
+                continue;
+            }
+            auto* trueTarget =
+                dynamic_cast<IR::BasicBlock*>(
+                    terminator->getOperand(1));
+            auto* falseTarget =
+                dynamic_cast<IR::BasicBlock*>(
+                    terminator->getOperand(2));
+            const bool trueDominatesUpdate =
+                trueTarget &&
+                dominators[updateStore->getParent()].count(
+                    trueTarget);
+            const bool falseDominatesUpdate =
+                falseTarget &&
+                dominators[updateStore->getParent()].count(
+                    falseTarget);
+            const bool unequalExecutesUpdate =
+                (compare->getName() == "eq" &&
+                 falseDominatesUpdate &&
+                 !trueDominatesUpdate) ||
+                (compare->getName() == "ne" &&
+                 trueDominatesUpdate &&
+                 !falseDominatesUpdate);
+            if (unequalExecutesUpdate) {
                 if (skippedCoefficient &&
                     skippedCoefficient->getValue() !=
                         skipValue->getValue()) {
