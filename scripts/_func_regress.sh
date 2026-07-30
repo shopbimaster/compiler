@@ -7,10 +7,10 @@ cd /mnt/c/Users/whoever/Desktop/hust/game/compiler2026-x || exit 1
 
 GCC=riscv64-linux-gnu-gcc
 QEMU=qemu-riscv64-static
-COMPILER=./build_wsl/compiler
+COMPILER=${COMPILER:-./build_wsl/compiler}
 SYLIB=./build_b/libsylib.a
-TMPDIR=/tmp/func_regress
-rm -rf $TMPDIR && mkdir -p $TMPDIR
+TMPDIR=${FUNC_REGRESS_TMPDIR:-/tmp/func_regress}
+rm -rf "$TMPDIR" && mkdir -p "$TMPDIR"
 
 total=0 pass=0 compile_fail=0 link_fail=0 diff_fail=0 segfault=0 timeouts=0
 

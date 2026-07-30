@@ -43,8 +43,66 @@ void RegisterAllocator::allocate(IR::Function& func) {
     nextSpillSlot = 0;
     spillSlotSize = 0;
 
+    intRegPool = INT_REGS;
+    floatRegPool = FLOAT_REGS;
+    bool isLeaf = true;
+    unsigned integerArgs = 0;
+    unsigned floatArgs = 0;
+    for (unsigned index = 0; index < func.getNumArgs(); ++index) {
+        auto* type = func.getArg(index)->getType();
+        if (type && type->isFloat()) ++floatArgs;
+        else ++integerArgs;
+    }
+    for (const auto& block : func.getBlocks()) {
+        for (const auto& instruction : block->getInstructions()) {
+            if (instruction->getOpcode() == IR::Instruction::Opcode::CALL) {
+                isLeaf = false;
+                break;
+            }
+        }
+        if (!isLeaf) break;
+    }
+
     maxInstId = assignInstructionIds(func);
     buildIntervals(func);
+
+    auto exceedsBaseCapacity = [&](bool isFloat) {
+        const auto& basePool = isFloat ? FLOAT_REGS : INT_REGS;
+        int capacity = 0;
+        for (const auto& reg : basePool) {
+            if (!reservedRegs.count(reg)) ++capacity;
+        }
+        for (const auto& point : intervals) {
+            if (point.isFloat != isFloat) continue;
+            int live = 0;
+            for (const auto& interval : intervals) {
+                if (interval.isFloat == isFloat &&
+                    interval.start <= point.start &&
+                    point.start <= interval.end) {
+                    ++live;
+                }
+            }
+            if (live > capacity) return true;
+        }
+        return false;
+    };
+    if (isLeaf && func.prefersExpandedLeafRegisters()) {
+        // Unused argument registers are ordinary caller-saved registers in a
+        // leaf. Add them only when the base pool provably cannot hold the
+        // maximum live set, keeping low-pressure functions byte-stable.
+        if (exceedsBaseCapacity(false)) {
+            for (unsigned index = std::max(2u, integerArgs);
+                 index < 8; ++index) {
+                intRegPool.push_back("a" + std::to_string(index));
+            }
+        }
+        if (exceedsBaseCapacity(true)) {
+            for (unsigned index = std::max(2u, floatArgs);
+                 index < 8; ++index) {
+                floatRegPool.push_back("fa" + std::to_string(index));
+            }
+        }
+    }
     if (useGraphColoring()) {
         colorAllocate();   // 图着色分配器（默认；RA_ALLOCATOR=linear 可切回线扫）
     } else {
@@ -724,7 +782,7 @@ void RegisterAllocator::linearScan() {
     for (auto& current : intervals) {
         expireOldIntervals(current.start, active);
 
-        const auto& regPool = current.isFloat ? FLOAT_REGS : INT_REGS;
+        const auto& regPool = current.isFloat ? floatRegPool : intRegPool;
         std::set<std::string> freeRegs(regPool.begin(), regPool.end());
 
         // 移除已被预留的寄存器
@@ -783,7 +841,7 @@ void RegisterAllocator::colorAllocate() {
 }
 
 bool RegisterAllocator::colorRegClass(bool isFloat) {
-    const auto& regPool = isFloat ? FLOAT_REGS : INT_REGS;
+    const auto& regPool = isFloat ? floatRegPool : intRegPool;
     // 可用物理寄存器 = 池 - 预留寄存器
     std::vector<std::string> kRegs;
     for (const auto& r : regPool) {

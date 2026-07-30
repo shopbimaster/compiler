@@ -167,6 +167,16 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    // Cache-local scalar expansion for a strictly proven in-place matrix
+    // product. Run after SSA construction so loop/reduction legality is
+    // explicit, but before the iterative cleanup phases so the generated
+    // helper receives the remaining O2 and O3 optimizations.
+    if (PASS_CALL(inplaceMatrixBlocking)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     // ================================================================
     // 阶段 2：指令级化简 + CFG 简化（迭代 2 次收敛）
     //   InstCombine（含 Store-to-Load 前推）暴露死存储，
