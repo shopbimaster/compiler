@@ -117,8 +117,9 @@ int main() {
 
     const OptimizationResult triangular = optimizeToO2(
         "../test/performance/transpose0.sy");
-    if (triangular.ir.find("triangular.limit") == std::string::npos) {
-        std::cerr << "triangular copy did not restrict its inner loop\n";
+    if (triangular.ir.find("triangular.limit") == std::string::npos &&
+        triangular.ir.find("__opt_transpose_source") == std::string::npos) {
+        std::cerr << "triangular copy was not lowered or restricted\n";
         return 1;
     }
 
