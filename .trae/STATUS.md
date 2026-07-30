@@ -115,6 +115,15 @@ P6 启用 vs 基线（P1+P2+P4），3 次取最小值：
 - 功能 **97/100**（较基线 95 提升：85_long_code/86_long_code2 超时解除；3 DIFF 均预存：62_percolation/68_brainfk/71_full_conn）。
 - 95_float 修复后 PASS；59_sort_test5 PASS；crypto-1/2/3 PASS；huffman-01 PASS。
 
+### 1.7a Peephole mv+branch 误删 promoted STORE 修复（2026-07-30，分支 fix-nested-calls-bst）
+
+- **症状**：93_nested_calls / 11_BST 在 -O0 失败（93 返回 24 应为 250；11_BST 输出 "10 65 88" 应为完整遍历）。-O1 均通过；`NO_PEEPHOLE=1` 后均通过 → PeepholeOptimizer 是根因。
+- **根因**：`mv rd,rs; bnez/beqz rd,label` 模式（[PeepholeOptimizer.cpp:1437](file:///d:/VSCodeProjects/compiler/src/opt/PeepholeOptimizer.cpp)）只检查 fall-through 路径（`isRegDeadGlobal(lines, i+2, mvRd)`），未检查 branch-taken 路径。`isRegDeadGlobal` 从 i+2（branch 之后）起扫描，不会回溯到本条 branch 的 taken-target，漏掉 taken 路径对 mvRd 的读取。
+  - 典型：`if(!n) return 0;` 编译为 `mv s2,n; bnez s2,endif; (return 0); endif: while(...) bge i,s2`。fall-through 到 epilogue 的 `ld s2`（callee-saved 恢复）被误判为 kill → 误删 `mv s2,n` → while 读取未初始化 s2。
+- **修复**：新增 `deadOnBothPaths` 检查，从 `brLabel` 起再跑一次 `isRegDeadGlobal`，fall-through 与 branch-taken 两路均死才替换。
+- **验证**：93/11_BST -O0/-O1 全 PASS。全套：func O1 97/3预存（+2：55_sort_test1/85_long_code 超时解除）、func O0 99/1预存、hfunc O0 40/0、hfunc O1 36/4预存、perf 60/0。无新增回归。
+- **附带收益**：peephole bug 导致的错误代码（无限循环）正是 55_sort_test1 / 85_long_code 超时的根因，修复后两例通过。
+
 ### 1.7 71_full_conn 预存回归诊断（2026-07-29，未修复，待单独处理）
 
 - **症状**：`model(a)` 返回 1（"cat"）应为 0（"dog"），所有 -O1 模式均错；-O0 正确。

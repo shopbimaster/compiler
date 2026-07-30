@@ -1436,21 +1436,40 @@ std::string peepholeOptimize(const std::string& asmCode) {
 
             // mv rd, rs; bnez rd, label → bnez rs, label
             // mv rd, rs; beqz rd, label → beqz rs, label
-            // 安全条件：mvRd 在 branch 之后必须死亡（branch 不定义寄存器，mvRd 可能 live-out）
+            // 安全条件：mvRd 在 branch 的两条后继路径上均必须死亡。
+            //   branch 不定义寄存器，但控制流分裂为 fall-through 与 branch-taken，
+            //   mvRd 可能在任一路径上 live-out，故两路均死才可消除 mv。
+            //   ★ 仅检查 fall-through（i+2）不够：isRegDeadGlobal 从 i+2 起扫描，
+            //     不会回溯到本条 branch 的 taken-target，会漏掉 taken 路径上对
+            //     mvRd 的读取。典型场景：if(!n) return 0; 编译为
+            //       mv s2,n; bnez s2,endif; (return 0); endif: while(...) bge i,s2
+            //     s2 在 taken 路径（while 条件）活跃，但 fall-through 到 epilogue
+            //     的 ld s2（callee-saved 恢复）被误判为 kill → 误删 mv s2,n →
+            //     while 读取未初始化 s2。影响 11_BST / 93_nested_calls -O0。
+            //   修复：显式从 brLabel 起再跑 isRegDeadGlobal，两路均死才替换。
             if (!matched && i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {
                 std::string mvRd, mvRs;
                 if (tryMatch(lines[i], "mv", mvRd, mvRs, imm)) {
                     std::string brRs, brLabel;
+                    // mvRd 必须在 fall-through 与 branch-taken 两条路径上均死亡。
+                    auto deadOnBothPaths = [&](const std::string& label) -> bool {
+                        // fall-through 路径（从 i+2 起）
+                        if (!(isRegDeadInBB(lines, i + 2, mvRd) ||
+                              isRegDeadGlobal(lines, i + 2, mvRd, labelMap)))
+                            return false;
+                        // branch-taken 路径（从 label 起）
+                        auto it = labelMap.find(label);
+                        if (it == labelMap.end()) return false;  // 未知目标，保守不优化
+                        return isRegDeadGlobal(lines, it->second, mvRd, labelMap);
+                    };
                     if (tryMatchBranch(lines[i + 1], "bnez", brRs, brLabel) && brRs == mvRd) {
-                        if (isRegDeadInBB(lines, i + 2, mvRd) ||
-                            isRegDeadGlobal(lines, i + 2, mvRd, labelMap)) {
+                        if (deadOnBothPaths(brLabel)) {
                             result.push_back("  bnez    " + mvRs + ", " + brLabel);
                             ++i;
                             matched = true;
                         }
                     } else if (tryMatchBranch(lines[i + 1], "beqz", brRs, brLabel) && brRs == mvRd) {
-                        if (isRegDeadInBB(lines, i + 2, mvRd) ||
-                            isRegDeadGlobal(lines, i + 2, mvRd, labelMap)) {
+                        if (deadOnBothPaths(brLabel)) {
                             result.push_back("  beqz    " + mvRs + ", " + brLabel);
                             ++i;
                             matched = true;
