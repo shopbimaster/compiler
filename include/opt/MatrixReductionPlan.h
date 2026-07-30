@@ -14,6 +14,8 @@ struct AffineKernelSummary {
     IR::ArrayType* rowType = nullptr;
     IR::ConstantInt* initialValue = nullptr;
     IR::ConstantInt* skippedScale = nullptr;
+    unsigned initialValueArgumentIndex = 0;
+    bool initialValueIsArgument = false;
     unsigned sizeArgumentIndex = 0;
     unsigned scaleArgumentIndex = 0;
     unsigned addendArgumentIndex = 0;

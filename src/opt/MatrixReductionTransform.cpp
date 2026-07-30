@@ -63,10 +63,16 @@ IR::Function* createAffineRowSummaryFunction(
         IR::Instruction::createPhi(i32, "summary.acc", 4);
     IR::Instruction* initialRowSum = nullptr;
     IR::Value* initialAccumulation = zero;
-    if (summary.initialValue &&
-        summary.initialValue->getValue() != 0) {
-        auto* fillValue = IR::ConstantInt::get(
+    IR::Value* fillValue = nullptr;
+    if (summary.initialValueIsArgument) {
+        fillValue = function->getArg(
+            summary.initialValueArgumentIndex);
+    } else if (summary.initialValue &&
+               summary.initialValue->getValue() != 0) {
+        fillValue = IR::ConstantInt::get(
             i32, summary.initialValue->getValue());
+    }
+    if (fillValue) {
         initialRowSum = IR::Instruction::createBinOp(
             Opc::MUL, i32, "summary.initial.row.sum",
             sizeArgument, fillValue);

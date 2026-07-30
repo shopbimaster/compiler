@@ -88,6 +88,62 @@ bool isSemanticallyUnusedArgument(
     return true;
 }
 
+bool isInitializationOnlyArgument(
+    IR::Argument* argument,
+    IR::Instruction* initialStore,
+    const AllocaArgumentMap& argumentMap) {
+    if (!argument || !initialStore) return false;
+
+    for (const auto& use : argument->getUses()) {
+        auto* instruction =
+            dynamic_cast<IR::Instruction*>(use.user);
+        if (instruction == initialStore &&
+            use.operandNo == 0) {
+            continue;
+        }
+        if (!instruction ||
+            instruction->getOpcode() != Opc::STORE ||
+            instruction->getNumOperands() != 2 ||
+            use.operandNo != 0) {
+            return false;
+        }
+        auto found = argumentMap.find(
+            instruction->getOperand(1));
+        if (found == argumentMap.end() ||
+            found->second != argument) {
+            return false;
+        }
+    }
+
+    for (const auto& [alloca, mappedArgument] : argumentMap) {
+        if (mappedArgument != argument) continue;
+        for (const auto& use : alloca->getUses()) {
+            auto* instruction =
+                dynamic_cast<IR::Instruction*>(use.user);
+            if (!instruction) return false;
+            if (instruction->getOpcode() == Opc::STORE &&
+                instruction->getNumOperands() == 2 &&
+                use.operandNo == 1 &&
+                instruction->getOperand(0) == argument) {
+                continue;
+            }
+            if (instruction->getOpcode() != Opc::LOAD ||
+                instruction->getNumOperands() != 1 ||
+                use.operandNo != 0) {
+                return false;
+            }
+            for (const auto& loadUse :
+                 instruction->getUses()) {
+                if (loadUse.user != initialStore ||
+                    loadUse.operandNo != 0) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool matchKernelFunction(
     IR::Function* function, AffineKernelSummary& summary) {
     if (!function || function->isExternal()) {
@@ -183,18 +239,34 @@ bool matchKernelFunction(
     IR::Instruction* initialStore = nullptr;
     IR::Instruction* updateStore = recurrence.store;
     IR::ConstantInt* initialValue = nullptr;
+    IR::Argument* initialValueArgument = nullptr;
     for (auto* store : outputStores) {
         if (store == updateStore) continue;
         if (initialStore) return false;
         initialValue = dynamic_cast<IR::ConstantInt*>(
             store->getOperand(0));
-        if (!initialValue ||
-            initialValue->getType() != IR::IntegerType::I32) {
+        if (!initialValue) {
+            PointerAccess source;
+            if (!collectPointerAccess(
+                    store->getOperand(0), &argumentMap,
+                    source) ||
+                !source.indices.empty()) {
+                return false;
+            }
+            initialValueArgument =
+                dynamic_cast<IR::Argument*>(source.root);
+        }
+        if ((!initialValue && !initialValueArgument) ||
+            store->getOperand(0)->getType() !=
+                IR::IntegerType::I32) {
             return false;
         }
         initialStore = store;
     }
-    if (!initialStore || !initialValue) return false;
+    if (!initialStore ||
+        (!initialValue && !initialValueArgument)) {
+        return false;
+    }
 
     PointerAccess initialOutput;
     if (!collectPointerAccess(
@@ -337,6 +409,13 @@ bool matchKernelFunction(
         initialLoopJ = std::move(candidateInitialLoopJ);
     }
     if (!sizeArgument) return false;
+    if (initialValueArgument &&
+        (initialValueArgument == sizeArgument ||
+         !isInitializationOnlyArgument(
+             initialValueArgument, initialStore,
+             argumentMap))) {
+        return false;
+    }
 
     for (unsigned index = 0;
          index < function->getNumArgs(); ++index) {
@@ -344,7 +423,8 @@ bool matchKernelFunction(
         if (argument == sizeArgument ||
             argument == scaleArgument ||
             argument == addendArgument ||
-            argument == destinationArgument) {
+            argument == destinationArgument ||
+            argument == initialValueArgument) {
             continue;
         }
         if (!isSemanticallyUnusedArgument(
@@ -370,7 +450,8 @@ bool matchKernelFunction(
                 indexStep) {
         return false;
     }
-    if (initialValue->getValue() != 0 &&
+    if ((initialValueArgument ||
+         initialValue->getValue() != 0) &&
         (indexStart != 0 || indexStep != 1 ||
          inclusiveUpperBound)) {
         return false;
@@ -413,6 +494,12 @@ bool matchKernelFunction(
     summary.rowType = rowType;
     summary.initialValue = initialValue;
     summary.skippedScale = skippedCoefficient;
+    summary.initialValueIsArgument =
+        initialValueArgument != nullptr;
+    if (initialValueArgument) {
+        summary.initialValueArgumentIndex =
+            initialValueArgument->getIndex();
+    }
     summary.sizeArgumentIndex =
         sizeArgument->getIndex();
     summary.scaleArgumentIndex =
