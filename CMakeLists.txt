@@ -109,6 +109,10 @@ add_library(sysy_opt STATIC
     src/opt/ReadOnlyGlobal.cpp
     src/opt/SCCP.cpp
     src/opt/LoopFind.cpp
+    src/opt/AffineRecurrenceAnalysis.cpp
+    src/opt/LoopPatternAnalysis.cpp
+    src/opt/MemoryAccessAnalysis.cpp
+    src/opt/ScalarReductionAnalysis.cpp
     src/opt/SCEVAnalysis.cpp
     src/opt/LoopStrengthReduce.cpp
     src/opt/LoopFullUnroll.cpp
@@ -139,9 +143,13 @@ add_library(sysy_opt STATIC
     src/opt/InstructionScheduling.cpp
     src/opt/RecursiveMulToNative.cpp
     src/opt/RepeatedDivRemToNative.cpp
+    src/opt/ModAddRecurrence.cpp
+    src/opt/StencilInteriorSpecialization.cpp
     src/opt/RecursiveCallGuard.cpp
     src/opt/MatrixReductionContraction.cpp
+    src/opt/MatrixReductionTransform.cpp
     src/opt/RadixSortLowering.cpp
+    src/opt/RecursiveMemoization.cpp
     src/opt/BitOpPatternRecognition.cpp
     src/opt/PowerOfTwoDispatch.cpp
     src/opt/GlobalVariablePromotion.cpp

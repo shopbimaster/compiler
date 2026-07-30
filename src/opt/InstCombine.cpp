@@ -110,13 +110,18 @@ IR::Value* simplifyBinaryOp(IR::Instruction* inst) {
             break;
         case Opc::AND:
             if (isZero(lhs) || isZero(rhs)) return IR::ConstantInt::get(IR::IntegerType::I32, 0); // 0 & x = 0
+            if (isNegOne(lhs)) return rhs;     // -1 & x = x（-1 全 1 位掩码，恒等）
+            if (isNegOne(rhs)) return lhs;     // x & -1 = x
             if (lhs == rhs) return lhs;        // x & x = x
             break;
         case Opc::OR:
             if (isZero(lhs)) return rhs;       // 0 | x = x
             if (isZero(rhs)) return lhs;       // x | 0 = x
+            if (isNegOne(lhs) || isNegOne(rhs)) // -1 | x = -1（全 1）
+                return IR::ConstantInt::get(IR::IntegerType::I32, -1);
             if (lhs == rhs) return lhs;        // x | x = x
             break;
+
         case Opc::XOR:
             if (isZero(lhs)) return rhs;       // 0 ^ x = x
             if (isZero(rhs)) return lhs;       // x ^ 0 = x

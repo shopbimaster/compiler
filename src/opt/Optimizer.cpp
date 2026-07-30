@@ -55,10 +55,24 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    if (PASS_CALL(modAddRecurrenceStrengthReduce)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     if (PASS_CALL(radixSortLowering)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
+
+    // 纯自递归函数记忆化：在尾递归消除/内联之前运行，因为匹配逻辑依赖
+    // 恰好一个外部调用点和 alloca/load/store（非 PHI）的原始形态；
+    // 这两个前提在内联或尾递归转换后不再成立。
+    if (PASS_CALL(recursiveMemoization)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
 
     if (PASS_CALL(repeatedDivRemToNative)) {
         constantFolding(mod);
@@ -365,9 +379,15 @@ void runO2(IR::Module* mod) {
     // 6a. IfConversion：条件转换
     if (ifConversion(mod)) {
         simplifyCFG(mod);  // 清理 IfConversion 产生的同目标 COND_BR
+        // IfConversion 把 `||`/`&&` 降级成 select(cond,1,x)/select(cond,x,0)。
+        // 这类 i1 select 等价于单条 or/and，否则后端展开成 seqz/neg/and/or 多条
+        // 指令（knapsack 递归体 `i==0||w==0`、短路求值等热路径每次都执行）。
+        // 此处补一次 algebraicSimplification 折叠这些新 select，再清理。
+        algebraicSimplification(mod);
         constantFolding(mod);
         deadCodeElimination(mod);
     }
+
     // 6b. ADCE：激进死代码消除
     if (adce(mod)) {
         constantFolding(mod);
@@ -403,6 +423,12 @@ void runO2(IR::Module* mod) {
             constantFolding(mod);
             deadCodeElimination(mod);
         }
+    }
+
+    if (PASS_CALL(stencilInteriorSpecialization)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
     }
 
     matrixReductionContraction(mod);

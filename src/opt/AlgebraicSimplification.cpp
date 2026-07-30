@@ -543,7 +543,7 @@ bool trySimplify(IR::Instruction* inst) {
                             auto* repl = IR::Instruction::createGetElementPtr(
                                 pointee, innerGEP->getOperand(0), indices, inst->getName() + ".is");
                             for (auto it = bb->begin(); it != bb->end(); ++it) {
-                                if (it->get() == inst) {
+                            if (it->get() == inst) {
                                     replaceWithNewInst(it, inst, repl);
                                     return true;
                                 }
@@ -555,10 +555,56 @@ bool trySimplify(IR::Instruction* inst) {
         }
     }
 
+    // ================================================================
+    // SELECT → 布尔 OR/AND 化简
+    //   select(cond, 1, x) → or(cond, x)    （对应 a || b）
+    //   select(cond, x, 0) → and(cond, x)   （对应 a && b）
+    // 前提：cond 与非常量分支 x 均为 i1（值域 {0,1}），此时按位 or/and 与
+    //   select 逐位等价。IfConversion 把 `||`/`&&` 降级成的 select 正是此形，
+    //   否则后端把 select 展开成 seqz/neg/and/or 多条指令（knapsack 递归体的
+    //   `i==0 || w==0`、短路求值等热路径每次都执行）。化简为单条 or/and。
+    // 安全性：纯函数式；要求 cond 和 x 都是 i1，结果类型沿用 select 的 i1。
+    // ================================================================
+    if (op == Opc::SELECT && inst->getNumOperands() >= 3) {
+        auto* cond = inst->getOperand(0);
+        auto* tv = inst->getOperand(1);
+        auto* fv = inst->getOperand(2);
+        auto isI1 = [](IR::Value* v) {
+            return v && v->getType() == IR::IntegerType::I1;
+        };
+        auto isConstVal = [](IR::Value* v, int64_t k) {
+            auto* c = dynamic_cast<IR::ConstantInt*>(v);
+            return c && c->getValue() == k;
+        };
+        // 结果类型沿用 select 的类型（常见为 i32，因结果会存入 int 变量）：
+        // cond/x 为 i1（值 0/1），or/and 逐位运算结果仍是 0/1，存入更宽整数
+        // 位模式一致，故安全。只需 cond 与非常量分支 x 都是 i1。
+        if (isI1(cond)) {
+            IR::Instruction* repl = nullptr;
+
+            if (isConstVal(tv, 1) && isI1(fv)) {
+                repl = IR::Instruction::createBinOp(
+                    Opc::OR, inst->getType(), inst->getName() + ".sor", cond, fv);
+            } else if (isConstVal(fv, 0) && isI1(tv)) {
+                repl = IR::Instruction::createBinOp(
+                    Opc::AND, inst->getType(), inst->getName() + ".sand", cond, tv);
+            }
+            if (repl) {
+                for (auto it = bb->begin(); it != bb->end(); ++it) {
+                    if (it->get() == inst) {
+                        replaceWithNewInst(it, inst, repl);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     return false;
 }
 
 } // namespace
+
 
 // ================================================================
 // algebraicSimplification 入口 — 迭代直到收敛
