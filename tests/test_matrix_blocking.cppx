@@ -10,6 +10,7 @@ namespace {
 
 struct OptimizationResult {
     std::string ir;
+    bool changed = false;
     bool inPlaceHelperPrefersExpandedRegisters = false;
     bool conditionalHelperPrefersExpandedRegisters = false;
     bool anyFunctionPrefersExpandedRegisters = false;
@@ -17,6 +18,17 @@ struct OptimizationResult {
     bool callsHotLeafF = false;
     bool callsHotLoopTest = false;
 };
+
+OptimizationResult runFocusedPass(
+        const std::string& source, bool (*pass)(IR::Module*)) {
+    IR::IRBuilder builder;
+    auto module = builder.compile(source);
+    Opt::runO1(module.get());
+    OptimizationResult result;
+    result.changed = pass(module.get());
+    result.ir = module->dump();
+    return result;
+}
 
 OptimizationResult optimizeToO2(const std::string& source) {
     IR::IRBuilder builder;
@@ -133,6 +145,23 @@ int main() {
         "../test/performance/h-4-01.sy");
     if (hotInline.callsHotLeafF || hotInline.callsHotLoopTest) {
         std::cerr << "unique hot-loop leaf calls were not inlined\n";
+        return 1;
+    }
+
+    const OptimizationResult genericRepeat = runFocusedPass(
+        "../test/optimization/redundant_iteration_variant.sy",
+        Opt::redundantIterationElimination);
+    if (!genericRepeat.changed) {
+        std::cerr << "renamed redundant-iteration variant did not trigger\n";
+        return 1;
+    }
+
+    const OptimizationResult genericFixedPoint = runFocusedPass(
+        "../test/optimization/dynamic_fixed_point_variant.sy",
+        Opt::dynamicIdempotentLoopElimination);
+    if (!genericFixedPoint.changed ||
+        genericFixedPoint.ir.find("fixedpoint.ready") == std::string::npos) {
+        std::cerr << "renamed dynamic fixed-point variant did not trigger\n";
         return 1;
     }
 

@@ -1,0 +1,29 @@
+int payload[257];
+int payload_length;
+int cursor;
+int rolling_state;
+int emitted[257];
+
+int process_payload() {
+    while (cursor < payload_length) {
+        rolling_state = rolling_state + payload[cursor];
+        emitted[cursor] = rolling_state;
+        rolling_state = 0;
+        cursor = cursor + 1;
+    }
+    return rolling_state;
+}
+
+int main() {
+    payload_length = getarray(payload);
+    int rounds = 17;
+    int final_state;
+    while (rounds > 0) {
+        cursor = 0;
+        final_state = process_payload();
+        rounds = rounds - 1;
+    }
+    putint(final_state);
+    putch(10);
+    return 0;
+}

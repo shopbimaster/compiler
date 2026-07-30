@@ -149,6 +149,8 @@ add_library(sysy_opt STATIC
     src/opt/MatrixReductionContraction.cpp
     src/opt/MatrixReductionTransform.cpp
     src/opt/RadixSortLowering.cpp
+    src/opt/RedundantIterationElimination.cpp
+    src/opt/DynamicIdempotentLoopElimination.cpp
     src/opt/RecursiveMemoization.cpp
     src/opt/BitOpPatternRecognition.cpp
     src/opt/PowerOfTwoDispatch.cpp
