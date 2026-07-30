@@ -433,6 +433,17 @@ void runO3(IR::Module* mod) {
         o3Changed = true;
     }
 
+    // E4: LoopRotation — while(cond){body} → guard + do{body}while(cond)
+    // 消除回边无条件 j，让循环体成为 fall-through 流。在 FullUnroll 之前运行：
+    // 旋转后的 do-while 形态更易被 LoopFullUnroll 识别为单 BB 体。
+    // 开关：LOOP_ROTATE_OFF=1 或 OPT_DISABLE=loopRotation
+    if (PASS_CALL(loopRotation)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+        o3Changed = true;
+    }
+
     // LoopFullUnroll：基于 SCEV 确定迭代次数的完全展开
     if (PASS_CALL(loopFullUnroll)) {
         constantFolding(mod);

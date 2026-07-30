@@ -134,6 +134,7 @@ bool loopInterchange(IR::Module* mod);
 bool tailRecursionElimination(IR::Module* mod);
 bool loopStrengthReduce(IR::Module* mod);
 bool loopFullUnroll(IR::Module* mod);
+bool loopRotation(IR::Module* mod);         // E4: 循环旋转（回边 fall-through 化）
 bool gepStrengthReduce(IR::Module* mod);
 bool instructionScheduling(IR::Module* mod);
 bool reductionSplitting(IR::Module* mod);   // P1: 多累加器归约分裂

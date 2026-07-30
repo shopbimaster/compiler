@@ -1531,10 +1531,57 @@ void TargetCodeGen::emitCondBr(IR::Instruction& inst) {
     // 原因：away 边的 PHI moves + j awayBB 必须内联在当前块末尾，会物理拦截
     // fall-through 路径（fall-through 会误执行 away 的 phi moves 和跳转）。
     // 此时退化为非 fall-through 模式（显式 j fallBB 跳过 away 代码块）。
+    //
+    // ★★ Self-loop 特殊处理（LoopRotation 关键收益点）：
+    // 当 away 边是自环（awayBB == currentBB，即循环回边）时，PHI moves 可安全
+    // 内联到分支指令之前，无需创建 edge-split 块（消除 mv+j 开销）。
+    //
+    // 安全性论证：
+    //   - back-edge 路径（cond true → 跳回 body）：moves 正确更新循环迭代变量供
+    //     下一迭代使用。✓
+    //   - exit 路径（cond false → fall-through 到 fallBB）：moves 已执行但 PHI
+    //     目标寄存器在 exit 路径必须不可被读取。LoopRotation 的 fixExitPhis 已将
+    //     exit PHI 引用从 header PHI 改为 back-edge 值（存于不同寄存器），故安全。
+    //   - 额外保守检查：若 exit 边的 PHI moves 引用了任一 self-loop PHI 目标
+    //     （说明 fixExitPhis 未运行或未覆盖），则不内联（回退到 edge-split）。
+    //   - ICMP 条件已在 moves 之前求值（结果存于独立寄存器），不受 moves 影响。✓
+    const bool selfLoopAway = (awayBB == currentBB);
     if (doFallThrough) {
         auto awayIt = phiMoveMap.find({currentBB, awayBB});
         if (awayIt != phiMoveMap.end() && !awayIt->second.empty()) {
-            doFallThrough = false;
+            if (selfLoopAway) {
+                // 保守检查：exit 边 PHI moves 不能引用 self-loop PHI 目标
+                bool canInline = true;
+                auto exitIt = phiMoveMap.find({currentBB, fallBB});
+                if (exitIt != phiMoveMap.end() && !exitIt->second.empty()) {
+                    // 收集 self-loop PHI 目标（PhiMove::phi 是目标 PHI 指令）
+                    std::vector<IR::Value*> selfPhiDests;
+                    selfPhiDests.reserve(awayIt->second.size());
+                    for (auto& m : awayIt->second) {
+                        selfPhiDests.push_back(m.phi);
+                    }
+                    // exit 边的 incoming 若是 self-loop PHI 目标，则内联会破坏 exit 值
+                    for (auto& m : exitIt->second) {
+                        for (auto* d : selfPhiDests) {
+                            if (m.incoming == d) {
+                                canInline = false;
+                                break;
+                            }
+                        }
+                        if (!canInline) break;
+                    }
+                }
+                if (canInline) {
+                    // 内联 self-loop PHI moves 到分支前（消除 edge-split 块的 mv+j）
+                    emitPhiMovesForEdge(currentBB, awayBB);
+                    // 清除已内联的 moves，避免后续 fall/away 处理误发射
+                    phiMoveMap.erase({currentBB, awayBB});
+                } else {
+                    doFallThrough = false;
+                }
+            } else {
+                doFallThrough = false;
+            }
         }
     }
 

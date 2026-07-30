@@ -6,7 +6,11 @@
 //       黑名单：跳过列出的 pass（逗号/空格/分号分隔）
 //   OPT_ENABLE="globalValueNumbering,sparseConditionalConstantPropagation"
 //       白名单：只运行列出的 pass（其余全部跳过）
-//   白名单非空时优先于黑名单。
+//   OPT_FORCE_ENABLE="loopRotation"
+//       强制启用 builtinDisable 中的 pass（保持其余 pass 默认行为）
+//       用于在完整优化流水线上测试默认禁用的 pass，不影响其他 pass
+//   白名单(OPT_ENABLE)非空时优先于一切。
+//   OPT_FORCE_ENABLE 不覆盖 OPT_DISABLE 黑名单。
 //
 // 键名 = Optimizer.h 中的 pass 函数名（如 mem2reg / simplifyCFG / GVN 别名
 // globalValueNumbering）。兼容旧开关 OPT_DISABLE_GVN=1。
@@ -54,6 +58,7 @@ std::unordered_set<std::string> parseEnvList(const char* var) {
 bool passEnabled(const std::string& name) {
     static const std::unordered_set<std::string> enableList = parseEnvList("OPT_ENABLE");
     static const std::unordered_set<std::string> disableList = parseEnvList("OPT_DISABLE");
+    static const std::unordered_set<std::string> forceEnableList = parseEnvList("OPT_FORCE_ENABLE");
 
     if (!enableList.empty())
         return enableList.count(name) > 0;
@@ -61,14 +66,17 @@ bool passEnabled(const std::string& name) {
         return false;
 
     // ★ 内置默认禁用列表：这些 pass 在 BOOM 目标上无收益或有 bug。
-    //   可用 OPT_ENABLE=passName 强制开启（用于调试/对比）。
+    //   可用 OPT_FORCE_ENABLE=passName 在完整流水线上强制启用（用于对比测试）。
     //   - loopStrengthReduce：BOOM mul 单周期全流水，强度削减净负收益（A3/B2 验证）；
     //     且在多 BB 循环体（如 crypto 的 3*i）上累加器变换有 bug，破坏计算。
     static const std::unordered_set<std::string> builtinDisable = {
         "loopStrengthReduce",
     };
-    if (builtinDisable.count(name) > 0)
+    if (builtinDisable.count(name) > 0) {
+        // OPT_FORCE_ENABLE 可覆盖 builtinDisable（但不覆盖 OPT_DISABLE 黑名单）
+        if (forceEnableList.count(name) > 0) return true;
         return false;
+    }
 
     // 兼容旧开关 OPT_DISABLE_GVN=1
     if (name == "globalValueNumbering") {

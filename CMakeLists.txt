@@ -112,6 +112,7 @@ add_library(sysy_opt STATIC
     src/opt/SCEVAnalysis.cpp
     src/opt/LoopStrengthReduce.cpp
     src/opt/LoopFullUnroll.cpp
+    src/opt/LoopRotation.cpp
     src/opt/GEPStrengthReduce.cpp
     src/opt/LoadElimination.cpp
     src/opt/Reassociate.cpp
