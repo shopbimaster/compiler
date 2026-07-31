@@ -605,18 +605,224 @@ IR::Function* createBlockedKernel(
     return function;
 }
 
+IR::Function* createRowPrivateKernel(
+    IR::Module* module, IR::ArrayType* rowType) {
+    // Privatize one output row before interchanging j and k.  The source
+    // matrix is not modified until every value in row i has been reduced, so
+    // rows k >= i retain their original values and rows k < i retain their
+    // already-updated values exactly as in the matched in-place loop nest.
+    auto* i32 = IR::IntegerType::I32;
+    auto* rowPointer = IR::PointerType::get(rowType);
+    auto* elementPointer = IR::PointerType::get(i32);
+    auto* functionType = IR::FunctionType::get(
+        IR::VoidType::get(),
+        {i32, rowPointer, rowPointer, elementPointer});
+    auto* function = module->createFunction(
+        functionType, "__opt_inplace_matrix_row_private", false);
+    function->setPreferExpandedLeafRegisters();
+
+    auto* zero = IR::ConstantInt::get(i32, 0);
+    auto* one = IR::ConstantInt::get(i32, 1);
+
+    auto* entry = function->createBlock("rowprivate.entry");
+    auto* iHeader = function->createBlock("rowprivate.i.header");
+    auto* iBody = function->createBlock("rowprivate.i.body");
+    auto* clearHeader = function->createBlock("rowprivate.clear.header");
+    auto* clearBody = function->createBlock("rowprivate.clear.body");
+    auto* kHeader = function->createBlock("rowprivate.k.header");
+    auto* kBody = function->createBlock("rowprivate.k.body");
+    auto* jHeader = function->createBlock("rowprivate.j.header");
+    auto* jBody = function->createBlock("rowprivate.j.body");
+    auto* kLatch = function->createBlock("rowprivate.k.latch");
+    auto* copyHeader = function->createBlock("rowprivate.copy.header");
+    auto* copyBody = function->createBlock("rowprivate.copy.body");
+    auto* iLatch = function->createBlock("rowprivate.i.latch");
+    auto* exit = function->createBlock("rowprivate.exit");
+
+    auto* iNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.i.next", nullptr, one);
+    auto* indexI = makePhi(
+        i32, "rowprivate.i", zero, entry, iNext, iLatch);
+    iNext->setOperand(0, indexI);
+    entry->pushBack(IR::Instruction::createBr(iHeader));
+    iHeader->pushBack(indexI);
+    auto* iCompare = IR::Instruction::createCmp(
+        Opc::ICMP, indexI, function->getArg(0), "slt");
+    iHeader->pushBack(iCompare);
+    iHeader->pushBack(IR::Instruction::createCondBr(
+        iCompare, iBody, exit));
+
+    auto* coefficientStart = IR::Instruction::createGetElementPtr(
+        rowType, function->getArg(1), {indexI, zero},
+        "rowprivate.coefficient.start");
+    auto* outputStart = IR::Instruction::createGetElementPtr(
+        rowType, function->getArg(2), {indexI, zero},
+        "rowprivate.output.start");
+    iBody->pushBack(coefficientStart);
+    iBody->pushBack(outputStart);
+    iBody->pushBack(IR::Instruction::createBr(clearHeader));
+
+    auto* clearNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.clear.next", nullptr, one);
+    auto* clearPointerNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {one}, "rowprivate.clear.pointer.next");
+    auto* clearIndex = makePhi(
+        i32, "rowprivate.clear.index", zero, iBody,
+        clearNext, clearBody);
+    auto* clearPointer = makePhi(
+        elementPointer, "rowprivate.clear.pointer", function->getArg(3),
+        iBody, clearPointerNext, clearBody);
+    clearNext->setOperand(0, clearIndex);
+    clearPointerNext->setOperand(0, clearPointer);
+    clearHeader->pushBack(clearIndex);
+    clearHeader->pushBack(clearPointer);
+    auto* clearCompare = IR::Instruction::createCmp(
+        Opc::ICMP, clearIndex, function->getArg(0), "slt");
+    clearHeader->pushBack(clearCompare);
+    clearHeader->pushBack(IR::Instruction::createCondBr(
+        clearCompare, clearBody, kHeader));
+    clearBody->pushBack(IR::Instruction::createStore(zero, clearPointer));
+    clearBody->pushBack(clearPointerNext);
+    clearBody->pushBack(clearNext);
+    clearBody->pushBack(IR::Instruction::createBr(clearHeader));
+
+    auto* kNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.k.next", nullptr, one);
+    auto* coefficientPointerNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {one}, "rowprivate.coefficient.next");
+    auto* indexK = makePhi(
+        i32, "rowprivate.k", zero, clearHeader, kNext, kLatch);
+    auto* coefficientPointer = makePhi(
+        coefficientStart->getType(), "rowprivate.coefficient.pointer",
+        coefficientStart, clearHeader, coefficientPointerNext, kLatch);
+    kNext->setOperand(0, indexK);
+    coefficientPointerNext->setOperand(0, coefficientPointer);
+    kHeader->pushBack(indexK);
+    kHeader->pushBack(coefficientPointer);
+    auto* kCompare = IR::Instruction::createCmp(
+        Opc::ICMP, indexK, function->getArg(0), "slt");
+    kHeader->pushBack(kCompare);
+    kHeader->pushBack(IR::Instruction::createCondBr(
+        kCompare, kBody, copyHeader));
+
+    auto* inputStart = IR::Instruction::createGetElementPtr(
+        rowType, function->getArg(2), {indexK, zero},
+        "rowprivate.input.start");
+    auto* coefficient = IR::Instruction::createLoad(
+        i32, coefficientPointer, "rowprivate.coefficient");
+    kBody->pushBack(inputStart);
+    kBody->pushBack(coefficient);
+    kBody->pushBack(IR::Instruction::createBr(jHeader));
+
+    auto* jNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.j.next", nullptr, one);
+    auto* inputPointerNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {one}, "rowprivate.input.next");
+    auto* scratchPointerNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {one}, "rowprivate.scratch.next");
+    auto* indexJ = makePhi(
+        i32, "rowprivate.j", zero, kBody, jNext, jBody);
+    auto* inputPointer = makePhi(
+        inputStart->getType(), "rowprivate.input.pointer", inputStart,
+        kBody, inputPointerNext, jBody);
+    auto* scratchPointer = makePhi(
+        elementPointer, "rowprivate.scratch.pointer", function->getArg(3),
+        kBody, scratchPointerNext, jBody);
+    jNext->setOperand(0, indexJ);
+    inputPointerNext->setOperand(0, inputPointer);
+    scratchPointerNext->setOperand(0, scratchPointer);
+    jHeader->pushBack(indexJ);
+    jHeader->pushBack(inputPointer);
+    jHeader->pushBack(scratchPointer);
+    auto* jCompare = IR::Instruction::createCmp(
+        Opc::ICMP, indexJ, function->getArg(0), "slt");
+    jHeader->pushBack(jCompare);
+    jHeader->pushBack(IR::Instruction::createCondBr(
+        jCompare, jBody, kLatch));
+
+    auto* input = IR::Instruction::createLoad(
+        i32, inputPointer, "rowprivate.input");
+    auto* accumulated = IR::Instruction::createLoad(
+        i32, scratchPointer, "rowprivate.accumulated");
+    auto* product = IR::Instruction::createBinOp(
+        Opc::MUL, i32, "rowprivate.product", coefficient, input);
+    auto* updated = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.updated", accumulated, product);
+    jBody->pushBack(input);
+    jBody->pushBack(accumulated);
+    jBody->pushBack(product);
+    jBody->pushBack(updated);
+    jBody->pushBack(IR::Instruction::createStore(updated, scratchPointer));
+    jBody->pushBack(inputPointerNext);
+    jBody->pushBack(scratchPointerNext);
+    jBody->pushBack(jNext);
+    jBody->pushBack(IR::Instruction::createBr(jHeader));
+
+    kLatch->pushBack(coefficientPointerNext);
+    kLatch->pushBack(kNext);
+    kLatch->pushBack(IR::Instruction::createBr(kHeader));
+
+    auto* copyNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.copy.next", nullptr, one);
+    auto* copySourceNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {one}, "rowprivate.copy.source.next");
+    auto* copyDestinationNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {one}, "rowprivate.copy.destination.next");
+    auto* copyIndex = makePhi(
+        i32, "rowprivate.copy.index", zero, kHeader,
+        copyNext, copyBody);
+    auto* copySource = makePhi(
+        elementPointer, "rowprivate.copy.source", function->getArg(3),
+        kHeader, copySourceNext, copyBody);
+    auto* copyDestination = makePhi(
+        outputStart->getType(), "rowprivate.copy.destination", outputStart,
+        kHeader, copyDestinationNext, copyBody);
+    copyNext->setOperand(0, copyIndex);
+    copySourceNext->setOperand(0, copySource);
+    copyDestinationNext->setOperand(0, copyDestination);
+    copyHeader->pushBack(copyIndex);
+    copyHeader->pushBack(copySource);
+    copyHeader->pushBack(copyDestination);
+    auto* copyCompare = IR::Instruction::createCmp(
+        Opc::ICMP, copyIndex, function->getArg(0), "slt");
+    copyHeader->pushBack(copyCompare);
+    copyHeader->pushBack(IR::Instruction::createCondBr(
+        copyCompare, copyBody, iLatch));
+
+    auto* copyValue = IR::Instruction::createLoad(
+        i32, copySource, "rowprivate.copy.value");
+    copyBody->pushBack(copyValue);
+    copyBody->pushBack(IR::Instruction::createStore(
+        copyValue, copyDestination));
+    copyBody->pushBack(copySourceNext);
+    copyBody->pushBack(copyDestinationNext);
+    copyBody->pushBack(copyNext);
+    copyBody->pushBack(IR::Instruction::createBr(copyHeader));
+
+    iLatch->pushBack(iNext);
+    iLatch->pushBack(IR::Instruction::createBr(iHeader));
+    exit->pushBack(IR::Instruction::createRet(nullptr));
+    return function;
+}
+
 bool applyPlan(IR::Module* module, const MatrixBlockingPlan& plan) {
-    auto* kernel = createBlockedKernel(module, plan.rowType);
+    auto* kernel = createRowPrivateKernel(module, plan.rowType);
     auto* zero = IR::ConstantInt::get(IR::IntegerType::I32, 0);
+    auto* scratch = module->createGlobalVariable(
+        IR::PointerType::get(plan.rowType),
+        "__opt_inplace_matrix_row_scratch", false);
     auto* coefficientBase = IR::Instruction::createGetElementPtr(
         plan.outerMatrixType, plan.coefficient, {zero, zero},
         "block.coefficient.base");
     auto* matrixBase = IR::Instruction::createGetElementPtr(
         plan.outerMatrixType, plan.matrix, {zero, zero},
         "block.matrix.base");
+    auto* scratchBase = IR::Instruction::createGetElementPtr(
+        plan.rowType, scratch, {zero, zero},
+        "rowprivate.scratch.base");
     auto* call = IR::Instruction::createCall(
         kernel->getFunctionType(), kernel,
-        {plan.size, coefficientBase, matrixBase}, "");
+        {plan.size, coefficientBase, matrixBase, scratchBase}, "");
 
     auto* terminator = plan.preheader->getTerminator();
     if (!terminator || terminator->getOpcode() != Opc::BR) return false;
@@ -626,6 +832,8 @@ bool applyPlan(IR::Module* module, const MatrixBlockingPlan& plan) {
         iterator = plan.preheader->insert(iterator, coefficientBase);
         ++iterator;
         iterator = plan.preheader->insert(iterator, matrixBase);
+        ++iterator;
+        iterator = plan.preheader->insert(iterator, scratchBase);
         ++iterator;
         plan.preheader->insert(iterator, call);
         terminator->setOperand(0, plan.exit);
