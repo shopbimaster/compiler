@@ -12,7 +12,14 @@ namespace Opt {
 struct AffineKernelSummary {
     IR::Function* sourceFunction = nullptr;
     IR::ArrayType* rowType = nullptr;
+    IR::ConstantInt* initialValue = nullptr;
     IR::ConstantInt* skippedScale = nullptr;
+    unsigned initialValueArgumentIndex = 0;
+    bool initialValueIsArgument = false;
+    unsigned sizeArgumentIndex = 0;
+    unsigned scaleArgumentIndex = 0;
+    unsigned addendArgumentIndex = 0;
+    unsigned destinationArgumentIndex = 0;
     int64_t indexStart = 0;
     int64_t indexStep = 1;
     bool inclusiveUpperBound = false;
@@ -26,7 +33,7 @@ struct MatrixReductionPlan {
     IR::Function* caller = nullptr;
     IR::BasicBlock* loopPreheader = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
-    unsigned finalInnerBoundOperand = 1;
+    IR::Value* finalInnerInduction = nullptr;
     std::vector<IR::Instruction*> calls;
     IR::GlobalVariable* seedMatrix = nullptr;
     IR::GlobalVariable* resultMatrix = nullptr;

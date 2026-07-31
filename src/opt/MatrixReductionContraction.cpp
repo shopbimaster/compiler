@@ -49,32 +49,109 @@ bool getCommonIterationDomain(
     return initialized;
 }
 
+bool isSemanticallyUnusedArgument(
+    IR::Argument* argument,
+    const AllocaArgumentMap& argumentMap) {
+    if (!argument) return false;
+
+    for (const auto& use : argument->getUses()) {
+        auto* instruction =
+            dynamic_cast<IR::Instruction*>(use.user);
+        if (!instruction ||
+            instruction->getOpcode() != Opc::STORE ||
+            instruction->getNumOperands() != 2 ||
+            use.operandNo != 0) {
+            return false;
+        }
+        auto found = argumentMap.find(
+            instruction->getOperand(1));
+        if (found == argumentMap.end() ||
+            found->second != argument) {
+            return false;
+        }
+    }
+
+    for (const auto& [alloca, mappedArgument] : argumentMap) {
+        if (mappedArgument != argument) continue;
+        for (const auto& use : alloca->getUses()) {
+            auto* instruction =
+                dynamic_cast<IR::Instruction*>(use.user);
+            if (!instruction ||
+                instruction->getOpcode() != Opc::STORE ||
+                instruction->getNumOperands() != 2 ||
+                use.operandNo != 1 ||
+                instruction->getOperand(0) != argument) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool isInitializationOnlyArgument(
+    IR::Argument* argument,
+    IR::Instruction* initialStore,
+    const AllocaArgumentMap& argumentMap) {
+    if (!argument || !initialStore) return false;
+
+    for (const auto& use : argument->getUses()) {
+        auto* instruction =
+            dynamic_cast<IR::Instruction*>(use.user);
+        if (instruction == initialStore &&
+            use.operandNo == 0) {
+            continue;
+        }
+        if (!instruction ||
+            instruction->getOpcode() != Opc::STORE ||
+            instruction->getNumOperands() != 2 ||
+            use.operandNo != 0) {
+            return false;
+        }
+        auto found = argumentMap.find(
+            instruction->getOperand(1));
+        if (found == argumentMap.end() ||
+            found->second != argument) {
+            return false;
+        }
+    }
+
+    for (const auto& [alloca, mappedArgument] : argumentMap) {
+        if (mappedArgument != argument) continue;
+        for (const auto& use : alloca->getUses()) {
+            auto* instruction =
+                dynamic_cast<IR::Instruction*>(use.user);
+            if (!instruction) return false;
+            if (instruction->getOpcode() == Opc::STORE &&
+                instruction->getNumOperands() == 2 &&
+                use.operandNo == 1 &&
+                instruction->getOperand(0) == argument) {
+                continue;
+            }
+            if (instruction->getOpcode() != Opc::LOAD ||
+                instruction->getNumOperands() != 1 ||
+                use.operandNo != 0) {
+                return false;
+            }
+            for (const auto& loadUse :
+                 instruction->getUses()) {
+                if (loadUse.user != initialStore ||
+                    loadUse.operandNo != 0) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool matchKernelFunction(
     IR::Function* function, AffineKernelSummary& summary) {
-    if (!function || function->isExternal() ||
-        function->getNumArgs() != 4) {
+    if (!function || function->isExternal()) {
         return false;
     }
 
     auto* functionType = function->getFunctionType();
-    const auto& parameters = functionType->getParamTypes();
-    if (!functionType->getReturnType()->isVoid() ||
-        parameters.size() != 4 ||
-        parameters[0] != IR::IntegerType::I32 ||
-        parameters[1] != parameters[2] ||
-        parameters[1] != parameters[3]) {
-        return false;
-    }
-
-    auto* rowPointer =
-        dynamic_cast<IR::PointerType*>(parameters[1]);
-    auto* rowType = rowPointer
-        ? dynamic_cast<IR::ArrayType*>(
-              rowPointer->getPointeeType())
-        : nullptr;
-    if (!rowType ||
-        rowType->getElementType() != IR::IntegerType::I32 ||
-        rowType->getNumElements() < 2) {
+    if (!functionType->getReturnType()->isVoid()) {
         return false;
     }
     for (auto& block : function->getBlocks()) {
@@ -84,6 +161,58 @@ bool matchKernelFunction(
     }
 
     auto argumentMap = buildAllocaArgumentMap(function);
+    std::vector<AffineRecurrence> recurrences;
+    for (auto& block : function->getBlocks()) {
+        for (auto& instruction : block->getInstructions()) {
+            AffineRecurrence recurrence;
+            if (analyzeAffineRecurrence(
+                    instruction.get(), &argumentMap,
+                    recurrence) &&
+                dynamic_cast<IR::Argument*>(
+                    recurrence.destination.root) &&
+                dynamic_cast<IR::Argument*>(
+                    recurrence.scale.root) &&
+                dynamic_cast<IR::Argument*>(
+                    recurrence.addend.root)) {
+                recurrences.push_back(std::move(recurrence));
+            }
+        }
+    }
+    if (recurrences.size() != 1) return false;
+
+    const auto& recurrence = recurrences.front();
+    auto* destinationArgument =
+        dynamic_cast<IR::Argument*>(
+            recurrence.destination.root);
+    auto* scaleArgument =
+        dynamic_cast<IR::Argument*>(recurrence.scale.root);
+    auto* addendArgument =
+        dynamic_cast<IR::Argument*>(recurrence.addend.root);
+    if (!destinationArgument || !scaleArgument ||
+        !addendArgument ||
+        destinationArgument == scaleArgument ||
+        destinationArgument == addendArgument ||
+        scaleArgument == addendArgument) {
+        return false;
+    }
+
+    auto* rowPointer =
+        dynamic_cast<IR::PointerType*>(
+            destinationArgument->getType());
+    auto* rowType = rowPointer
+        ? dynamic_cast<IR::ArrayType*>(
+              rowPointer->getPointeeType())
+        : nullptr;
+    if (!rowType ||
+        rowType->getElementType() != IR::IntegerType::I32 ||
+        rowType->getNumElements() < 2 ||
+        scaleArgument->getType() !=
+            destinationArgument->getType() ||
+        addendArgument->getType() !=
+            destinationArgument->getType()) {
+        return false;
+    }
+
     std::vector<IR::Instruction*> outputStores;
     for (auto& block : function->getBlocks()) {
         for (auto& instruction : block->getInstructions()) {
@@ -95,7 +224,7 @@ bool matchKernelFunction(
             if (collectPointerAccess(
                     instruction->getOperand(1),
                     &argumentMap, access)) {
-                if (access.root == function->getArg(3)) {
+                if (access.root == destinationArgument) {
                     outputStores.push_back(instruction.get());
                 } else if (
                     dynamic_cast<IR::Argument*>(access.root) ||
@@ -107,40 +236,57 @@ bool matchKernelFunction(
     }
     if (outputStores.size() != 2) return false;
 
-    IR::Instruction* zeroStore = nullptr;
-    IR::Instruction* updateStore = nullptr;
+    IR::Instruction* initialStore = nullptr;
+    IR::Instruction* updateStore = recurrence.store;
+    IR::ConstantInt* initialValue = nullptr;
+    IR::Argument* initialValueArgument = nullptr;
     for (auto* store : outputStores) {
-        if (isConstant(store->getOperand(0), 0)) {
-            zeroStore = store;
-        } else {
-            updateStore = store;
+        if (store == updateStore) continue;
+        if (initialStore) return false;
+        initialValue = dynamic_cast<IR::ConstantInt*>(
+            store->getOperand(0));
+        if (!initialValue) {
+            PointerAccess source;
+            if (!collectPointerAccess(
+                    store->getOperand(0), &argumentMap,
+                    source) ||
+                !source.indices.empty()) {
+                return false;
+            }
+            initialValueArgument =
+                dynamic_cast<IR::Argument*>(source.root);
         }
+        if ((!initialValue && !initialValueArgument) ||
+            store->getOperand(0)->getType() !=
+                IR::IntegerType::I32) {
+            return false;
+        }
+        initialStore = store;
     }
-    if (!zeroStore || !updateStore) return false;
+    if (!initialStore ||
+        (!initialValue && !initialValueArgument)) {
+        return false;
+    }
 
-    PointerAccess zeroOutput;
+    PointerAccess initialOutput;
     if (!collectPointerAccess(
-            zeroStore->getOperand(1), &argumentMap, zeroOutput) ||
-        zeroOutput.indices.size() != 2) {
+            initialStore->getOperand(1), &argumentMap,
+            initialOutput) ||
+        initialOutput.indices.size() != 2) {
         return false;
     }
 
-    AffineRecurrence recurrence;
-    if (!analyzeAffineRecurrence(
-            updateStore, &argumentMap, recurrence)) {
-        return false;
-    }
     const auto& updatedOutput = recurrence.destination;
     if (updatedOutput.indices.size() != 2 ||
-        recurrence.previous.root != function->getArg(3) ||
+        recurrence.previous.root != destinationArgument ||
         recurrence.previous.indices != updatedOutput.indices) {
         return false;
     }
 
     const auto& coefficient = recurrence.scale;
     const auto& input = recurrence.addend;
-    if (coefficient.root != function->getArg(1) ||
-        input.root != function->getArg(2) ||
+    if (coefficient.root != scaleArgument ||
+        input.root != addendArgument ||
         coefficient.indices.size() != 2 ||
         input.indices.size() != 2) {
         return false;
@@ -163,7 +309,8 @@ bool matchKernelFunction(
         for (auto& owned : block->getInstructions()) {
             auto* compare = owned.get();
             if (compare->getOpcode() != Opc::ICMP ||
-                compare->getName() != "eq" ||
+                (compare->getName() != "eq" &&
+                 compare->getName() != "ne") ||
                 compare->getNumOperands() != 2) {
                 continue;
             }
@@ -188,21 +335,39 @@ bool matchKernelFunction(
             if (!collectPointerAccess(
                     comparedLoad->getOperand(0),
                     &argumentMap, comparedAccess) ||
-                comparedAccess.root != function->getArg(1) ||
+                comparedAccess.root != scaleArgument ||
                 comparedAccess.indices != coefficient.indices) {
                 continue;
             }
             auto* terminator = compare->getParent()
                 ? compare->getParent()->getTerminator()
                 : nullptr;
-            auto* falseTarget = terminator &&
-                                        terminator->getOpcode() ==
-                                            Opc::COND_BR
-                ? dynamic_cast<IR::BasicBlock*>(
-                      terminator->getOperand(2))
-                : nullptr;
-            if (falseTarget &&
-                dominators[updateStore->getParent()].count(falseTarget)) {
+            if (!terminator ||
+                terminator->getOpcode() != Opc::COND_BR) {
+                continue;
+            }
+            auto* trueTarget =
+                dynamic_cast<IR::BasicBlock*>(
+                    terminator->getOperand(1));
+            auto* falseTarget =
+                dynamic_cast<IR::BasicBlock*>(
+                    terminator->getOperand(2));
+            const bool trueDominatesUpdate =
+                trueTarget &&
+                dominators[updateStore->getParent()].count(
+                    trueTarget);
+            const bool falseDominatesUpdate =
+                falseTarget &&
+                dominators[updateStore->getParent()].count(
+                    falseTarget);
+            const bool unequalExecutesUpdate =
+                (compare->getName() == "eq" &&
+                 falseDominatesUpdate &&
+                 !trueDominatesUpdate) ||
+                (compare->getName() == "ne" &&
+                 trueDominatesUpdate &&
+                 !falseDominatesUpdate);
+            if (unequalExecutesUpdate) {
                 if (skippedCoefficient &&
                     skippedCoefficient->getValue() !=
                         skipValue->getValue()) {
@@ -217,32 +382,82 @@ bool matchKernelFunction(
     CanonicalCountedLoop loopI;
     CanonicalCountedLoop loopJ;
     CanonicalCountedLoop loopK;
-    CanonicalCountedLoop zeroLoopI;
-    CanonicalCountedLoop zeroLoopJ;
-    auto* size = function->getArg(0);
-    if (!analyzeCanonicalCountedLoop(
-            function, indexI, size,
-            updateStore->getParent(), loopI) ||
-        !analyzeCanonicalCountedLoop(
-            function, indexJ, size,
-            updateStore->getParent(), loopJ) ||
-        !analyzeCanonicalCountedLoop(
-            function, indexK, size,
-            updateStore->getParent(), loopK) ||
-        !analyzeCanonicalCountedLoop(
-            function, zeroOutput.indices[0], size,
-            zeroStore->getParent(), zeroLoopI) ||
-        !analyzeCanonicalCountedLoop(
-            function, zeroOutput.indices[1], size,
-            zeroStore->getParent(), zeroLoopJ)) {
+    CanonicalCountedLoop initialLoopI;
+    CanonicalCountedLoop initialLoopJ;
+    IR::Argument* sizeArgument = nullptr;
+    for (unsigned index = 0;
+         index < function->getNumArgs(); ++index) {
+        auto* candidate = function->getArg(index);
+        if (candidate->getType() != IR::IntegerType::I32) {
+            continue;
+        }
+
+        CanonicalCountedLoop candidateLoopI;
+        CanonicalCountedLoop candidateLoopJ;
+        CanonicalCountedLoop candidateLoopK;
+        CanonicalCountedLoop candidateInitialLoopI;
+        CanonicalCountedLoop candidateInitialLoopJ;
+        if (!analyzeCanonicalCountedLoop(
+                function, indexI, candidate,
+                updateStore->getParent(),
+                candidateLoopI) ||
+            !analyzeCanonicalCountedLoop(
+                function, indexJ, candidate,
+                updateStore->getParent(),
+                candidateLoopJ) ||
+            !analyzeCanonicalCountedLoop(
+                function, indexK, candidate,
+                updateStore->getParent(),
+                candidateLoopK) ||
+            !analyzeCanonicalCountedLoop(
+                function, initialOutput.indices[0],
+                candidate, initialStore->getParent(),
+                candidateInitialLoopI) ||
+            !analyzeCanonicalCountedLoop(
+                function, initialOutput.indices[1],
+                candidate, initialStore->getParent(),
+                candidateInitialLoopJ)) {
+            continue;
+        }
+        if (sizeArgument) return false;
+        sizeArgument = candidate;
+        loopI = std::move(candidateLoopI);
+        loopJ = std::move(candidateLoopJ);
+        loopK = std::move(candidateLoopK);
+        initialLoopI = std::move(candidateInitialLoopI);
+        initialLoopJ = std::move(candidateInitialLoopJ);
+    }
+    if (!sizeArgument) return false;
+    if (initialValueArgument &&
+        (initialValueArgument == sizeArgument ||
+         !isInitializationOnlyArgument(
+             initialValueArgument, initialStore,
+             argumentMap))) {
         return false;
     }
+
+    for (unsigned index = 0;
+         index < function->getNumArgs(); ++index) {
+        auto* argument = function->getArg(index);
+        if (argument == sizeArgument ||
+            argument == scaleArgument ||
+            argument == addendArgument ||
+            argument == destinationArgument ||
+            argument == initialValueArgument) {
+            continue;
+        }
+        if (!isSemanticallyUnusedArgument(
+                argument, argumentMap)) {
+            return false;
+        }
+    }
+
     int64_t indexStart = 0;
     int64_t indexStep = 0;
     bool inclusiveUpperBound = false;
     if (!getCommonIterationDomain(
             {&loopI, &loopJ, &loopK,
-             &zeroLoopI, &zeroLoopJ},
+             &initialLoopI, &initialLoopJ},
             indexStart, indexStep,
             inclusiveUpperBound) ||
         indexStart < 0 ||
@@ -252,6 +467,11 @@ bool matchKernelFunction(
         indexStart >
             std::numeric_limits<int32_t>::max() -
                 indexStep) {
+        return false;
+    }
+    if ((initialValueArgument ||
+         initialValue->getValue() != 0) &&
+        inclusiveUpperBound) {
         return false;
     }
 
@@ -290,7 +510,22 @@ bool matchKernelFunction(
 
     summary.sourceFunction = function;
     summary.rowType = rowType;
+    summary.initialValue = initialValue;
     summary.skippedScale = skippedCoefficient;
+    summary.initialValueIsArgument =
+        initialValueArgument != nullptr;
+    if (initialValueArgument) {
+        summary.initialValueArgumentIndex =
+            initialValueArgument->getIndex();
+    }
+    summary.sizeArgumentIndex =
+        sizeArgument->getIndex();
+    summary.scaleArgumentIndex =
+        scaleArgument->getIndex();
+    summary.addendArgumentIndex =
+        addendArgument->getIndex();
+    summary.destinationArgumentIndex =
+        destinationArgument->getIndex();
     summary.indexStart = indexStart;
     summary.indexStep = indexStep;
     summary.inclusiveUpperBound =
@@ -326,7 +561,7 @@ bool findFinalReduction(
     IR::BasicBlock* loopPreheader,
     IR::Instruction*& finalLoad,
     IR::Instruction*& innerCompare,
-    unsigned& innerBoundOperand) {
+    IR::Value*& innerInduction) {
     std::vector<IR::Instruction*> loads;
     std::vector<IR::Instruction*> stores;
     std::vector<IR::Instruction*> callsWithMatrix;
@@ -454,10 +689,35 @@ bool findFinalReduction(
             }
         }
     }
+    auto* innerTerminator = inner.header
+        ? inner.header->getTerminator()
+        : nullptr;
+    auto* innerBodyEntry =
+        innerTerminator &&
+                innerTerminator->getOpcode() == Opc::COND_BR
+            ? dynamic_cast<IR::BasicBlock*>(
+                  innerTerminator->getOperand(1))
+            : nullptr;
+    auto* innerExit =
+        innerTerminator &&
+                innerTerminator->getOpcode() == Opc::COND_BR
+            ? dynamic_cast<IR::BasicBlock*>(
+                  innerTerminator->getOperand(2))
+            : nullptr;
+    if (!innerTerminator ||
+        !innerBodyEntry || !innerExit ||
+        !inner.body.count(innerBodyEntry) ||
+        inner.body.count(innerExit) ||
+        inner.compare->getNumUses() != 1 ||
+        inner.compare->getUses().front().user !=
+            innerTerminator ||
+        inner.compare->getUses().front().operandNo != 0) {
+        return false;
+    }
 
     finalLoad = loads[0];
     innerCompare = inner.compare;
-    innerBoundOperand = inner.boundOperand;
+    innerInduction = inner.induction;
     return true;
 }
 
@@ -582,6 +842,16 @@ IR::BasicBlock* findUniqueLoopPreheader(
     return preheader;
 }
 
+IR::Value* callArgument(
+    IR::Instruction* call, unsigned argumentIndex) {
+    if (!call ||
+        call->getOpcode() != Opc::CALL ||
+        argumentIndex + 1 >= call->getNumOperands()) {
+        return nullptr;
+    }
+    return call->getOperand(argumentIndex + 1);
+}
+
 bool matchCallChain(
     IR::Module* module, const AffineKernelSummary& kernel,
     const std::vector<IR::Instruction*>& calls,
@@ -592,7 +862,8 @@ bool matchCallChain(
     if (!caller || !callBlock) return false;
     std::unordered_set<IR::Instruction*> callSet;
     for (auto* call : calls) {
-        if (call->getNumOperands() != 5 ||
+        if (call->getNumOperands() !=
+                kernel.sourceFunction->getNumArgs() + 1 ||
             call->getParent()->getParent() != caller ||
             call->getParent() != callBlock) {
             return false;
@@ -608,12 +879,18 @@ bool matchCallChain(
     }
     if (orderedCalls.size() != calls.size()) return false;
 
-    auto* size = orderedCalls.front()->getOperand(1);
+    auto* size = callArgument(
+        orderedCalls.front(),
+        kernel.sizeArgumentIndex);
     auto* coefficientMatrix =
-        rootGlobal(orderedCalls.front()->getOperand(2));
+        rootGlobal(callArgument(
+            orderedCalls.front(),
+            kernel.scaleArgumentIndex));
     auto* seedMatrix =
-        rootGlobal(orderedCalls.front()->getOperand(3));
-    if (!coefficientMatrix || !seedMatrix ||
+        rootGlobal(callArgument(
+            orderedCalls.front(),
+            kernel.addendArgumentIndex));
+    if (!size || !coefficientMatrix || !seedMatrix ||
         coefficientMatrix == seedMatrix) {
         return false;
     }
@@ -622,10 +899,15 @@ bool matchCallChain(
     std::unordered_set<IR::GlobalVariable*> carrierMatrices = {
         seedMatrix};
     for (auto* call : orderedCalls) {
-        auto* inputMatrix = rootGlobal(call->getOperand(3));
-        auto* outputMatrix = rootGlobal(call->getOperand(4));
-        if (call->getOperand(1) != size ||
-            rootGlobal(call->getOperand(2)) != coefficientMatrix ||
+        auto* inputMatrix = rootGlobal(callArgument(
+            call, kernel.addendArgumentIndex));
+        auto* outputMatrix = rootGlobal(callArgument(
+            call, kernel.destinationArgumentIndex));
+        if (callArgument(
+                call, kernel.sizeArgumentIndex) != size ||
+            rootGlobal(callArgument(
+                call, kernel.scaleArgumentIndex)) !=
+                coefficientMatrix ||
             inputMatrix != currentMatrix ||
             !outputMatrix ||
             outputMatrix == inputMatrix ||
@@ -641,7 +923,7 @@ bool matchCallChain(
         findUniqueLoopPreheader(caller, callBlock);
     IR::Instruction* finalLoad = nullptr;
     IR::Instruction* finalInnerCompare = nullptr;
-    unsigned finalInnerBoundOperand = 1;
+    IR::Value* finalInnerInduction = nullptr;
     if (!loopPreheader ||
         !findFinalReduction(
             module, caller, resultMatrix, size,
@@ -650,7 +932,7 @@ bool matchCallChain(
             kernel.inclusiveUpperBound,
             orderedCalls, loopPreheader,
             finalLoad, finalInnerCompare,
-            finalInnerBoundOperand)) {
+            finalInnerInduction)) {
         return false;
     }
 
@@ -681,8 +963,7 @@ bool matchCallChain(
     plan.caller = caller;
     plan.loopPreheader = loopPreheader;
     plan.finalInnerCompare = finalInnerCompare;
-    plan.finalInnerBoundOperand =
-        finalInnerBoundOperand;
+    plan.finalInnerInduction = finalInnerInduction;
     plan.calls = std::move(orderedCalls);
     plan.seedMatrix = seedMatrix;
     plan.resultMatrix = resultMatrix;

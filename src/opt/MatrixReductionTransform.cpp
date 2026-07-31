@@ -1,6 +1,7 @@
 #include "opt/MatrixReductionPlan.h"
 
 #include <string>
+#include <vector>
 
 namespace Opt {
 namespace {
@@ -30,6 +31,14 @@ IR::Function* createAffineRowSummaryFunction(
         i32, summary.indexStart);
     auto* indexStep = IR::ConstantInt::get(
         i32, summary.indexStep);
+    auto* sizeArgument =
+        function->getArg(summary.sizeArgumentIndex);
+    auto* scaleArgument =
+        function->getArg(summary.scaleArgumentIndex);
+    auto* addendArgument =
+        function->getArg(summary.addendArgumentIndex);
+    auto* destinationArgument =
+        function->getArg(summary.destinationArgumentIndex);
     const std::string loopPredicate =
         summary.inclusiveUpperBound ? "sle" : "slt";
 
@@ -53,7 +62,45 @@ IR::Function* createAffineRowSummaryFunction(
         i32, "summary.k", indexStart, iBody, kNext, kBody);
     auto* accumulation =
         IR::Instruction::createPhi(i32, "summary.acc", 4);
-    accumulation->addOperand(zero);
+    IR::Instruction* initialRowSum = nullptr;
+    IR::Value* initialAccumulation = zero;
+    std::vector<IR::Instruction*> initialSetup;
+    IR::Value* fillValue = nullptr;
+    if (summary.initialValueIsArgument) {
+        fillValue = function->getArg(
+            summary.initialValueArgumentIndex);
+    } else if (summary.initialValue &&
+               summary.initialValue->getValue() != 0) {
+        fillValue = IR::ConstantInt::get(
+            i32, summary.initialValue->getValue());
+    }
+    if (fillValue) {
+        IR::Value* iterationCount = sizeArgument;
+        if (summary.indexStart != 0 ||
+            summary.indexStep != 1) {
+            auto* one = IR::ConstantInt::get(i32, 1);
+            auto* distance = IR::Instruction::createBinOp(
+                Opc::SUB, i32, "summary.iter.distance",
+                sizeArgument, indexStart);
+            auto* adjusted = IR::Instruction::createBinOp(
+                Opc::SUB, i32, "summary.iter.adjusted",
+                distance, one);
+            auto* quotient = IR::Instruction::createBinOp(
+                Opc::SDIV, i32, "summary.iter.quotient",
+                adjusted, indexStep);
+            auto* count = IR::Instruction::createBinOp(
+                Opc::ADD, i32, "summary.iter.count",
+                quotient, one);
+            initialSetup = {
+                distance, adjusted, quotient, count};
+            iterationCount = count;
+        }
+        initialRowSum = IR::Instruction::createBinOp(
+            Opc::MUL, i32, "summary.initial.row.sum",
+            iterationCount, fillValue);
+        initialAccumulation = initialRowSum;
+    }
+    accumulation->addOperand(initialAccumulation);
     accumulation->addOperand(iBody);
     accumulation->addOperand(nullptr);
     accumulation->addOperand(kBody);
@@ -63,26 +110,32 @@ IR::Function* createAffineRowSummaryFunction(
     entry->pushBack(IR::Instruction::createBr(iHeader));
     iHeader->pushBack(indexI);
     auto* iCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexI, function->getArg(0),
+        Opc::ICMP, indexI, sizeArgument,
         loopPredicate);
     iHeader->pushBack(iCompare);
     iHeader->pushBack(
         IR::Instruction::createCondBr(iCompare, iBody, exit));
 
     auto* rowA = IR::Instruction::createGetElementPtr(
-        summary.rowType, function->getArg(1),
+        summary.rowType, scaleArgument,
         {indexI}, "summary.A.row");
     auto* outputRow = IR::Instruction::createGetElementPtr(
-        summary.rowType, function->getArg(3),
+        summary.rowType, destinationArgument,
         {indexI}, "summary.C.row");
     iBody->pushBack(rowA);
     iBody->pushBack(outputRow);
+    for (auto* instruction : initialSetup) {
+        iBody->pushBack(instruction);
+    }
+    if (initialRowSum) {
+        iBody->pushBack(initialRowSum);
+    }
     iBody->pushBack(IR::Instruction::createBr(kHeader));
 
     kHeader->pushBack(indexK);
     kHeader->pushBack(accumulation);
     auto* kCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexK, function->getArg(0),
+        Opc::ICMP, indexK, sizeArgument,
         loopPredicate);
     kHeader->pushBack(kCompare);
     kHeader->pushBack(
@@ -96,7 +149,7 @@ IR::Function* createAffineRowSummaryFunction(
     auto* coefficient = IR::Instruction::createLoad(
         i32, coefficientAddress, "summary.coefficient");
     auto* inputRow = IR::Instruction::createGetElementPtr(
-        summary.rowType, function->getArg(2),
+        summary.rowType, addendArgument,
         {indexK}, "summary.B.row");
     auto* inputAddress =
         IR::Instruction::createGetElementPtr(
@@ -281,13 +334,12 @@ bool applyMatrixReductionPlan(
             call->setOperand(0, summaryKernel);
         }
         plan.finalInnerCompare->setOperand(
-            plan.finalInnerBoundOperand,
-            IR::ConstantInt::get(
-                IR::IntegerType::I32,
-                plan.kernel.indexStart +
-                    (plan.kernel.inclusiveUpperBound
-                         ? 0
-                         : plan.kernel.indexStep)));
+            0, plan.finalInnerInduction);
+        plan.finalInnerCompare->setOperand(
+            1, IR::ConstantInt::get(
+                   IR::IntegerType::I32,
+                   plan.kernel.indexStart));
+        plan.finalInnerCompare->setName("eq");
         return true;
     }
     return false;
