@@ -341,7 +341,8 @@ namespace IR {
     // ================================================================
 
     Function::Function(FunctionType* ft, const std::string& n, bool ext)
-        : Value(ft, n), funcType(ft), parent(nullptr), external(ext) {
+        : Value(ft, n), funcType(ft), parent(nullptr), external(ext),
+          preferExpandedLeafRegisters(false) {
         auto& paramTypes = ft->getParamTypes();
         for (size_t i = 0; i < paramTypes.size(); ++i) {
             auto arg = std::make_unique<Argument>(paramTypes[i], static_cast<unsigned>(i), "arg" + std::to_string(i));

@@ -65,6 +65,16 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    if (PASS_CALL(redundantIterationElimination)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    if (PASS_CALL(dynamicIdempotentLoopElimination)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     // 纯自递归函数记忆化：在尾递归消除/内联之前运行，因为匹配逻辑依赖
     // 恰好一个外部调用点和 alloca/load/store（非 PHI）的原始形态；
     // 这两个前提在内联或尾递归转换后不再成立。
@@ -186,6 +196,23 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    // Remove stores to globals whose complete pointer-use graph is proven to
+    // contain no read or escape. This also exposes dead address arithmetic.
+    if (PASS_CALL(deadGlobalStoreElimination)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // Cache-local scalar expansion for a strictly proven in-place matrix
+    // product. Run after SSA construction so loop/reduction legality is
+    // explicit, but before the iterative cleanup phases so the generated
+    // helper receives the remaining O2 and O3 optimizations.
+    if (PASS_CALL(inplaceMatrixBlocking)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     // ================================================================
     // 阶段 2：指令级化简 + CFG 简化（迭代 2 次收敛）
     //   InstCombine（含 Store-to-Load 前推）暴露死存储，
@@ -225,6 +252,24 @@ void runO2(IR::Module* mod) {
 
         if (!phase2Changed) break;
     }
+
+    // Restrict a proven lower-triangular copy to its useful j range before
+    // later loop and address optimizations obscure the original guard.
+    if (PASS_CALL(triangularCopyOptimization)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // Fuse adjacent output columns for a strictly proven conditional matrix
+    // reduction. Phase 2 first exposes the reduction as SSA; this still runs
+    // before MagicDivision lowers the remainder operation used by the matcher.
+    if (PASS_CALL(conditionalMatrixBlocking)) {
+        simplifyCFG(mod);
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     // ================================================================
     // 阶段 3：算术优化（在值传播之前！）
     //   关键设计决策：算术优化产生新常量，SCCP 需要在这些常量产生后

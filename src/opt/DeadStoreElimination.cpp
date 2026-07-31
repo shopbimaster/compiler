@@ -58,9 +58,21 @@ void dseOnFunction(IR::Function* func) {
         changed = false;
 
         for (auto& bb : func->getBlocks()) {
-            // 记录每个地址最后一条 STORE 指令
-            std::unordered_map<IR::Value*, IR::Instruction*> lastStore;
+            // 记录每个地址最后一条 STORE 指令。
+            // 注意：不能用 unordered_map<ptr,...> 做键查找 —— 结构相同但对象
+            // 不同的 GEP（如循环内每次迭代重算的 a[i][j]）指针值不相等，
+            // 哈希查找必然 miss，isSameAddress 的 GEP 等价判断永远走不到。
+            // 因此改为线性扫描 + isSameAddress 比较。
+            std::vector<std::pair<IR::Value*, IR::Instruction*>> lastStore;
             std::unordered_set<IR::Instruction*> deadStores;
+
+            auto findSlot = [&lastStore](IR::Value* ptr) -> int {
+                for (size_t k = 0; k < lastStore.size(); ++k) {
+                    if (isSameAddress(lastStore[k].first, ptr))
+                        return static_cast<int>(k);
+                }
+                return -1;
+            };
 
             auto& insts = bb->getInstructions();
             for (size_t i = 0; i < insts.size(); ++i) {
@@ -70,31 +82,35 @@ void dseOnFunction(IR::Function* func) {
                     // STORE: operand[0]=value, operand[1]=pointer
                     IR::Value* ptr = inst->getOperand(1);
 
-                    // 检查是否有之前对同一地址的 STORE（且中间没有 LOAD）
-                    auto it = lastStore.find(ptr);
-                    if (it != lastStore.end() && isSameAddress(it->first, ptr)) {
-                        // 前面的 STORE 是死的
-                        deadStores.insert(it->second);
+                    int slot = findSlot(ptr);
+                    if (slot >= 0) {
+                        // 同一地址上一条 STORE 被本条完全覆盖（中间无 LOAD）→ 死存储
+                        deadStores.insert(lastStore[slot].second);
+                        lastStore[slot].second = inst;
                         changed = true;
+                    } else {
+                        lastStore.emplace_back(ptr, inst);
                     }
-
-                    // 更新 lastStore
-                    lastStore[ptr] = inst;
                 }
                 else if (inst->getOpcode() == IR::Instruction::Opcode::LOAD) {
                     // LOAD: operand[0]=pointer
-                    // 该地址被读取了，清除 lastStore 记录
+                    // 该地址被读取了，清除 lastStore 记录。
+                    // 保守：无法证明不别名的记录也一并失效。
                     IR::Value* ptr = inst->getOperand(0);
-                    auto it = lastStore.find(ptr);
-                    if (it != lastStore.end() && isSameAddress(it->first, ptr)) {
-                        lastStore.erase(it);
+                    int slot = findSlot(ptr);
+                    if (slot >= 0) {
+                        lastStore.erase(lastStore.begin() + slot);
+                    } else {
+                        // 未知地址的 LOAD 可能读到任何已记录地址 → 全部失效
+                        lastStore.clear();
                     }
                 }
-                else if (mayWriteMemory(inst)) {
-                    // CALL 可能写入任意地址，清空所有 lastStore
+                else if (mayWriteMemory(inst) || mayReadMemory(inst)) {
+                    // CALL 可能读写任意地址，清空所有 lastStore
                     lastStore.clear();
                 }
             }
+
 
             // 移除死 STORE
             if (!deadStores.empty()) {

@@ -1,0 +1,170 @@
+#include "ir/IRBuilder.h"
+#include "opt/MemoryAccessAnalysis.h"
+#include "opt/Optimizer.h"
+
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
+namespace {
+
+struct OptimizationResult {
+    std::string ir;
+    bool changed = false;
+    bool inPlaceHelperPrefersExpandedRegisters = false;
+    bool conditionalHelperPrefersExpandedRegisters = false;
+    bool anyFunctionPrefersExpandedRegisters = false;
+    bool writesDeadY = false;
+    bool callsHotLeafF = false;
+    bool callsHotLoopTest = false;
+};
+
+OptimizationResult runFocusedPass(
+        const std::string& source, bool (*pass)(IR::Module*)) {
+    IR::IRBuilder builder;
+    auto module = builder.compile(source);
+    Opt::runO1(module.get());
+    OptimizationResult result;
+    result.changed = pass(module.get());
+    result.ir = module->dump();
+    return result;
+}
+
+OptimizationResult optimizeToO2(const std::string& source) {
+    IR::IRBuilder builder;
+    auto module = builder.compile(source);
+    Opt::runO1(module.get());
+    Opt::runO2(module.get());
+    OptimizationResult result;
+    result.ir = module->dump();
+    for (const auto& function : module->getFunctions()) {
+        for (const auto& block : function->getBlocks()) {
+            for (const auto& instruction : block->getInstructions()) {
+                if (instruction->getOpcode() ==
+                        IR::Instruction::Opcode::CALL &&
+                    instruction->getNumOperands() != 0) {
+                    const auto& callee = instruction->getOperand(0)->getName();
+                    result.callsHotLeafF |= callee == "f";
+                    result.callsHotLoopTest |= callee == "loop_test";
+                }
+                if (instruction->getOpcode() !=
+                        IR::Instruction::Opcode::STORE ||
+                    instruction->getNumOperands() != 2) {
+                    continue;
+                }
+                auto* global = Opt::rootGlobal(instruction->getOperand(1));
+                if (global && global->getName() == "y") {
+                    result.writesDeadY = true;
+                }
+            }
+        }
+        if (!function->prefersExpandedLeafRegisters()) continue;
+        result.anyFunctionPrefersExpandedRegisters = true;
+        if (function->getName() == "__opt_inplace_matrix_block4") {
+            result.inPlaceHelperPrefersExpandedRegisters = true;
+        }
+        if (function->getName() == "__opt_conditional_matrix_mask4") {
+            result.conditionalHelperPrefersExpandedRegisters = true;
+        }
+    }
+    return result;
+}
+
+} // namespace
+
+int main() {
+#ifdef _WIN32
+    _putenv_s("M2R_NONENTRY_ALLPASS", "1");
+#else
+    setenv("M2R_NONENTRY_ALLPASS", "1", 1);
+#endif
+
+    const OptimizationResult inPlace = optimizeToO2(
+        "../test/performance/many_mat_cal-1.sy");
+    if (inPlace.ir.find("__opt_inplace_matrix_block4") ==
+        std::string::npos) {
+        std::cerr << "in-place matrix reduction did not trigger blocking\n";
+        return 1;
+    }
+    if (!inPlace.inPlaceHelperPrefersExpandedRegisters) {
+        std::cerr << "blocked helper is missing its leaf-register hint\n";
+        return 1;
+    }
+    if (inPlace.ir.find("__opt_conditional_matrix_mask4") !=
+        std::string::npos) {
+        std::cerr << "in-place kernel triggered conditional blocking\n";
+        return 1;
+    }
+
+    const OptimizationResult conditional = optimizeToO2(
+        "../test/performance/matmul1.sy");
+    if (conditional.ir.find("__opt_inplace_matrix_block4") !=
+        std::string::npos) {
+        std::cerr << "out-of-place matrix kernel triggered in-place blocking\n";
+        return 1;
+    }
+    if (conditional.ir.find("__opt_conditional_matrix_mask4") ==
+        std::string::npos) {
+        std::cerr << "conditional matrix reduction did not trigger blocking\n";
+        return 1;
+    }
+    if (!conditional.conditionalHelperPrefersExpandedRegisters) {
+        std::cerr << "conditional helper is missing its leaf-register hint\n";
+        return 1;
+    }
+
+    const OptimizationResult negative = optimizeToO2(
+        "../test/performance/conv2d-1.sy");
+    if (negative.ir.find("__opt_inplace_matrix_block4") !=
+            std::string::npos ||
+        negative.ir.find("__opt_conditional_matrix_mask4") !=
+            std::string::npos) {
+        std::cerr << "unrelated matrix kernel triggered blocking\n";
+        return 1;
+    }
+    if (negative.anyFunctionPrefersExpandedRegisters) {
+        std::cerr << "leaf-register hint escaped the blocked helper\n";
+        return 1;
+    }
+
+    const OptimizationResult triangular = optimizeToO2(
+        "../test/performance/transpose0.sy");
+    if (triangular.ir.find("triangular.limit") == std::string::npos) {
+        std::cerr << "triangular copy did not restrict its inner loop\n";
+        return 1;
+    }
+
+    const OptimizationResult deadGlobal = optimizeToO2(
+        "../test/performance/sl1.sy");
+    if (deadGlobal.writesDeadY) {
+        std::cerr << "write-only global array stores were not eliminated\n";
+        return 1;
+    }
+
+    const OptimizationResult hotInline = optimizeToO2(
+        "../test/performance/h-4-01.sy");
+    if (hotInline.callsHotLeafF || hotInline.callsHotLoopTest) {
+        std::cerr << "unique hot-loop leaf calls were not inlined\n";
+        return 1;
+    }
+
+    const OptimizationResult genericRepeat = runFocusedPass(
+        "../test/optimization/redundant_iteration_variant.sy",
+        Opt::redundantIterationElimination);
+    if (!genericRepeat.changed) {
+        std::cerr << "renamed redundant-iteration variant did not trigger\n";
+        return 1;
+    }
+
+    const OptimizationResult genericFixedPoint = runFocusedPass(
+        "../test/optimization/dynamic_fixed_point_variant.sy",
+        Opt::dynamicIdempotentLoopElimination);
+    if (!genericFixedPoint.changed ||
+        genericFixedPoint.ir.find("fixedpoint.ready") == std::string::npos) {
+        std::cerr << "renamed dynamic fixed-point variant did not trigger\n";
+        return 1;
+    }
+
+    std::cout << "Optimization trigger checks passed\n";
+    return 0;
+}

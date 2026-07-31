@@ -88,6 +88,8 @@ private:
     std::unordered_map<IR::Value*, std::string> regMap;
     std::unordered_map<IR::Value*, int> spillMap;
     std::unordered_set<IR::Value*> floatValues;
+    std::vector<std::string> intRegPool;
+    std::vector<std::string> floatRegPool;
     int nextSpillSlot;
     int spillSlotSize;
 
