@@ -68,6 +68,24 @@ bool isAllocaOf(IR::Function* function, IR::Value* value) {
            instruction->getParent()->getParent() == function;
 }
 
+bool isTailSelfCall(IR::Instruction* call, IR::Function* function) {
+    if (!call || call->getOpcode() != Opc::CALL ||
+        call->getNumOperands() == 0 || call->getOperand(0) != function) {
+        return false;
+    }
+    auto* block = call->getParent();
+    if (!block) return false;
+
+    const auto& instructions = block->getInstructions();
+    for (size_t index = 0; index + 1 < instructions.size(); ++index) {
+        if (instructions[index].get() != call) continue;
+        auto* ret = instructions[index + 1].get();
+        return ret->getOpcode() == Opc::RET &&
+               ret->getNumOperands() == 1 && ret->getOperand(0) == call;
+    }
+    return false;
+}
+
 // Returns true iff `function` matches the pure-self-recursion shape
 // described above. Purely structural: inspects opcodes, operand
 // shapes and call targets; never looks at the function's name or any
@@ -88,6 +106,7 @@ bool isMemoizableSelfRecursive(IR::Function* function) {
     }
 
     bool sawSelfCall = false;
+    bool sawNonTailSelfCall = false;
     for (auto& block : function->getBlocks()) {
         for (auto& owned : block->getInstructions()) {
             auto* instruction = owned.get();
@@ -105,6 +124,7 @@ bool isMemoizableSelfRecursive(IR::Function* function) {
                     return false;
                 }
                 sawSelfCall = true;
+                sawNonTailSelfCall |= !isTailSelfCall(instruction, function);
                 break;
             }
             case Opc::STORE: {
@@ -124,6 +144,11 @@ bool isMemoizableSelfRecursive(IR::Function* function) {
         }
     }
     if (!sawSelfCall) return false;
+
+    // A recursion tree with only tail edges has no branching subproblems for
+    // this pass to collapse. Leave that shape intact so the following tail
+    // recursion pass can turn it into a loop without memo-table lookups.
+    if (!sawNonTailSelfCall) return false;
 
     // The function must have exactly one call site outside of its own
     // body. This guarantees there is a single "root" activation, so

@@ -12,7 +12,7 @@ namespace {
 
 using Opc = IR::Instruction::Opcode;
 
-constexpr unsigned kBlockWidth = 4;
+constexpr unsigned kBlockWidth = 8;
 
 struct StackCountedLoop {
     IR::BasicBlock* header = nullptr;
