@@ -139,6 +139,7 @@ bool gepStrengthReduce(IR::Module* mod);
 bool instructionScheduling(IR::Module* mod);
 bool reductionSplitting(IR::Module* mod);   // P1: 多累加器归约分裂
 bool earlyReturnToSelect(IR::Module* mod);   // P4: if-else-RET → SELECT
+bool softwarePipelining(IR::Module* mod);   // P9: 跨迭代 LOAD 预取（软件流水）
 void runO3(IR::Module* mod);
 
 // ================================================================

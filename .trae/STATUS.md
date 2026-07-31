@@ -7,17 +7,65 @@
 
 ## 一、当前焦点
 
-**分支**：`Peephole-test`（含 E4 循环旋转 + perf-compliant-loop-effects 合并 + InlineExpansion 跨 BB ALLOCA 克隆修复）
-**当前方向**：合并 `perf-compliant-loop-effects` 分支后修复 InlineExpansion 段错误，全测试通过，待 FPGA 验证。
+**分支**：`Peephole-test`（含 E4 循环旋转 + perf-compliant-loop-effects 合并 + InlineExpansion 跨 BB ALLOCA 克隆修复 + P9 软件流水 + E5 分支概率引导布局）
+**当前方向**：软件流水（IR 层跨迭代 LOAD 预取）+ 分支概率引导布局已完成并验证，待 FPGA 实测。
+
+### E5 分支概率引导布局（2026-07-31）
+
+**目标**：在支配树 DFS 框架内引入静态分支概率启发式，让热路径 fall-through、冷路径 out-of-line，优化 BOOM 14 周期误预测惩罚。规避 E2 教训（无 PGO 时分支密集代码 h-4-03/huffman 回归）。
+
+**设计（严格"改进或不变"型）**：仅当存在可靠信号时偏离基线 name-sort，中性 if-then-else 完全不变。
+
+- 循环继续边（succ 在 cur 所在循环体内）：热 +100 → fall-through
+- 循环退出边（succ 不在循环体内）：冷 -100 → out-of-line
+- RET 终止后继块：冷 -50 → out-of-line（早返回/错误路径）
+- 无信号：保持基线 name-sort（零回归）
+
+**关键设计**：自循环（LoopRotation 产物）不被 `findNaturalLoops` 检测（用 `strictlyDominates`，自环不严格支配自身），其布局 (H, exit：冷出口 fall-through + 热回边预测 taken 后向分支) 已最优，无需干预。仅非自循环 while 形循环头由循环启发式处理。
+
+**改动**：`src/opt/BasicBlockReordering.cpp` 增强 dom-children 排序比较器（保留支配树 DFS + 后继优先不变量，仅改后继间的排序键）。开关 `LAYOUT_PROB_OFF=1` 回退基线；`DBG_LAYOUT=1` 打印生效点。
+
+**A/B 静态指标（60 性能用例）**：
+| 指标 | 基线 (name-sort) | 概率引导 | delta |
+| --- | --- | --- | --- |
+| 代码行数 | 25040 | 24782 | **-258 (-1.03%)** |
+| 无条件 j | 858 | 843 | **-15 (-1.75%)** |
+| taken 分支 | 1071 | 1071 | **0** |
+| 变化用例 | — | 18 改进 / 42 不变 / 0 回归 | — |
+
+- **典型改进**：03_sort -42 行、many_mat_cal -17 行 -1j、matmul1/2/3 -10 行 -1j、huffman -3 行 -1j、01_mm -12 行 -2j
+- **关键**：taken 分支数零变化 → 无新增分支预测压力；huffman 改进（E2 曾回归它）；h-4-03 不变（E2 曾 +14.62% 回归）→ 保守设计成功规避 E2 回归陷阱
+
+**功能测试（默认 SWP+布局同时启用）**：
+| 套件 | 结果 | 新增失败 |
+| ---- | ---- | -------- |
+| perf O1 | 60 OK | 0 |
+| func O1 | 96 OK, 3 DIFF, 1 TO | 0（基线一致） |
+| hfunc O1 | 36 OK, 4 DIFF | 0（基线一致） |
+
+### P9 软件流水（IR 层跨迭代 LOAD 预取）验证（2026-07-31）
+
+**状态**：实现完成，全测试通过。`src/opt/SoftwarePipelining.cpp`（body-split + 守卫预取算法，将自循环 LOAD 预取到上一迭代末尾，隐藏 BOOM 4 周期 load-use 延迟）。
+
+**配套修复（与 LoopRotation/LoopUnrolling/ReductionSplitting 协同）**：
+
+- `LoopRotation.cpp`：扩展支持 alloca-based IV（header 含 LOAD(alloca)），新增 `ROT_ALLOCA_OFF`/`ROT_MAX` 调试开关
+- `LoopUnrolling.cpp`：`inferTripCount` 增加步长感知（`traceAddChain` for PHI-IV，`computeAllocaStep` for alloca-IV），解决归约分裂把步长从 1 变 N 后展开越界（matmul3 回归）
+- `ReductionSplitting.cpp`：修复合并链循环依赖（恢复首条合并指令操作数为 accPhis[0]）
+- `Optimizer.cpp`：O3 管线在 loopRotation 后、loopUnrolling 前插入 softwarePipelining
+
+**测试**：matmul3 alloca-IV 旋转 OK；perf 60/60；func 96/4/1TO；hfunc 36/4（38_light2d PASS）。零新增失败。
 
 ### 合并 perf-compliant-loop-effects + InlineExpansion 修复（2026-07-31）
 
 **合并内容**（commit `974f8cf`，--no-ff 前向合并）：
+
 - 新增 pass：`redundantIterationElimination`、`dynamicIdempotentLoopElimination`、`deadGlobalStoreElimination`、`inplaceMatrixBlocking`、`triangularCopyOptimization`、`conditionalMatrixBlocking`（均 O2 阶段）
 - 修改：`InlineExpansion.cpp`（热点循环内联 `isHotInlineCandidate`，放宽至 24 BB / 160 insts）、`DeadStoreElimination.cpp`（GEP 别名线性扫描）、`RegisterAllocator.cpp`（确定性排序修复）
 - 与现有优化无重叠：新 pass 在 O2 阶段，循环旋转在 O3 阶段；硬件优化（PHI move 内联、压缩指令、分支友好布局）不受影响
 
 **段错误根因与修复**：
+
 - **症状**：`38_light2d` 在 -O1（含热点循环内联）段错误
 - **根因**：`InlineExpansion::tryInlineMultiBBCall` 的两遍克隆（PHI → 其他）在跨 BB 引用 ALLOCA 时有顺序 bug。circle_sdf 内联进 scene 后，scene 的 BB 列表顺序变为 `entry → then_23 → else_24 → ... → inline_cont_circle_sdf_3(含 %sd1 alloca)`。`else_24` 中的 `load %sd1` 在 `inline_cont_circle_sdf_3` 中的 `alloca %sd1` 之前被克隆，导致 `lookup(%sd1)` 返回原始指针（非克隆），产生跨函数悬空引用 → 后续 pass 将 load 外提到 preheader → 运行时段错误
 - **修复**：在两遍克隆之间增加 ALLOCA 预克隆遍（PHI → ALLOCA → 其他），确保所有栈槽在被引用前进入 valueMap

@@ -61,6 +61,61 @@ std::vector<LoopInfo> detectLoops(IR::Function* func) {
     return loops;
 }
 
+// ---- 追溯 add 链：从 val 回溯到 target，累加常量增量 ----
+// 每一环必须是 `add const, X`（或 `add X, const`），X 是下一环。
+// 返回净步长；若链不能干净到达 target 则返回 -1（保守跳过）。
+// 用于 PHI-form IV：back-edge 值经 add 链回到 IV PHI，净步长 = 链上常量和。
+//   正常 step=1：backVal = add 1, phi → step 1
+//   redsplit N 路：backVal = add 1, (add 1, (... (add 1, phi))) → step N
+int64_t traceAddChain(IR::Value* val, IR::Value* target) {
+    int64_t step = 0;
+    std::unordered_set<IR::Value*> visited;
+    IR::Value* cur = val;
+    while (cur != target) {
+        if (visited.count(cur)) return -1;  // 环
+        visited.insert(cur);
+        auto* inst = dynamic_cast<IR::Instruction*>(cur);
+        if (!inst || inst->getOpcode() != IR::Instruction::Opcode::ADD) return -1;
+        if (inst->getNumOperands() < 2) return -1;
+        auto* c0 = dynamic_cast<IR::ConstantInt*>(inst->getOperand(0));
+        auto* c1 = dynamic_cast<IR::ConstantInt*>(inst->getOperand(1));
+        if (!c0 && !c1) return -1;  // 无常量 → 步长未知
+        if (c0 && c1) return -1;    // 双常量（应被折叠）→ 可疑
+        step += c0 ? c0->getValue() : c1->getValue();
+        cur = c0 ? inst->getOperand(1) : inst->getOperand(0);
+    }
+    return step;
+}
+
+// ---- 计算 alloca-IV 的净步长：body 内对 allocaPtr 的所有 store 的常量增量之和 ----
+// 正常 step=1：1 个 store `add 1, load %j` → step 1
+// redsplit N 路：N 个 store `add 1, X` → step N
+// step!=1 的普通循环：1 个 store `add k, load %j` → step k
+// 返回净步长；任何 store 非干净 add-const 则返回 -1（保守跳过）。
+int64_t computeAllocaStep(IR::Value* allocaPtr, const BBSet& body) {
+    int64_t step = 0;
+    int storeCount = 0;
+    for (auto* bb : body) {
+        if (!bb) continue;
+        for (auto& inst : bb->getInstructions()) {
+            if (inst->getOpcode() != IR::Instruction::Opcode::STORE) continue;
+            if (inst->getNumOperands() < 2) continue;
+            if (inst->getOperand(1) != allocaPtr) continue;
+            ++storeCount;
+            auto* storedInst = dynamic_cast<IR::Instruction*>(inst->getOperand(0));
+            if (!storedInst || storedInst->getOpcode() != IR::Instruction::Opcode::ADD) return -1;
+            if (storedInst->getNumOperands() < 2) return -1;
+            auto* c0 = dynamic_cast<IR::ConstantInt*>(storedInst->getOperand(0));
+            auto* c1 = dynamic_cast<IR::ConstantInt*>(storedInst->getOperand(1));
+            if (!c0 && !c1) return -1;
+            if (c0 && c1) return -1;
+            step += c0 ? c0->getValue() : c1->getValue();
+        }
+    }
+    if (storeCount == 0) return -1;
+    return step;
+}
+
 // ---- 从 header 的 ICMP 推导迭代次数 ----
 // ★ 必须考虑 PHI 的初始值！
 //   while (i = 1; i < 16; i++) 的 tripCount = 16 - 1 = 15，不是 16。
@@ -69,6 +124,9 @@ std::vector<LoopInfo> detectLoops(IR::Function* func) {
 // ★ P2-fix: 支持 LOAD/STORE 形式的循环变量（mem2reg 未提升时）
 //   如 matmul1 的 j 变量：header 中 %t = load %j; icmp %t, 200
 //   需要在 preheader 中找 store 初始值到 %j 的指令
+// ★ step-fix: 感知 IV 步长。redsplit 会把步长从 1 变 N，若仍按 step=1
+//   算 tc 会高估 N 倍，导致选了不整除的 factor → 展开后末次迭代越界。
+//   修复：tc = (bound - init) / step，要求 (bound-init) % step == 0。
 int inferTripCount(IR::BasicBlock* header, const BBSet& body, IR::Function* func) {
     for (auto& inst : header->getInstructions()) {
         if (inst->getOpcode() != IR::Instruction::Opcode::ICMP) continue;
@@ -87,9 +145,13 @@ int inferTripCount(IR::BasicBlock* header, const BBSet& body, IR::Function* func
         // 尝试从 PHI 获取初始值
         int64_t initVal = 0;
         bool initKnown = false;
+        // ★ IV 步长（默认 1）。redsplit/step!=1 循环需正确感知，否则 tc 高估。
+        int64_t step = 1;
+        bool stepKnown = false;
         if (auto* varInst = dynamic_cast<IR::Instruction*>(varOp)) {
             if (varInst->getOpcode() == IR::Instruction::Opcode::PHI) {
-                // 遍历 PHI 的操作数，找来自非 body BB 的初始值
+                // 遍历 PHI 的操作数，找来自非 body BB 的初始值 + back-edge 值
+                IR::Value* backVal = nullptr;
                 for (unsigned i = 0; i + 1 < varInst->getNumOperands(); i += 2) {
                     auto* predBB = dynamic_cast<IR::BasicBlock*>(varInst->getOperand(i + 1));
                     if (predBB != header && !body.count(predBB)) {
@@ -98,8 +160,17 @@ int inferTripCount(IR::BasicBlock* header, const BBSet& body, IR::Function* func
                             initVal = ci->getValue();
                             initKnown = true;
                         }
-                        break;
+                    } else {
+                        // back-edge 值（来自 body）
+                        backVal = varInst->getOperand(i);
                     }
+                }
+                // ★ 追溯 back-edge 的 add 链到 IV PHI，得到净步长
+                //   正常 step=1：backVal=add(1,phi)；redsplit N 路：链 N 个 add(1,...)
+                if (backVal) {
+                    int64_t s = traceAddChain(backVal, varInst);
+                    if (s > 0) { step = s; stepKnown = true; }
+                    else return -1;  // 链不干净或退化（s<=0）→ 步长未知，保守跳过
                 }
             } else if (varInst->getOpcode() == IR::Instruction::Opcode::LOAD) {
                 // ★ LOAD 模式：循环变量在 ALLOCA 中（mem2reg 未提升）
@@ -109,6 +180,13 @@ int inferTripCount(IR::BasicBlock* header, const BBSet& body, IR::Function* func
                 if (std::getenv("DBG_UNROLL")) fprintf(stderr, "[unroll] %s LOAD varOp alloca=%s\n",
                     header->getName().c_str(),
                     allocaPtr ? allocaPtr->getName().c_str() : "?");
+                // ★ 计算 alloca-IV 净步长（body 内对 allocaPtr 的 store 常量增量之和）
+                //   redsplit N 路 → step N；正常 step=1；step!=1 普通循环 → step k
+                {
+                    int64_t s = computeAllocaStep(allocaPtr, body);
+                    if (s > 0) { step = s; stepKnown = true; }
+                    else if (s < 0) return -1;  // store 非干净 add-const → 步长未知，跳过
+                }
                 auto preds = buildPredecessors(func);
 
                 // 辅助函数：在 BB 中查找最后一个 STORE 常量到 allocaPtr
@@ -172,17 +250,27 @@ int inferTripCount(IR::BasicBlock* header, const BBSet& body, IR::Function* func
         // 如果初始值未知，迭代次数依赖于外层循环变量等动态值
         // 实际 tripCount 不是常数，展开会导致越界访问（如 h-5-01 回代循环）
         if (!initKnown) return -1;
+        // step 已知时必须 > 0；未知则按 step=1（兼容旧行为）
+        if (stepKnown && step <= 0) return -1;
 
-        // 仅处理 slt（有符号小于）：i < N  → tripCount = N - init
+        // 仅处理 slt（有符号小于）：i < N  → tripCount = (N - init) / step
         // P2: 上界从 64 放宽到 256，允许大循环部分展开（如 matmul1 tc=200）
+        // ★ step-fix: 除以步长并要求整除。redsplit 后 step=N，若不整除则展开
+        //   会导致末次迭代越界（matmul3: range=250, step=2 → tc=125, 125%2≠0 → 跳过）
         if (inst->getName() == "slt" && bound > 0 && bound <= 256) {
-            int tc = static_cast<int>(bound - initVal);
+            int64_t range = bound - initVal;
+            if (range <= 0) return -1;
+            if (range % step != 0) return -1;  // 非整除 → 展开会越界，保守跳过
+            int tc = static_cast<int>(range / step);
             if (tc > 0 && tc <= 256) return tc;
             return -1;
         }
-        // sle（有符号小于等于）：i <= N → tripCount = N+1 - init
+        // sle（有符号小于等于）：i <= N → tripCount = (N+1 - init) / step
         if (inst->getName() == "sle" && bound >= 0 && bound < 256) {
-            int tc = static_cast<int>(bound + 1 - initVal);
+            int64_t range = bound + 1 - initVal;
+            if (range <= 0) return -1;
+            if (range % step != 0) return -1;
+            int tc = static_cast<int>(range / step);
             if (tc > 0 && tc <= 256) return tc;
             return -1;
         }
@@ -497,6 +585,28 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
             if (predBB == bodyBB) {
                 inst->setOperand(i, finalBackEdge);
                 break;
+            }
+        }
+    }
+
+    // ★ 更新 latch COND_BR 的条件为最后一次克隆的 ICMP（alloca-IV 自循环路径）
+    //   旋转后的自循环 body 末尾是 COND_BR(icmp, body, exit)，展开后 COND_BR 仍用
+    //   原始 ICMP（检查第一份 IV 值），导致边界检查错误（多执行迭代→越界）。
+    //   修复：将 COND_BR 的条件更新为 valueMap 中 ICMP 的最新克隆。
+    {
+        auto* term = bodyBB->getTerminator();
+        if (term && term->getOpcode() == IR::Instruction::Opcode::COND_BR) {
+            auto* succ1 = dynamic_cast<IR::BasicBlock*>(term->getOperand(1));
+            auto* succ2 = dynamic_cast<IR::BasicBlock*>(term->getOperand(2));
+            bool isSelfLoop = (succ1 == bodyBB || succ2 == bodyBB);
+            if (isSelfLoop) {
+                auto* condInst = dynamic_cast<IR::Instruction*>(term->getOperand(0));
+                if (condInst) {
+                    auto vIt = valueMap.find(condInst);
+                    if (vIt != valueMap.end()) {
+                        term->setOperand(0, vIt->second);
+                    }
+                }
             }
         }
     }

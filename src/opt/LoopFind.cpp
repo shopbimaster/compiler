@@ -30,6 +30,10 @@ std::vector<NaturalLoop> findNaturalLoops(IR::Function* func) {
     auto succs = buildSuccessors(func);
 
     // 1. 检测回边：边 B→H 且 H strictly dominates B
+    //    ★ 注意：自循环 B→B 不被 strictlyDominates 检测（B 不严格支配自身）。
+    //      这是有意为之：自循环检测在 SoftwarePipelining 内部单独处理，避免
+    //      影响其他 Pass（LoopUnrolling/ReductionSplitting 等对自循环的处理
+    //      可能产生误编译，如 matmul3 回归）。
     struct BackEdge {
         IR::BasicBlock* from;
         IR::BasicBlock* to;

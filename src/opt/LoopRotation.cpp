@@ -13,11 +13,12 @@
 //
 // 保守约束（本轮）：
 //   - 仅单 BB 体循环（header + body，body 是 latch）
-//   - IV 必须是 SSA PHI（mem2reg 已提升）
-//   - header 仅含 PHI + ICMP + COND_BR（无其他指令）
+//   - IV 可以是 SSA PHI 或 alloca LOAD（mem2reg 未提升时）
+//   - header 仅含 PHI + ICMP + COND_BR + LOAD(from alloca)（无其他指令）
 //   - body 无 CALL、无 COND_BR（纯顺序体）
 //   - body 指令数 ≤ 60
 //   - exit 的 PHI 若引用 header PHI，需正确分裂为 guard/body 两路 incoming
+//   - alloca IV 路径：header 的 LOAD 结果仅用于 ICMP，exit 不引用 header 定义值
 //
 // 开关：LOOP_ROTATE_OFF=1 或 OPT_DISABLE=loopRotation 可关闭
 // ================================================================
@@ -39,6 +40,12 @@ bool loopRotateDisabled() {
         return std::string(v) == "1";
     return false;
 }
+
+// Debug logging controlled by DBG_ROT=1
+static const bool dbgRot = [] {
+    const char* v = std::getenv("DBG_ROT");
+    return v && std::string(v) == "1";
+}();
 
 // 查找 header 的唯一循环外前驱（preheader）。多个外前驱则返回 nullptr。
 IR::BasicBlock* findPreheader(IR::Function* func, const NaturalLoop& loop) {
@@ -207,10 +214,28 @@ bool rotateLoop(IR::Function* func, const NaturalLoop& loop) {
     else if (condBrElse == body && !loop.body.count(condBrThen)) exitBB = condBrThen;
     else return false;
 
-    // 8. header 仅含 PHI + ICMP + COND_BR
+    // 8. header 仅含 PHI + ICMP + COND_BR + LOAD(from alloca)
+    //    alloca LOAD 路径：当 mem2reg 未提升 IV（useBlocks > 3）时，header 包含
+    //    load alloca 读取 IV。允许此模式以支持 alloca-based IV 的旋转。
+    IR::Instruction* allocaLoad = nullptr;
     for (auto& inst : header->getInstructions()) {
         auto op = inst->getOpcode();
-        if (op != Opc::PHI && op != Opc::ICMP && op != Opc::COND_BR) return false;
+        if (op == Opc::LOAD) {
+            auto* ptr = inst->getOperand(0);
+            auto* ptrInst = dynamic_cast<IR::Instruction*>(ptr);
+            if (!ptrInst || ptrInst->getOpcode() != Opc::ALLOCA) return false;
+            if (allocaLoad) return false;  // 仅允许 1 个 alloca LOAD（IV）
+            allocaLoad = inst.get();
+        } else if (op != Opc::PHI && op != Opc::ICMP && op != Opc::COND_BR) {
+            return false;
+        }
+    }
+    bool isAllocaIV = (allocaLoad != nullptr);
+    // alloca IV 模式下不允许 header 同时有 PHI（复杂交互，保守跳过）
+    if (isAllocaIV) {
+        for (auto& inst : header->getInstructions()) {
+            if (inst->getOpcode() == Opc::PHI) return false;
+        }
     }
 
     // 9. COND_BR 的条件是 header 中的 ICMP
@@ -223,6 +248,142 @@ bool rotateLoop(IR::Function* func, const NaturalLoop& loop) {
     auto* preheader = findPreheader(func, loop);
     if (!preheader) return false;
 
+    // === 识别 IV 及 bound ===
+    auto* icmpOp0 = icmp->getOperand(0);
+    auto* icmpOp1 = icmp->getOperand(1);
+    const std::string& pred = icmp->getName();  // "slt"/"sge"/"eq"/"ne"/"sgt"/"sle"
+    if (pred.empty()) return false;
+
+    int ivOperandIdx = -1;   // IV 在 ICMP 中的操作数位置（0 或 1）
+    IR::Value* boundVal = nullptr;
+
+    if (isAllocaIV) {
+        // === alloca IV 路径 ===
+        // header 无 PHI，仅有 LOAD(alloca) + ICMP + COND_BR
+        // 可用 ROT_ALLOCA_OFF=1 禁用此路径（诊断用）
+        if (const char* v = std::getenv("ROT_ALLOCA_OFF"); v && std::string(v) == "1") return false;
+        if (dbgRot) fprintf(stderr, "[rot] alloca-IV candidate: %s header=%s body=%s\n",
+                            func->getName().c_str(), header->getName().c_str(), body->getName().c_str());
+        // 安全检查 1：header 中所有指令的 use 仅在 header 内
+        //   （body 有自己的 alloca LOAD，不引用 header 的 LOAD 结果；
+        //    若 body 引用 header 值，删除 header 后会悬空）
+        for (auto& inst : header->getInstructions()) {
+            for (auto& use : inst->getUses()) {
+                auto* userInst = dynamic_cast<IR::Instruction*>(use.user);
+                if (!userInst) continue;
+                if (userInst->getParent() == header) continue;
+                if (dbgRot) fprintf(stderr, "[rot] reject %s: header value used outside\n",
+                                    func->getName().c_str());
+                return false;  // header 值被外部引用，保守放弃
+            }
+        }
+        // 安全检查 2：没有其他块的 PHI 引用 header 作为 incoming BB
+        //   （删除 header 后 PHI 的 BB 引用会悬空）
+        for (auto& bb : func->getBlocks()) {
+            if (bb.get() == header) continue;
+            for (auto& inst : bb->getInstructions()) {
+                if (inst->getOpcode() != Opc::PHI) continue;
+                for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                    auto* predBB = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+                    if (predBB == header) {
+                        if (dbgRot) fprintf(stderr, "[rot] reject %s: exit PHI refs header\n",
+                                            func->getName().c_str());
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // ICMP 必须使用 allocaLoad
+        if (icmpOp0 == static_cast<IR::Value*>(allocaLoad)) {
+            ivOperandIdx = 0; boundVal = icmpOp1;
+        } else if (icmpOp1 == static_cast<IR::Value*>(allocaLoad)) {
+            ivOperandIdx = 1; boundVal = icmpOp0;
+        } else {
+            if (dbgRot) fprintf(stderr, "[rot] reject %s: ICMP not using allocaLoad\n",
+                                func->getName().c_str());
+            return false;
+        }
+        // boundVal 循环不变
+        if (auto* boundInst = dynamic_cast<IR::Instruction*>(boundVal)) {
+            auto* defBB = boundInst->getParent();
+            if (defBB && loop.body.count(defBB)) {
+                if (dbgRot) fprintf(stderr, "[rot] reject %s: bound not loop-invariant\n",
+                                    func->getName().c_str());
+                return false;
+            }
+        }
+        if (dbgRot) fprintf(stderr, "[rot] ACCEPT %s: rotating %s\n",
+                            func->getName().c_str(), header->getName().c_str());
+
+        // === 旋转变换（alloca IV）===
+        IR::BasicBlock* guard = func->insertBlock(header->getName() + ".guard", header);
+
+        // 1. guard：克隆 LOAD（读 init 值 from alloca）+ ICMP + COND_BR
+        auto* guardLoad = IR::Instruction::createLoad(
+            allocaLoad->getType(), allocaLoad->getOperand(0),
+            allocaLoad->getName() + ".grd");
+        guard->pushBack(guardLoad);
+        IR::Instruction* guardIcmp;
+        if (ivOperandIdx == 0)
+            guardIcmp = IR::Instruction::createCmp(Opc::ICMP, guardLoad, boundVal, pred);
+        else
+            guardIcmp = IR::Instruction::createCmp(Opc::ICMP, boundVal, guardLoad, pred);
+        guard->pushBack(guardIcmp);
+        guard->pushBack(IR::Instruction::createCondBr(guardIcmp, condBrThen, condBrElse));
+
+        // 2. body 末尾追加 latch：克隆 LOAD（读更新值 from alloca）+ ICMP + COND_BR
+        //    body 的 STORE 已更新 alloca，克隆的 LOAD 读取最新值（iv_next）
+        auto bodyTermIt = body->end();
+        --bodyTermIt;
+        (*bodyTermIt)->dropAllUses();
+        body->erase(bodyTermIt);
+
+        auto* latchLoad = IR::Instruction::createLoad(
+            allocaLoad->getType(), allocaLoad->getOperand(0),
+            allocaLoad->getName() + ".lth");
+        body->pushBack(latchLoad);
+        IR::Instruction* latchIcmp;
+        if (ivOperandIdx == 0)
+            latchIcmp = IR::Instruction::createCmp(Opc::ICMP, latchLoad, boundVal, pred);
+        else
+            latchIcmp = IR::Instruction::createCmp(Opc::ICMP, boundVal, latchLoad, pred);
+        body->pushBack(latchIcmp);
+        body->pushBack(IR::Instruction::createCondBr(latchIcmp, condBrThen, condBrElse));
+
+        // 3. 重定向 preheader → guard
+        auto* preTerm = preheader->getTerminator();
+        if (preTerm && preTerm->getOpcode() == Opc::BR) {
+            preTerm->setOperand(0, guard);
+        } else if (preTerm && preTerm->getOpcode() == Opc::COND_BR) {
+            for (unsigned i = 1; i <= 2; ++i) {
+                if (preTerm->getOperand(i) == header) preTerm->setOperand(i, guard);
+            }
+        }
+
+        // 4. 删除 header
+        for (auto& inst : header->getInstructions()) {
+            inst->dropAllUses();
+        }
+        auto& blocks = func->getBlocks();
+        for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+            if (it->get() == header) { blocks.erase(it); break; }
+        }
+        if (dbgRot) {
+            auto* bt = body->getTerminator();
+            bool selfLoop = false;
+            if (bt && bt->getOpcode() == Opc::COND_BR) {
+                auto* t1 = dynamic_cast<IR::BasicBlock*>(bt->getOperand(1));
+                auto* t2 = dynamic_cast<IR::BasicBlock*>(bt->getOperand(2));
+                selfLoop = (t1 == body || t2 == body);
+            }
+            fprintf(stderr, "[rot] post-rotate %s: body=%s selfLoop=%d\n",
+                    func->getName().c_str(), body->getName().c_str(), selfLoop);
+        }
+        return true;
+    }
+
+    // === SSA PHI 路径（现有逻辑）===
     // === 收集 header PHI ===
     std::vector<PhiInfo> phis;
     if (!collectHeaderPhis(header, preheader, body, phis)) return false;
@@ -237,14 +398,7 @@ bool rotateLoop(IR::Function* func, const NaturalLoop& loop) {
     if (!exitPhisRotatable(exitBB, header, phis)) return false;
 
     // === 识别 IV：ICMP 的某个操作数是 header PHI ===
-    auto* icmpOp0 = icmp->getOperand(0);
-    auto* icmpOp1 = icmp->getOperand(1);
-    const std::string& pred = icmp->getName();  // "slt"/"sge"/"eq"/"ne"/"sgt"/"sle"
-    if (pred.empty()) return false;
-
     const PhiInfo* ivPhi = nullptr;
-    int ivOperandIdx = -1;   // IV 在 ICMP 中的操作数位置（0 或 1）
-    IR::Value* boundVal = nullptr;
     for (const auto& pi : phis) {
         if (icmpOp0 == static_cast<IR::Value*>(pi.phi)) {
             ivPhi = &pi; ivOperandIdx = 0; boundVal = icmpOp1; break;
@@ -354,6 +508,11 @@ bool rotateLoop(IR::Function* func, const NaturalLoop& loop) {
 bool loopRotation(IR::Module* mod) {
     if (loopRotateDisabled()) return false;
 
+    // ROT_MAX=N：限制本轮最多旋转 N 个循环（诊断用）
+    int rotMax = -1;
+    if (const char* v = std::getenv("ROT_MAX")) rotMax = std::atoi(v);
+    int rotCount = 0;
+
     bool changed = false;
     for (auto& func : mod->getFunctions()) {
         if (func->isExternal()) continue;
@@ -361,6 +520,7 @@ bool loopRotation(IR::Module* mod) {
         // 内层优先；旋转可能改变 CFG，一次只处理一轮（外层循环下次调用再处理）
         auto loops = getLoopsInnermostFirst(func.get());
         for (auto& loop : loops) {
+            if (rotMax >= 0 && rotCount >= rotMax) goto done;
             // 旋转后循环结构变化，跳过已被破坏的循环（body 已不含原 header）
             // 通过检查 header 是否仍在函数中来判断
             bool headerExists = false;
@@ -371,9 +531,11 @@ bool loopRotation(IR::Module* mod) {
 
             if (rotateLoop(func.get(), loop)) {
                 changed = true;
+                ++rotCount;
             }
         }
     }
+done:
     return changed;
 }
 

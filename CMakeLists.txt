@@ -141,6 +141,7 @@ add_library(sysy_opt STATIC
     src/opt/EarlyReturnToSelect.cpp
     src/opt/TailRecursionElimination.cpp
     src/opt/InstructionScheduling.cpp
+    src/opt/SoftwarePipelining.cpp
     src/opt/RecursiveMulToNative.cpp
     src/opt/RepeatedDivRemToNative.cpp
     src/opt/ModAddRecurrence.cpp

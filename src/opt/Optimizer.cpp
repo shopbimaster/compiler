@@ -516,7 +516,24 @@ void runO3(IR::Module* mod) {
     }
 
     // LoopFullUnroll：基于 SCEV 确定迭代次数的完全展开
+    //   tc ≤ 64 的小循环在此完全展开（消除回边），tc > 64 的大循环存活，
+    //   保持 loopRotation 创建的自循环结构，供 SoftwarePipelining 接手。
     if (PASS_CALL(loopFullUnroll)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+        o3Changed = true;
+    }
+
+    // P9: SoftwarePipelining —— 跨迭代 LOAD 预取（软件流水）
+    // ★ 必须在 loopRotation 之后、loopUnrolling 之前运行：
+    //   - loopRotation 将 while 循环转为 guard + self-loop，提供 SWP 所需的自循环结构
+    //   - loopUnrolling 会部分展开自循环（body 变多 LOAD/多 BB），破坏 SWP 候选约束
+    //   - loopFullUnroll 在此之前已移除 tc≤64 的小循环，存活的大 tc 自循环正是 SWP 目标
+    //   - gepStrengthReduce 在此之后运行，可化简 SWP 克隆的地址计算链
+    // 在 O3 清理轮之前：SWP 拆出的新 BB（body.swp_prefetch）需要 SimplifyCFG + DCE 收敛
+    // 开关：SWP_OFF=1 或 OPT_DISABLE=softwarePipelining
+    if (PASS_CALL(softwarePipelining)) {
+        simplifyCFG(mod);
         constantFolding(mod);
         deadCodeElimination(mod);
         o3Changed = true;

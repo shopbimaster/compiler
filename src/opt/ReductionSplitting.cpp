@@ -423,12 +423,14 @@ bool splitReduction(ReductionInfo& info, int factor, IR::Function* func) {
     if (!exitBB) return false;
 
     IR::Value* merged = accPhis[0];
+    IR::Instruction* firstMerge = nullptr;  // 首条 merge 指令（操作数 0 是 accPhis[0]=info.phi）
     auto insertIt = exitBB->begin();
     for (int k = 1; k < N; ++k) {
         std::string mName = info.phi->getName() + ".merge" + std::to_string(k);
         auto* mAdd = IR::Instruction::createBinOp(
             Opc::ADD, info.phi->getType(), mName, merged, accPhis[k]);
         exitBB->insert(insertIt, mAdd);
+        if (k == 1) firstMerge = mAdd;
         merged = mAdd;
         ++insertIt;
     }
@@ -441,6 +443,12 @@ bool splitReduction(ReductionInfo& info, int factor, IR::Function* func) {
         auto* rhs = info.update->getOperand(1);
         if (lhs == merged) info.update->setOperand(0, accPhis[0]);
         else if (rhs == merged) info.update->setOperand(1, accPhis[0]);
+    }
+    // 恢复 merge chain 首指令的操作数：replaceAllUsesWith 会将 accPhis[0](=info.phi)
+    //   替换为 merged(=last merge)，造成 merge1→mergeN→...→merge1 循环依赖，
+    //   后续 SCCP/DCE 遍历 use-def 链时触发 use-after-free（freed 后内存被覆写）。
+    if (firstMerge) {
+        firstMerge->setOperand(0, accPhis[0]);
     }
     // 恢复 header 中归约 PHI 的 back-edge 值
     for (unsigned i = 0; i + 1 < info.phi->getNumOperands(); i += 2) {
@@ -459,6 +467,10 @@ bool splitReduction(ReductionInfo& info, int factor, IR::Function* func) {
 } // namespace
 
 bool reductionSplitting(IR::Module* mod) {
+    static const bool dbg = [] {
+        const char* v = std::getenv("DBG_RS");
+        return v && std::string(v) == "1";
+    }();
     bool anyChanged = false;
     for (auto& func : mod->getFunctions()) {
         if (func->isExternal()) continue;
@@ -470,6 +482,12 @@ bool reductionSplitting(IR::Module* mod) {
 
             auto indInfo = analyzeLoopInduction(loop, func.get());
             if (indInfo.tripCount < 8) continue;
+
+            if (dbg) fprintf(stderr, "[rs] %s: detected reduction phi=%s body=%s tc=%lld\n",
+                             func->getName().c_str(),
+                             info.phi->getName().c_str(),
+                             info.body->getName().c_str(),
+                             (long long)indInfo.tripCount);
 
             size_t extVals = countExternalVals(loop);
 
@@ -486,8 +504,13 @@ bool reductionSplitting(IR::Module* mod) {
 
             if (!isSafeToSplit(info, indInfo.tripCount, factor)) continue;
 
+            if (dbg) fprintf(stderr, "[rs] %s: splitting factor=%d extVals=%zu\n",
+                             func->getName().c_str(), factor, extVals);
             if (splitReduction(info, factor, func.get())) {
+                if (dbg) fprintf(stderr, "[rs] %s: split SUCCESS\n", func->getName().c_str());
                 anyChanged = true;
+            } else {
+                if (dbg) fprintf(stderr, "[rs] %s: split FAILED\n", func->getName().c_str());
             }
         }
     }
