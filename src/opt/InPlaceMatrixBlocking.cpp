@@ -631,8 +631,10 @@ IR::Function* createRowPrivateKernel(
     auto* clearBody = function->createBlock("rowprivate.clear.body");
     auto* kHeader = function->createBlock("rowprivate.k.header");
     auto* kBody = function->createBlock("rowprivate.k.body");
-    auto* jHeader = function->createBlock("rowprivate.j.header");
-    auto* jBody = function->createBlock("rowprivate.j.body");
+    auto* jFullHeader = function->createBlock("rowprivate.j.full.header");
+    auto* jFullBody = function->createBlock("rowprivate.j.full.body");
+    auto* jTailHeader = function->createBlock("rowprivate.j.tail.header");
+    auto* jTailBody = function->createBlock("rowprivate.j.tail.body");
     auto* kLatch = function->createBlock("rowprivate.k.latch");
     auto* copyHeader = function->createBlock("rowprivate.copy.header");
     auto* copyBody = function->createBlock("rowprivate.copy.body");
@@ -712,51 +714,128 @@ IR::Function* createRowPrivateKernel(
         i32, coefficientPointer, "rowprivate.coefficient");
     kBody->pushBack(inputStart);
     kBody->pushBack(coefficient);
-    kBody->pushBack(IR::Instruction::createBr(jHeader));
+    kBody->pushBack(IR::Instruction::createBr(jFullHeader));
 
-    auto* jNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rowprivate.j.next", nullptr, one);
-    auto* inputPointerNext = IR::Instruction::createGetElementPtr(
-        i32, nullptr, {one}, "rowprivate.input.next");
-    auto* scratchPointerNext = IR::Instruction::createGetElementPtr(
-        i32, nullptr, {one}, "rowprivate.scratch.next");
-    auto* indexJ = makePhi(
-        i32, "rowprivate.j", zero, kBody, jNext, jBody);
-    auto* inputPointer = makePhi(
-        inputStart->getType(), "rowprivate.input.pointer", inputStart,
-        kBody, inputPointerNext, jBody);
-    auto* scratchPointer = makePhi(
-        elementPointer, "rowprivate.scratch.pointer", function->getArg(3),
-        kBody, scratchPointerNext, jBody);
-    jNext->setOperand(0, indexJ);
-    inputPointerNext->setOperand(0, inputPointer);
-    scratchPointerNext->setOperand(0, scratchPointer);
-    jHeader->pushBack(indexJ);
-    jHeader->pushBack(inputPointer);
-    jHeader->pushBack(scratchPointer);
-    auto* jCompare = IR::Instruction::createCmp(
-        Opc::ICMP, indexJ, function->getArg(0), "slt");
-    jHeader->pushBack(jCompare);
-    jHeader->pushBack(IR::Instruction::createCondBr(
-        jCompare, jBody, kLatch));
+    auto* four = IR::ConstantInt::get(i32, 4);
+    auto* fullIndexNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.j.full.next", nullptr, four);
+    auto* fullInputNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {four}, "rowprivate.input.full.next");
+    auto* fullScratchNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {four}, "rowprivate.scratch.full.next");
+    auto* fullIndex = makePhi(
+        i32, "rowprivate.j.full", zero, kBody,
+        fullIndexNext, jFullBody);
+    auto* fullInput = makePhi(
+        inputStart->getType(), "rowprivate.input.full", inputStart,
+        kBody, fullInputNext, jFullBody);
+    auto* fullScratch = makePhi(
+        elementPointer, "rowprivate.scratch.full", function->getArg(3),
+        kBody, fullScratchNext, jFullBody);
+    fullIndexNext->setOperand(0, fullIndex);
+    fullInputNext->setOperand(0, fullInput);
+    fullScratchNext->setOperand(0, fullScratch);
+    jFullHeader->pushBack(fullIndex);
+    jFullHeader->pushBack(fullInput);
+    jFullHeader->pushBack(fullScratch);
+    auto* fullEnd = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.j.full.end", fullIndex, four);
+    auto* hasFullBlock = IR::Instruction::createCmp(
+        Opc::ICMP, fullEnd, function->getArg(0), "sle");
+    jFullHeader->pushBack(fullEnd);
+    jFullHeader->pushBack(hasFullBlock);
+    jFullHeader->pushBack(IR::Instruction::createCondBr(
+        hasFullBlock, jFullBody, jTailHeader));
 
-    auto* input = IR::Instruction::createLoad(
-        i32, inputPointer, "rowprivate.input");
-    auto* accumulated = IR::Instruction::createLoad(
-        i32, scratchPointer, "rowprivate.accumulated");
-    auto* product = IR::Instruction::createBinOp(
-        Opc::MUL, i32, "rowprivate.product", coefficient, input);
-    auto* updated = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rowprivate.updated", accumulated, product);
-    jBody->pushBack(input);
-    jBody->pushBack(accumulated);
-    jBody->pushBack(product);
-    jBody->pushBack(updated);
-    jBody->pushBack(IR::Instruction::createStore(updated, scratchPointer));
-    jBody->pushBack(inputPointerNext);
-    jBody->pushBack(scratchPointerNext);
-    jBody->pushBack(jNext);
-    jBody->pushBack(IR::Instruction::createBr(jHeader));
+    for (unsigned lane = 0; lane < 4; ++lane) {
+        IR::Value* inputAddress = fullInput;
+        IR::Value* scratchAddress = fullScratch;
+        if (lane != 0) {
+            auto* offset = IR::ConstantInt::get(i32, lane);
+            auto* laneInput = IR::Instruction::createGetElementPtr(
+                i32, fullInput, {offset},
+                "rowprivate.input.lane." + std::to_string(lane));
+            auto* laneScratch = IR::Instruction::createGetElementPtr(
+                i32, fullScratch, {offset},
+                "rowprivate.scratch.lane." + std::to_string(lane));
+            jFullBody->pushBack(laneInput);
+            jFullBody->pushBack(laneScratch);
+            inputAddress = laneInput;
+            scratchAddress = laneScratch;
+        }
+        auto* input = IR::Instruction::createLoad(
+            i32, inputAddress,
+            "rowprivate.input." + std::to_string(lane));
+        auto* accumulated = IR::Instruction::createLoad(
+            i32, scratchAddress,
+            "rowprivate.accumulated." + std::to_string(lane));
+        auto* product = IR::Instruction::createBinOp(
+            Opc::MUL, i32,
+            "rowprivate.product." + std::to_string(lane),
+            coefficient, input);
+        auto* updated = IR::Instruction::createBinOp(
+            Opc::ADD, i32,
+            "rowprivate.updated." + std::to_string(lane),
+            accumulated, product);
+        jFullBody->pushBack(input);
+        jFullBody->pushBack(accumulated);
+        jFullBody->pushBack(product);
+        jFullBody->pushBack(updated);
+        jFullBody->pushBack(IR::Instruction::createStore(
+            updated, scratchAddress));
+    }
+    jFullBody->pushBack(fullInputNext);
+    jFullBody->pushBack(fullScratchNext);
+    jFullBody->pushBack(fullIndexNext);
+    jFullBody->pushBack(IR::Instruction::createBr(jFullHeader));
+
+    auto* tailIndexNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.j.tail.next", nullptr, one);
+    auto* tailInputNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {one}, "rowprivate.input.tail.next");
+    auto* tailScratchNext = IR::Instruction::createGetElementPtr(
+        i32, nullptr, {one}, "rowprivate.scratch.tail.next");
+    auto* tailIndex = makePhi(
+        i32, "rowprivate.j.tail", fullIndex, jFullHeader,
+        tailIndexNext, jTailBody);
+    auto* tailInput = makePhi(
+        fullInput->getType(), "rowprivate.input.tail", fullInput,
+        jFullHeader, tailInputNext, jTailBody);
+    auto* tailScratch = makePhi(
+        elementPointer, "rowprivate.scratch.tail", fullScratch,
+        jFullHeader, tailScratchNext, jTailBody);
+    tailIndexNext->setOperand(0, tailIndex);
+    tailInputNext->setOperand(0, tailInput);
+    tailScratchNext->setOperand(0, tailScratch);
+    jTailHeader->pushBack(tailIndex);
+    jTailHeader->pushBack(tailInput);
+    jTailHeader->pushBack(tailScratch);
+    auto* hasTail = IR::Instruction::createCmp(
+        Opc::ICMP, tailIndex, function->getArg(0), "slt");
+    jTailHeader->pushBack(hasTail);
+    jTailHeader->pushBack(IR::Instruction::createCondBr(
+        hasTail, jTailBody, kLatch));
+
+    auto* tailInputValue = IR::Instruction::createLoad(
+        i32, tailInput, "rowprivate.input.tail.value");
+    auto* tailAccumulated = IR::Instruction::createLoad(
+        i32, tailScratch, "rowprivate.accumulated.tail");
+    auto* tailProduct = IR::Instruction::createBinOp(
+        Opc::MUL, i32, "rowprivate.product.tail",
+        coefficient, tailInputValue);
+    auto* tailUpdated = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "rowprivate.updated.tail",
+        tailAccumulated, tailProduct);
+    jTailBody->pushBack(tailInputValue);
+    jTailBody->pushBack(tailAccumulated);
+    jTailBody->pushBack(tailProduct);
+    jTailBody->pushBack(tailUpdated);
+    jTailBody->pushBack(IR::Instruction::createStore(
+        tailUpdated, tailScratch));
+    jTailBody->pushBack(tailInputNext);
+    jTailBody->pushBack(tailScratchNext);
+    jTailBody->pushBack(tailIndexNext);
+    jTailBody->pushBack(IR::Instruction::createBr(jTailHeader));
 
     kLatch->pushBack(coefficientPointerNext);
     kLatch->pushBack(kNext);
