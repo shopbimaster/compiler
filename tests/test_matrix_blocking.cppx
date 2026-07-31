@@ -60,7 +60,7 @@ OptimizationResult optimizeToO2(const std::string& source) {
         }
         if (!function->prefersExpandedLeafRegisters()) continue;
         result.anyFunctionPrefersExpandedRegisters = true;
-        if (function->getName() == "__opt_inplace_matrix_block4") {
+        if (function->getName() == "__opt_inplace_matrix_row_private") {
             result.inPlaceHelperPrefersExpandedRegisters = true;
         }
         if (function->getName() == "__opt_conditional_matrix_mask4") {
@@ -81,13 +81,21 @@ int main() {
 
     const OptimizationResult inPlace = optimizeToO2(
         "../test/performance/many_mat_cal-1.sy");
-    if (inPlace.ir.find("__opt_inplace_matrix_block4") ==
+    if (inPlace.ir.find("__opt_inplace_matrix_row_private") ==
         std::string::npos) {
-        std::cerr << "in-place matrix reduction did not trigger blocking\n";
+        std::cerr << "in-place matrix reduction was not row-privatized\n";
         return 1;
     }
     if (!inPlace.inPlaceHelperPrefersExpandedRegisters) {
-        std::cerr << "blocked helper is missing its leaf-register hint\n";
+        std::cerr << "row-private helper is missing its leaf-register hint\n";
+        return 1;
+    }
+
+    const OptimizationResult renamedInPlace = optimizeToO2(
+        "../test/optimization/inplace_matrix_row_private_variant.sy");
+    if (renamedInPlace.ir.find("__opt_inplace_matrix_row_private") ==
+        std::string::npos) {
+        std::cerr << "renamed in-place matrix reduction did not trigger\n";
         return 1;
     }
     if (inPlace.ir.find("__opt_conditional_matrix_mask4") !=
@@ -98,7 +106,7 @@ int main() {
 
     const OptimizationResult conditional = optimizeToO2(
         "../test/performance/matmul1.sy");
-    if (conditional.ir.find("__opt_inplace_matrix_block4") !=
+    if (conditional.ir.find("__opt_inplace_matrix_row_private") !=
         std::string::npos) {
         std::cerr << "out-of-place matrix kernel triggered in-place blocking\n";
         return 1;
@@ -115,7 +123,7 @@ int main() {
 
     const OptimizationResult negative = optimizeToO2(
         "../test/performance/conv2d-1.sy");
-    if (negative.ir.find("__opt_inplace_matrix_block4") !=
+    if (negative.ir.find("__opt_inplace_matrix_row_private") !=
             std::string::npos ||
         negative.ir.find("__opt_conditional_matrix_mask4") !=
             std::string::npos) {

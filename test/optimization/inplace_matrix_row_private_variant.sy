@@ -1,0 +1,54 @@
+int transform[8][8];
+int state[8][8];
+
+int main() {
+    int n = getint();
+    int i = 0;
+    while (i < n) {
+        int j = 0;
+        while (j < n) {
+            transform[i][j] = getint();
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < n) {
+        int j = 0;
+        while (j < n) {
+            state[i][j] = getint();
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < n) {
+        int j = 0;
+        while (j < n) {
+            int k = 0;
+            int sum = 0;
+            while (k < n) {
+                sum = sum + transform[i][k] * state[k][j];
+                k = k + 1;
+            }
+            state[i][j] = sum;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < n) {
+        int j = 0;
+        while (j < n) {
+            putint(state[i][j]);
+            putch(32);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    putch(10);
+    return 0;
+}
