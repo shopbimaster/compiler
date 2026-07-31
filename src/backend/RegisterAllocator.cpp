@@ -5,6 +5,8 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>   // [EXP-SCAFFOLD] std::getenv for A/B switch
+#include <limits>
+
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -41,8 +43,66 @@ void RegisterAllocator::allocate(IR::Function& func) {
     nextSpillSlot = 0;
     spillSlotSize = 0;
 
+    intRegPool = INT_REGS;
+    floatRegPool = FLOAT_REGS;
+    bool isLeaf = true;
+    unsigned integerArgs = 0;
+    unsigned floatArgs = 0;
+    for (unsigned index = 0; index < func.getNumArgs(); ++index) {
+        auto* type = func.getArg(index)->getType();
+        if (type && type->isFloat()) ++floatArgs;
+        else ++integerArgs;
+    }
+    for (const auto& block : func.getBlocks()) {
+        for (const auto& instruction : block->getInstructions()) {
+            if (instruction->getOpcode() == IR::Instruction::Opcode::CALL) {
+                isLeaf = false;
+                break;
+            }
+        }
+        if (!isLeaf) break;
+    }
+
     maxInstId = assignInstructionIds(func);
     buildIntervals(func);
+
+    auto exceedsBaseCapacity = [&](bool isFloat) {
+        const auto& basePool = isFloat ? FLOAT_REGS : INT_REGS;
+        int capacity = 0;
+        for (const auto& reg : basePool) {
+            if (!reservedRegs.count(reg)) ++capacity;
+        }
+        for (const auto& point : intervals) {
+            if (point.isFloat != isFloat) continue;
+            int live = 0;
+            for (const auto& interval : intervals) {
+                if (interval.isFloat == isFloat &&
+                    interval.start <= point.start &&
+                    point.start <= interval.end) {
+                    ++live;
+                }
+            }
+            if (live > capacity) return true;
+        }
+        return false;
+    };
+    if (isLeaf && func.prefersExpandedLeafRegisters()) {
+        // Unused argument registers are ordinary caller-saved registers in a
+        // leaf. Add them only when the base pool provably cannot hold the
+        // maximum live set, keeping low-pressure functions byte-stable.
+        if (exceedsBaseCapacity(false)) {
+            for (unsigned index = std::max(2u, integerArgs);
+                 index < 8; ++index) {
+                intRegPool.push_back("a" + std::to_string(index));
+            }
+        }
+        if (exceedsBaseCapacity(true)) {
+            for (unsigned index = std::max(2u, floatArgs);
+                 index < 8; ++index) {
+                floatRegPool.push_back("fa" + std::to_string(index));
+            }
+        }
+    }
     if (useGraphColoring()) {
         colorAllocate();   // 图着色分配器（默认；RA_ALLOCATOR=linear 可切回线扫）
     } else {
@@ -649,13 +709,64 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
         intervals.push_back(interval);
     }
 
+    // 排序必须是全序，否则 intervals 会保留 firstSeen（unordered_map<IR::Value*,...>）
+    // 的迭代顺序 —— 那个顺序取决于指针值，也就是取决于 ASLR。
+    //
+    // 之前的平局判据止于 getName()，看似足够，但 IR 里的名字并不唯一：crc1 中
+    // %div.pow2.sum / %div.pow2.q 等各出现 10 次（除法降级会为每个展开点生成同名值）。
+    // 于是 (start, end, name) 三元组相同的区间之间顺序不定，线性扫描分配器按此
+    // 顺序分配寄存器，结果漂移。
+    //
+    // 实测（scripts/_det_aslr.sh crc1 10）：
+    //     ASLR 开：10 次编译产生 7 种不同的 .s
+    //     ASLR 关：10 次编译产生 1 种
+    // 受影响的是 crc1/crc2/crc3/huffman-01 共 4 例（scripts/_determinism.sh）。
+    //
+    // 这会让任何 A/B 对比失真——一次编译的差异可能只是噪声，而非改动效果——
+    // 也意味着提交同一份代码，评测机上的性能可能随运行而变。
+    //
+    // 修复：在 name 之后再加一级判据——值在函数内的出现序号（indexOf）。
+    // 它由 IR 的遍历顺序决定，与地址无关，且严格唯一，因此排序成为全序。
+    //
+    // 关键：新判据放在 getName() 之后而非之前。这样，凡是原先就能靠
+    // (start, end, name) 分出胜负的区间对，次序完全不变——即原先确定的 56 例
+    // 生成的 .s 与修复前逐字节相同（scripts/_asm_identical.sh 验证）。
+    // 只有原先并列（同 start、同 end、同名）因而顺序随地址漂移的那些对，
+    // 才由新判据定序。把 indexOf 放在 name 之前会重排大量本来无歧义的区间，
+    // 波及全部 60 例的寄存器分配——那是与本次修复无关的改动，须避免。
+
+    std::unordered_map<IR::Value*, size_t> valOrder;
+    {
+        size_t ord = 0;
+        for (auto& bb : func.getBlocks()) {
+            valOrder.emplace(bb.get(), ord++);
+            for (auto& inst : bb->getInstructions()) {
+                valOrder.emplace(inst.get(), ord++);
+            }
+        }
+        for (unsigned i = 0; i < func.getNumArgs(); ++i) {
+            valOrder.emplace(func.getArg(i), ord++);
+        }
+
+    }
+    auto orderOf = [&valOrder](IR::Value* v) -> size_t {
+        auto it = valOrder.find(v);
+        // 不在函数体内的值（全局量、常量等）排在最后，彼此间按名字定序。
+        return it == valOrder.end() ? std::numeric_limits<size_t>::max() : it->second;
+    };
+
     std::sort(intervals.begin(), intervals.end(),
-        [](const LiveInterval& a, const LiveInterval& b) {
+        [&](const LiveInterval& a, const LiveInterval& b) {
             if (a.start != b.start) return a.start < b.start;
-            // tiebreaker: 确保相同 start 时顺序确定（消除 unordered_map 迭代顺序的非确定性）
             if (a.end != b.end) return a.end < b.end;
-            return a.value->getName() < b.value->getName();
+            const std::string& na = a.value->getName();
+            const std::string& nb = b.value->getName();
+            if (na != nb) return na < nb;
+            // 仅同名区间走到这里——原先正是它们的次序随地址漂移。
+            return orderOf(a.value) < orderOf(b.value);
         });
+
+
 
     // ★ 填充 valToInterval：必须在 sort 之后，且此后 intervals 不得再增删。
     //   coalesceMoves 会原地修改元素的 reg 字段，但不会 push_back，指针保持有效。
@@ -671,7 +782,7 @@ void RegisterAllocator::linearScan() {
     for (auto& current : intervals) {
         expireOldIntervals(current.start, active);
 
-        const auto& regPool = current.isFloat ? FLOAT_REGS : INT_REGS;
+        const auto& regPool = current.isFloat ? floatRegPool : intRegPool;
         std::set<std::string> freeRegs(regPool.begin(), regPool.end());
 
         // 移除已被预留的寄存器
@@ -730,7 +841,7 @@ void RegisterAllocator::colorAllocate() {
 }
 
 bool RegisterAllocator::colorRegClass(bool isFloat) {
-    const auto& regPool = isFloat ? FLOAT_REGS : INT_REGS;
+    const auto& regPool = isFloat ? floatRegPool : intRegPool;
     // 可用物理寄存器 = 池 - 预留寄存器
     std::vector<std::string> kRegs;
     for (const auto& r : regPool) {

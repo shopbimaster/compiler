@@ -1,0 +1,28 @@
+// Reproducer: recursiveMemoization treats a function that READS a mutable
+// global as pure. The pass only checks that STOREs target local allocas; a
+// LOAD from a global is accepted. The "exactly one external call site"
+// check is satisfied here (one textual call site), but that call site sits
+// inside a loop that mutates the global between iterations, so the memo
+// table returned from the first iteration is stale.
+//
+// Expected output (no memoization): 0 1 2 3 4  -> sum printed each line
+// With memoization: every line reuses the value cached in iteration 0.
+int g;
+
+int f(int a, int b) {
+    if (a == 0) {
+        return g;   // depends on mutable global state, not just (a, b)
+    }
+    return f(a - 1, b);
+}
+
+int main() {
+    int i = 0;
+    while (i < 5) {
+        g = i;              // global mutated between calls
+        putint(f(3, 7));    // single external call site, but called 5 times
+        putch(10);
+        i = i + 1;
+    }
+    return 0;
+}

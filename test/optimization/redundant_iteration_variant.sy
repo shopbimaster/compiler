@@ -1,0 +1,86 @@
+const int SIDE = 96;
+
+void solve_system(int extent, float left[][SIDE], float right[][SIDE]) {
+    int outer = 0;
+    while (outer < extent) {
+        int inner = 0;
+        while (inner < extent) {
+            right[outer][inner] =
+                right[outer][inner] / left[outer][outer] + 1;
+            inner = inner + 1;
+        }
+
+        int lower = outer + 1;
+        while (lower < extent) {
+            inner = 0;
+            while (inner < extent) {
+                right[lower][inner] = right[lower][inner] -
+                    left[lower][outer] * right[outer][inner];
+                inner = inner + 1;
+            }
+            lower = lower + 1;
+        }
+        outer = outer + 1;
+    }
+}
+
+float lhs[SIDE][SIDE];
+float destination[SIDE][SIDE];
+float initial[SIDE][SIDE];
+
+int main() {
+    int extent = getint();
+    int row, column, repeat;
+
+    row = 0;
+    column = 0;
+    while (row < extent) {
+        column = 0;
+        while (column < extent) {
+            lhs[row][column] = getfloat();
+            column = column + 1;
+        }
+        row = row + 1;
+    }
+    row = 0;
+    column = 0;
+    while (row < extent) {
+        column = 0;
+        while (column < extent) {
+            initial[row][column] = getfloat();
+            column = column + 1;
+        }
+        row = row + 1;
+    }
+
+    starttime();
+    repeat = 0;
+    while (repeat < 7) {
+        row = 0;
+        while (row < extent) {
+            column = 0;
+            while (column < extent) {
+                destination[row][column] = initial[row][column];
+                column = column + 1;
+            }
+            row = row + 1;
+        }
+        solve_system(extent, lhs, destination);
+        repeat = repeat + 1;
+    }
+    stoptime();
+
+    float answer = 0;
+    row = 0;
+    while (row < extent) {
+        column = 0;
+        while (column < extent) {
+            answer = answer + destination[row][column];
+            column = column + 1;
+        }
+        row = row + 1;
+    }
+    putfloat(answer);
+    putch(10);
+    return 0;
+}

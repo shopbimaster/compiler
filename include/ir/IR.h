@@ -360,6 +360,12 @@ namespace IR {
         FunctionType* getFunctionType() const { return funcType; }
 
         bool isExternal() const { return external; }
+        bool prefersExpandedLeafRegisters() const {
+            return preferExpandedLeafRegisters;
+        }
+        void setPreferExpandedLeafRegisters(bool enabled = true) {
+            preferExpandedLeafRegisters = enabled;
+        }
 
         unsigned getNumArgs() const { return static_cast<unsigned>(args.size()); }
         Argument* getArg(unsigned i) const;
@@ -377,6 +383,7 @@ namespace IR {
         std::vector<std::unique_ptr<BasicBlock>>  blocks;
         Module*                                   parent;
         bool                                      external;
+        bool                                      preferExpandedLeafRegisters;
     };
 
     // ================================================================

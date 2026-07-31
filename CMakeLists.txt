@@ -142,15 +142,21 @@ add_library(sysy_opt STATIC
     src/opt/RepeatedDivRemToNative.cpp
     src/opt/ModAddRecurrence.cpp
     src/opt/StencilInteriorSpecialization.cpp
+    src/opt/InPlaceMatrixBlocking.cpp
+    src/opt/ConditionalMatrixBlocking.cpp
+    src/opt/TriangularCopyOptimization.cpp
     src/opt/RecursiveCallGuard.cpp
     src/opt/MatrixReductionContraction.cpp
     src/opt/MatrixReductionTransform.cpp
     src/opt/RadixSortLowering.cpp
+    src/opt/RedundantIterationElimination.cpp
+    src/opt/DynamicIdempotentLoopElimination.cpp
     src/opt/RecursiveMemoization.cpp
     src/opt/BitOpPatternRecognition.cpp
     src/opt/PowerOfTwoDispatch.cpp
     src/opt/GlobalVariablePromotion.cpp
     src/opt/GlobalConstantPropagation.cpp
+    src/opt/DeadGlobalStoreElimination.cpp
     src/opt/Mem2Reg.cpp
     src/opt/GVN.cpp
     src/opt/PhiLowering.cpp
@@ -193,6 +199,16 @@ set_source_files_properties(tests/test_peephole.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_peephole PRIVATE include)
 target_link_libraries(test_peephole PRIVATE sysy_opt)
 
+# Focused legality/trigger checks for the cache-local in-place matrix kernel.
+add_executable(test_matrix_blocking
+    tests/test_matrix_blocking.cppx
+    ${ANTLR_SOURCES}
+)
+set_source_files_properties(tests/test_matrix_blocking.cppx PROPERTIES LANGUAGE CXX)
+target_include_directories(test_matrix_blocking PRIVATE include ${ANTLR_INCLUDES})
+target_link_libraries(test_matrix_blocking
+    sysy_compiler sysy_opt ${ANTLR4_RUNTIME_TARGET})
+
 # ================================================================
 # 编译器主入口 compiler
 # ================================================================
@@ -218,7 +234,9 @@ if(BUILD_TESTING)
     add_test(NAME ir_unit COMMAND test_ir)
     add_test(NAME compiler_integration COMMAND test_integration)
     add_test(NAME peephole_unit COMMAND test_peephole)
-    set_tests_properties(ir_unit compiler_integration peephole_unit PROPERTIES
+    add_test(NAME matrix_blocking_unit COMMAND test_matrix_blocking)
+    set_tests_properties(ir_unit compiler_integration peephole_unit
+                         matrix_blocking_unit PROPERTIES
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
     if(TARGET test_register_allocator)
