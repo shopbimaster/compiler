@@ -7,8 +7,27 @@
 
 ## 一、当前焦点
 
-**分支**：bug-free 回退版本上新建分支（E4 循环旋转 + 后端 PHI move 重构）
-**当前方向**：**E4 循环旋转（Loop Rotation）** — 消除回边无条件跳转，转为 guard + do-while 形态，回边变条件分支（预测 taken），exit 变 fall-through。后端 self-loop PHI move 内联到分支前，消除 edge-split 块的 mv+j 开销。
+**分支**：`Peephole-test`（含 E4 循环旋转 + perf-compliant-loop-effects 合并 + InlineExpansion 跨 BB ALLOCA 克隆修复）
+**当前方向**：合并 `perf-compliant-loop-effects` 分支后修复 InlineExpansion 段错误，全测试通过，待 FPGA 验证。
+
+### 合并 perf-compliant-loop-effects + InlineExpansion 修复（2026-07-31）
+
+**合并内容**（commit `974f8cf`，--no-ff 前向合并）：
+- 新增 pass：`redundantIterationElimination`、`dynamicIdempotentLoopElimination`、`deadGlobalStoreElimination`、`inplaceMatrixBlocking`、`triangularCopyOptimization`、`conditionalMatrixBlocking`（均 O2 阶段）
+- 修改：`InlineExpansion.cpp`（热点循环内联 `isHotInlineCandidate`，放宽至 24 BB / 160 insts）、`DeadStoreElimination.cpp`（GEP 别名线性扫描）、`RegisterAllocator.cpp`（确定性排序修复）
+- 与现有优化无重叠：新 pass 在 O2 阶段，循环旋转在 O3 阶段；硬件优化（PHI move 内联、压缩指令、分支友好布局）不受影响
+
+**段错误根因与修复**：
+- **症状**：`38_light2d` 在 -O1（含热点循环内联）段错误
+- **根因**：`InlineExpansion::tryInlineMultiBBCall` 的两遍克隆（PHI → 其他）在跨 BB 引用 ALLOCA 时有顺序 bug。circle_sdf 内联进 scene 后，scene 的 BB 列表顺序变为 `entry → then_23 → else_24 → ... → inline_cont_circle_sdf_3(含 %sd1 alloca)`。`else_24` 中的 `load %sd1` 在 `inline_cont_circle_sdf_3` 中的 `alloca %sd1` 之前被克隆，导致 `lookup(%sd1)` 返回原始指针（非克隆），产生跨函数悬空引用 → 后续 pass 将 load 外提到 preheader → 运行时段错误
+- **修复**：在两遍克隆之间增加 ALLOCA 预克隆遍（PHI → ALLOCA → 其他），确保所有栈槽在被引用前进入 valueMap
+
+**测试结果（QEMU）**：
+| 套件 | 结果 | 新增失败 |
+| ---- | ---- | -------- |
+| func O1 | 96 OK, 3 DIFF, 0 SEG, 1 TO | **0**（预存：62_percolation/68_brainfk/75_max_flow + 1 TO） |
+| hfunc O1 | 36 OK, 4 DIFF, 0 SEG, 0 TO | **0**（38_light2d SEG→PASS；预存：12_DSU/21_union_find/30_many_dimensions/35_math） |
+| perf O1 | 60 OK | **0** |
 
 ### E4 循环旋转 + PHI move 内联（2026-07-30）
 

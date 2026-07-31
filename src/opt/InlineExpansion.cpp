@@ -465,7 +465,9 @@ bool tryInlineMultiBBCall(IR::Instruction* callInst, IR::Function* callee,
     //   lookup() 会返回原始 PHI 指针，导致克隆的指令引用错误的（原始）PHI。
     //   后续 LICM 会将这些指令误判为循环不变量（因为引用的是另一个函数的
     //   PHI），将其外提到 preheader，使循环体变空 → 无限循环。
-    //   解决方案：两遍克隆——先克隆所有 PHI（填充 valueMap），再克隆其他指令。
+    //   解决方案：三遍克隆——先克隆所有 PHI（填充 valueMap），再克隆所有
+    //   ALLOCA（确保跨 BB 引用的栈槽在 LOAD/STORE 之前进入 valueMap），
+    //   最后克隆其他指令。
     for (auto& calleeBB : callee->getBlocks()) {
         auto* clonedBB = bbMap[calleeBB.get()];
         for (auto& inst : calleeBB->getInstructions()) {
@@ -477,12 +479,28 @@ bool tryInlineMultiBBCall(IR::Instruction* callInst, IR::Function* callee,
         }
     }
 
-    // 3b. 第二遍：克隆所有非 PHI、非 RET 指令
+    // 3a.5. 第二遍：克隆所有 ALLOCA 指令（跨 BB 预填充 valueMap）
+    //   ★ 关键：circle_sdf 内联后 callee 的 BB 顺序可能使得 ALLOCA 所在块
+    //   排在引用该 ALLOCA 的 LOAD/STORE 所在块之后（如 scene 的 %sd1 alloca
+    //   在 inline_cont 块，而 load %sd1 在 else_24 块，else_24 排在前面）。
+    //   若不预克隆 ALLOCA，LOAD 克隆时 lookup(alloca) 会返回原始指针 → 悬空引用 → SEGFAULT。
+    for (auto& calleeBB : callee->getBlocks()) {
+        auto* clonedBB = bbMap[calleeBB.get()];
+        for (auto& inst : calleeBB->getInstructions()) {
+            if (inst->getOpcode() != Opc::ALLOCA) continue;
+            auto* cloned = cloneInstruction(inst.get(), valueMap, caller, paramAllocaToArg);
+            if (cloned) {
+                clonedBB->pushBack(cloned);
+            }
+        }
+    }
+
+    // 3b. 第三遍：克隆所有非 PHI、非 ALLOCA、非 RET 指令
     for (auto& calleeBB : callee->getBlocks()) {
         auto* clonedBB = bbMap[calleeBB.get()];
         for (auto& inst : calleeBB->getInstructions()) {
             auto op = inst->getOpcode();
-            if (op == Opc::PHI || op == Opc::RET) continue;
+            if (op == Opc::PHI || op == Opc::ALLOCA || op == Opc::RET) continue;
             auto* cloned = cloneInstruction(inst.get(), valueMap, caller, paramAllocaToArg);
             if (cloned) {
                 clonedBB->pushBack(cloned);
