@@ -1,3 +1,10 @@
+// ================================================================
+// src/opt/MatrixReductionTransform.cpp — 矩阵归约模式重写变换
+// ----------------------------------------------------------------
+// 所属模块：opt（矩阵归约基础设施，供 MatrixReductionContraction 调用）
+// 关键依赖：opt/MatrixReductionPlan.h
+// ================================================================
+
 #include "opt/MatrixReductionPlan.h"
 
 #include <string>

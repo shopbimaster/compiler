@@ -109,10 +109,7 @@ add_library(sysy_opt STATIC
     src/opt/ReadOnlyGlobal.cpp
     src/opt/SCCP.cpp
     src/opt/LoopFind.cpp
-    src/opt/AffineRecurrenceAnalysis.cpp
-    src/opt/LoopPatternAnalysis.cpp
-    src/opt/MemoryAccessAnalysis.cpp
-    src/opt/ScalarReductionAnalysis.cpp
+    src/opt/LoopAnalysis.cpp
     src/opt/SCEVAnalysis.cpp
     src/opt/LoopStrengthReduce.cpp
     src/opt/LoopFullUnroll.cpp
@@ -142,20 +139,17 @@ add_library(sysy_opt STATIC
     src/opt/TailRecursionElimination.cpp
     src/opt/InstructionScheduling.cpp
     src/opt/SoftwarePipelining.cpp
-    src/opt/RecursiveMulToNative.cpp
-    src/opt/RepeatedDivRemToNative.cpp
-    src/opt/ModAddRecurrence.cpp
+    src/opt/NativeLowering.cpp
     src/opt/StencilInteriorSpecialization.cpp
     src/opt/InPlaceMatrixBlocking.cpp
     src/opt/ConditionalMatrixBlocking.cpp
     src/opt/TriangularCopyOptimization.cpp
-    src/opt/RecursiveCallGuard.cpp
+    src/opt/RecursiveOpt.cpp
     src/opt/MatrixReductionContraction.cpp
     src/opt/MatrixReductionTransform.cpp
     src/opt/RadixSortLowering.cpp
     src/opt/RedundantIterationElimination.cpp
     src/opt/DynamicIdempotentLoopElimination.cpp
-    src/opt/RecursiveMemoization.cpp
     src/opt/BitOpPatternRecognition.cpp
     src/opt/PowerOfTwoDispatch.cpp
     src/opt/GlobalVariablePromotion.cpp

@@ -1,5 +1,12 @@
-#include "opt/LoopPatternAnalysis.h"
-#include "opt/MemoryAccessAnalysis.h"
+// ================================================================
+// src/opt/InPlaceMatrixBlocking.cpp — 原地矩阵乘缓存局部性分块
+// ----------------------------------------------------------------
+// 所属模块：opt（O2 结构化变换）
+// 关键依赖：opt/LoopAnalysis.h（循环模式分析）、opt/Optimizer.h
+// 单元测试：test_matrix_blocking
+// ================================================================
+
+#include "opt/LoopAnalysis.h"
 #include "opt/Optimizer.h"
 
 #include <algorithm>

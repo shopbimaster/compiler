@@ -3,7 +3,7 @@
 #include <string>
 #include "ir/IR.h"
 #include "ir/IRBuilder.h"
-#include "opt/LoopPatternAnalysis.h"
+#include "opt/LoopAnalysis.h"
 #include "opt/Optimizer.h"
 
 using namespace IR;

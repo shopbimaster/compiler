@@ -1,4 +1,11 @@
-#include "opt/LoopPatternAnalysis.h"
+// ================================================================
+// src/opt/StencilInteriorSpecialization.cpp — 模板内部边界特化
+// ----------------------------------------------------------------
+// 所属模块：opt（O2 阶段 6 全局清理）
+// 关键依赖：opt/LoopAnalysis.h（循环模式分析）、opt/Optimizer.h
+// ================================================================
+
+#include "opt/LoopAnalysis.h"
 #include "opt/Optimizer.h"
 
 #include <cstdint>

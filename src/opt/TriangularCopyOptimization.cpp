@@ -1,5 +1,11 @@
-#include "opt/LoopPatternAnalysis.h"
-#include "opt/MemoryAccessAnalysis.h"
+// ================================================================
+// src/opt/TriangularCopyOptimization.cpp — 下三角拷贝范围裁剪
+// ----------------------------------------------------------------
+// 所属模块：opt（O2 阶段 2 指令级化简）
+// 关键依赖：opt/LoopAnalysis.h（循环模式分析）、opt/Optimizer.h
+// ================================================================
+
+#include "opt/LoopAnalysis.h"
 #include "opt/Optimizer.h"
 
 #include <algorithm>

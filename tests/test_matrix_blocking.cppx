@@ -1,5 +1,5 @@
 #include "ir/IRBuilder.h"
-#include "opt/MemoryAccessAnalysis.h"
+#include "opt/LoopAnalysis.h"
 #include "opt/Optimizer.h"
 
 #include <cstdlib>

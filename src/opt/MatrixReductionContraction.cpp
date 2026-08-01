@@ -1,9 +1,13 @@
+// ================================================================
+// src/opt/MatrixReductionContraction.cpp — 矩阵归约收缩
+// ----------------------------------------------------------------
+// 所属模块：opt（O2 阶段 6 全局清理）
+// 关键依赖：opt/Optimizer.h、opt/LoopAnalysis.h、opt/MatrixReductionPlan.h
+// ================================================================
+
 #include "opt/Optimizer.h"
-#include "opt/AffineRecurrenceAnalysis.h"
-#include "opt/LoopPatternAnalysis.h"
+#include "opt/LoopAnalysis.h"
 #include "opt/MatrixReductionPlan.h"
-#include "opt/MemoryAccessAnalysis.h"
-#include "opt/ScalarReductionAnalysis.h"
 
 #include <algorithm>
 #include <limits>

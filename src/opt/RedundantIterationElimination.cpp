@@ -1,4 +1,11 @@
-#include "opt/MemoryAccessAnalysis.h"
+// ================================================================
+// src/opt/RedundantIterationElimination.cpp — 可证冗余的循环迭代消除
+// ----------------------------------------------------------------
+// 所属模块：opt（O2 结构化变换）
+// 关键依赖：opt/LoopAnalysis.h（循环模式分析）、opt/Optimizer.h
+// ================================================================
+
+#include "opt/LoopAnalysis.h"
 #include "opt/Optimizer.h"
 
 #include <algorithm>

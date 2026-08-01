@@ -8,7 +8,21 @@
 ## 一、当前焦点
 
 **分支**：`Peephole-test`（含 E4 循环旋转 + perf-compliant-loop-effects 合并 + InlineExpansion 跨 BB ALLOCA 克隆修复 + P9 软件流水 + E5 分支概率引导布局）
-**当前方向**：软件流水（IR 层跨迭代 LOAD 预取）+ 分支概率引导布局已完成并验证，待 FPGA 实测。
+**当前方向**：净室化重构已完成（2026-08-01），软件流水 + 分支概率引导布局待 FPGA 实测。
+
+### 净室化重构（2026-08-01，已完成）
+
+**文件合并**（9 个零散 .cpp → 3 个主题合并文件，零逻辑改动）：
+
+- `LoopAnalysis.cpp/.h` ← AffineRecurrenceAnalysis + LoopPatternAnalysis + MemoryAccessAnalysis + ScalarReductionAnalysis
+- `NativeLowering.cpp` ← RecursiveMulToNative + RepeatedDivRemToNative + ModAddRecurrence（修复匿名命名空间合并导致的 isLoadFrom/isDirectlyReturned 重定义，删除 section 2 重复定义，保留 section 1 等价版本）
+- `RecursiveOpt.cpp` ← RecursiveCallGuard + RecursiveMemoization
+
+**文档收敛**：README.md 重写为唯一项目文档（架构 + 函数功能列表 + 测试映射 + 依赖链 + 注释规范 + 构建命令），删除 8 个根目录 .md + 4 个 .trae/documents 草稿 + 3 个 .claude/plan。
+
+**注释统一**：11 个缺少文件头的 opt 源文件补齐统一头块，全部 62 个 opt .cpp 现有一致格式。
+
+**验证**：构建零错误零警告；func O1 96 OK/3 DIFF/1 TO、hfunc O1 36 OK/4 DIFF、perf 60/60 — 全部匹配基线，零新增失败。
 
 ### E5 分支概率引导布局（2026-07-31）
 

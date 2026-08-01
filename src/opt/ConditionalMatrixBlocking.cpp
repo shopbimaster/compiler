@@ -1,5 +1,11 @@
-#include "opt/LoopPatternAnalysis.h"
-#include "opt/MemoryAccessAnalysis.h"
+// ================================================================
+// src/opt/ConditionalMatrixBlocking.cpp — 条件矩阵归约列融合
+// ----------------------------------------------------------------
+// 所属模块：opt（O2 结构化变换）
+// 关键依赖：opt/LoopAnalysis.h（循环分析）、opt/Optimizer.h
+// ================================================================
+
+#include "opt/LoopAnalysis.h"
 #include "opt/Optimizer.h"
 
 #include <algorithm>
