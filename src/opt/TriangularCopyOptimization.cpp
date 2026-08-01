@@ -232,13 +232,30 @@ bool getFlatGlobalAccess(
     IR::Value* pointer, IR::GlobalVariable*& root,
     IR::Value*& index) {
     PointerAccess access;
-    if (!collectPointerAccess(pointer, nullptr, access) ||
-        access.indices.empty()) {
+    if (!collectPointerAccess(pointer, nullptr, access)) {
         return false;
     }
     root = dynamic_cast<IR::GlobalVariable*>(access.root);
-    index = access.indices.back();
-    return root != nullptr;
+    auto* pointerType = root
+        ? dynamic_cast<IR::PointerType*>(root->getType())
+        : nullptr;
+    auto* arrayType = pointerType
+        ? dynamic_cast<IR::ArrayType*>(pointerType->getPointeeType())
+        : nullptr;
+    if (!arrayType ||
+        arrayType->getElementType() != IR::IntegerType::I32) {
+        return false;
+    }
+    if (access.indices.size() == 1) {
+        index = access.indices.front();
+        return true;
+    }
+    if (access.indices.size() == 2 &&
+        isConstant(access.indices.front(), 0)) {
+        index = access.indices.back();
+        return true;
+    }
+    return false;
 }
 
 bool blockHasOnlyIncrementAndBranch(
@@ -273,6 +290,104 @@ bool blockHasOnlyIncrementAndBranch(
         return false;
     }
     return increments == 1;
+}
+
+bool blockHasSingleIncrementTo(
+    IR::BasicBlock* block, IR::Value* pointer,
+    IR::BasicBlock* target) {
+    auto* terminator = block ? block->getTerminator() : nullptr;
+    if (!terminator || terminator->getOpcode() != Opc::BR ||
+        terminator->getNumOperands() != 1 ||
+        terminator->getOperand(0) != target) {
+        return false;
+    }
+    unsigned increments = 0;
+    for (const auto& instruction : block->getInstructions()) {
+        if (instruction->getOpcode() != Opc::STORE ||
+            instruction->getNumOperands() != 2 ||
+            instruction->getOperand(1) != pointer) {
+            continue;
+        }
+        if (!isUnitIncrement(instruction->getOperand(0), pointer)) {
+            return false;
+        }
+        ++increments;
+    }
+    return increments == 1;
+}
+
+bool hasNoPhi(IR::BasicBlock* block) {
+    if (!block) return false;
+    return std::none_of(
+        block->getInstructions().begin(), block->getInstructions().end(),
+        [](const auto& instruction) {
+            return instruction->getOpcode() == Opc::PHI;
+        });
+}
+
+bool definitionsUsedOnlyInBlock(IR::BasicBlock* block) {
+    if (!block) return false;
+    for (const auto& instruction : block->getInstructions()) {
+        for (const auto& use : instruction->getUses()) {
+            auto* user = dynamic_cast<IR::Instruction*>(use.user);
+            if (!user || user->getParent() != block) return false;
+        }
+    }
+    return true;
+}
+
+bool definitionsStayWithin(
+    const std::unordered_set<IR::BasicBlock*>& region) {
+    for (auto* block : region) {
+        for (const auto& instruction : block->getInstructions()) {
+            for (const auto& use : instruction->getUses()) {
+                auto* user = dynamic_cast<IR::Instruction*>(use.user);
+                if (!user || !region.count(user->getParent())) return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool overwrittenBeforeUse(
+    IR::Function* function, IR::Value* pointer,
+    IR::BasicBlock* start) {
+    for (const auto& use : pointer->getUses()) {
+        auto* instruction = dynamic_cast<IR::Instruction*>(use.user);
+        if (!instruction) return false;
+        const bool directLoad =
+            instruction->getOpcode() == Opc::LOAD && use.operandNo == 0;
+        const bool directStore =
+            instruction->getOpcode() == Opc::STORE && use.operandNo == 1;
+        if (!directLoad && !directStore) return false;
+    }
+
+    auto successors = buildSuccessors(function);
+    std::vector<IR::BasicBlock*> worklist = {start};
+    std::unordered_set<IR::BasicBlock*> visited;
+    while (!worklist.empty()) {
+        auto* block = worklist.back();
+        worklist.pop_back();
+        if (!block || !visited.insert(block).second) continue;
+        bool killed = false;
+        for (const auto& instruction : block->getInstructions()) {
+            if (instruction->getOpcode() == Opc::STORE &&
+                instruction->getNumOperands() == 2 &&
+                instruction->getOperand(1) == pointer) {
+                killed = true;
+                break;
+            }
+            for (unsigned index = 0;
+                 index < instruction->getNumOperands(); ++index) {
+                if (instruction->getOperand(index) == pointer) return false;
+            }
+        }
+        if (killed) continue;
+        for (auto* successor : successors[block]) {
+            worklist.push_back(successor);
+        }
+    }
+    return true;
 }
 
 bool matchGuard(
@@ -416,7 +531,11 @@ bool matchPlan(
     if (!innerBranch || innerBranch->getOpcode() != Opc::COND_BR ||
         innerBranch->getOperand(1) != branch->getParent() ||
         !innerLoop.body.count(copyBlock) ||
-        !innerLoop.body.count(skipBlock)) {
+        !innerLoop.body.count(skipBlock) || !hasNoPhi(copyBlock) ||
+        !definitionsUsedOnlyInBlock(branch->getParent()) ||
+        !definitionsStayWithin(innerLoop.body) ||
+        !blockHasSingleIncrementTo(
+            copyBlock, innerPointer, innerLoop.header)) {
         return false;
     }
 
@@ -429,6 +548,7 @@ bool matchPlan(
 
     unsigned globalLoads = 0;
     unsigned globalStores = 0;
+    std::unordered_set<IR::Value*> localPointers;
     for (auto* block : outerLoop.body) {
         for (const auto& instruction : block->getInstructions()) {
             if (instruction->getOpcode() == Opc::CALL) return false;
@@ -436,12 +556,26 @@ bool matchPlan(
             const bool isStore = instruction->getOpcode() == Opc::STORE;
             if (!isLoad && !isStore) continue;
             const unsigned pointerOperand = isLoad ? 0 : 1;
-            if (!rootGlobal(instruction->getOperand(pointerOperand))) continue;
+            auto* pointer = instruction->getOperand(pointerOperand);
+            auto* localPointer = dynamic_cast<IR::Instruction*>(pointer);
+            if (localPointer && localPointer->getOpcode() == Opc::ALLOCA) {
+                localPointers.insert(pointer);
+                continue;
+            }
+            if (!rootGlobal(pointer)) return false;
             if (isLoad) ++globalLoads;
             if (isStore) ++globalStores;
         }
     }
-    if (globalLoads != 2 || globalStores != 2) return false;
+    if (globalLoads != 2 || globalStores != 2) {
+        return false;
+    }
+    for (auto* pointer : localPointers) {
+        if (!overwrittenBeforeUse(
+                function, pointer, innerLoop.exit)) {
+            return false;
+        }
+    }
 
     plan.function = function;
     plan.outerIndex = outerIndex;

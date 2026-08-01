@@ -155,7 +155,7 @@ bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
     // 原因：递减循环（SUB 模式，step < 0）的 LSR 在 header 创建 lsr.ptr PHI，
     // 其活跃区间从 header 延伸到 latch，横跨整个循环体包括内层循环。
     // 递减循环的指针递减方向与通常的地址增长相反，寄存器分配器可能更难处理，
-    // 导致更多溢出。实测：h-5 LU 分解的递减 i 循环 LSR 导致 +100-200ms 回退。
+    // 导致更多溢出；递减的外层循环在实测中出现过明显回退。
     // 而递增循环（ADD 模式，step > 0）的外层 LSR 是有益的，不跳过。
     if (stepCI->getValue() < 0) {
         for (auto* bb : loop.body) {
@@ -183,10 +183,10 @@ bool reduceGEPsInLoop(const NaturalLoop& loop, IR::Function* func,
 
             // 辅助函数：检测值是否是 IV 或 (IV+const)，返回是否匹配
             // 注意：仅支持 ADD(iv, const)，不支持 SUB(iv, const)。
-            // 原因：sub(iv, const) 如 i-1 常出现在递归函数（如 knapsack_naive）中，
+            // 原因：sub(iv, const) 如 i-1 常出现在递归函数中，
             // 在递归函数中创建 LSR 指针会增加寄存器保存开销（2^N 放大），
-            // 实测 knapsack_naive +102ms 回归。ADD(iv, const) 如 k+1 出现在
-            // 嵌套循环中（如 h-8），LSR 收益大于开销。
+            // 其保存开销会被递归深度放大。ADD(iv, const) 如 k+1 常出现在
+            // 嵌套循环中，此时 LSR 收益通常大于开销。
             auto matchIvOrOffset = [&](IR::Value* idx) -> bool {
                 // 直接 IV
                 if (idx == ivPhi) {

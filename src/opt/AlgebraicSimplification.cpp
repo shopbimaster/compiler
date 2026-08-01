@@ -561,8 +561,8 @@ bool trySimplify(IR::Instruction* inst) {
     //   select(cond, x, 0) → and(cond, x)   （对应 a && b）
     // 前提：cond 与非常量分支 x 均为 i1（值域 {0,1}），此时按位 or/and 与
     //   select 逐位等价。IfConversion 把 `||`/`&&` 降级成的 select 正是此形，
-    //   否则后端把 select 展开成 seqz/neg/and/or 多条指令（knapsack 递归体的
-    //   `i==0 || w==0`、短路求值等热路径每次都执行）。化简为单条 or/and。
+    //   否则后端把 select 展开成 seqz/neg/and/or 多条指令；递归基例中的
+    //   短路条件会频繁执行。化简为单条 or/and。
     // 安全性：纯函数式；要求 cond 和 x 都是 i1，结果类型沿用 select 的 i1。
     // ================================================================
     if (op == Opc::SELECT && inst->getNumOperands() >= 3) {

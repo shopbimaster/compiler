@@ -102,7 +102,7 @@ int inferTripCount(IR::BasicBlock* header) {
         }
 
         // 如果初始值未知，迭代次数依赖于外层循环变量等动态值
-        // 实际 tripCount 不是常数，展开会导致越界访问（如 h-5-01 回代循环）
+        // 实际 tripCount 不是常数，展开会导致动态边界循环越界访问。
         if (!initKnown) return -1;
 
         // 仅处理 slt（有符号小于）：i < N  → tripCount = N - init
@@ -240,7 +240,7 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
 
     // 按从大到小尝试因子，最大 8×
     // 包含质数因子 5 和 7，支持 tc 为质数的循环完全展开
-    // （如 conv2d 的 KSIZE=5 循环，如果循环体是单 BB）
+    // 这也覆盖 trip count 为 5 或 7 的单基本块循环。
     unsigned factor = 0;
     static const unsigned candidates[] = {8, 6, 4, 3, 2};
     for (unsigned f : candidates) {

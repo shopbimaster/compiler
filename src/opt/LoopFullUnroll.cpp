@@ -769,8 +769,8 @@ bool fullUnrollLoop(const NaturalLoop& loop, IR::Function* func) {
     if (funcInstCount > 1500) return false;
 
     // 单层代码膨胀保护：展开后指令数 = (body指令数 - terminator数) * tc
-    // 限制为 500：允许小循环展开，阻止 conv2d kr/kc 嵌套展开导致寄存器溢出
-    // conv2d 的 kr×kc 嵌套展开（25 个 then_39 块）会产生 25 个同时活跃的 GEP 值，
+    // 限制为 500：允许小循环展开，阻止固定尺寸的嵌套内核导致寄存器溢出。
+    // 嵌套展开会产生大量同时活跃的 GEP 值，
     // 加上函数参数（arg0/arg1/arg2）和循环变量，总计 30+ 个同时活跃值，
     // 远超 16 个可用寄存器，导致寄存器分配器在溢出时产生错误代码 → SEGFAULT
     size_t bodyInstCount = 0;
@@ -821,8 +821,8 @@ bool fullUnrollLoop(const NaturalLoop& loop, IR::Function* func) {
     // 嵌套循环保护：跳过含内层循环的外层循环的完全展开
     // 原因：完全展开外层循环 tc 次会创建 tc 份内层循环的副本，每份都需要
     // 独立的 header/body/latch 和寄存器分配。这会导致代码指数膨胀和寄存器
-    // 压力激增。典型案例：h-5 LU 分解的递减 i 循环（tc=20）含内层 j 循环，
-    // 展开后创建 20 份 j 循环 → 92 个额外 BB → 寄存器溢出 → +200ms 回退。
+    // 压力激增。例如一个 trip count 为 20 的外层循环若包含内层循环，
+    // 完全展开会复制 20 份内层 CFG，容易导致代码膨胀和寄存器溢出。
     {
         auto allLoops = getLoopsInnermostFirst(func);
         for (auto& otherLoop : allLoops) {
@@ -835,7 +835,7 @@ bool fullUnrollLoop(const NaturalLoop& loop, IR::Function* func) {
     // ★ 必须按 func->getBlocks() 的 vector 顺序遍历（确定性），
     //   而非 loop.body（unordered_set，迭代顺序不确定）。
     //   非确定性会导致新 BB 创建顺序不同 → 指令 ID 不同 →
-    //   活跃区间不同 → 寄存器分配不同 → 非确定性 SEGFAULT（conv2d 根因）
+    //   活跃区间不同 → 寄存器分配不同 → 非确定性错误代码。
     std::vector<IR::BasicBlock*> bodyBBs;
     std::vector<IR::BasicBlock*> bodyBBsExceptHeader;
     for (auto& bb : func->getBlocks()) {

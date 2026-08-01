@@ -14,6 +14,8 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
+#include <algorithm>
+#include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -92,6 +94,13 @@ IR::Instruction* findConditionalBranch(
 
 struct SoftwareBitLoop {
     Opcode nativeOpcode = Opcode::XOR;
+    IR::Value* argumentSlots[2] = {nullptr, nullptr};
+    IR::Value* bitSlots[2] = {nullptr, nullptr};
+    IR::Value* lengthSlot = nullptr;
+    IR::Value* powerSlot = nullptr;
+    IR::Value* resultSlot = nullptr;
+    IR::Value* temporarySlot = nullptr;
+    IR::Instruction* resultAdd = nullptr;
 };
 
 bool matchSoftwareBitLoop(IR::Function* function, SoftwareBitLoop& match) {
@@ -230,6 +239,15 @@ bool matchSoftwareBitLoop(IR::Function* function, SoftwareBitLoop& match) {
     }
     if (!resultSlot || !resultAdd) return false;
 
+    match.argumentSlots[0] = argumentSlots[0];
+    match.argumentSlots[1] = argumentSlots[1];
+    match.bitSlots[0] = bitSlots[0];
+    match.bitSlots[1] = bitSlots[1];
+    match.lengthSlot = lengthSlot;
+    match.powerSlot = powerSlot;
+    match.resultSlot = resultSlot;
+    match.resultAdd = resultAdd;
+
     for (auto* instruction : instructions) {
         if (instruction->getOpcode() != Opcode::ICMP ||
             instruction->getName() != "ne" ||
@@ -284,6 +302,7 @@ bool matchSoftwareBitLoop(IR::Function* function, SoftwareBitLoop& match) {
         }
     }
     if (!storedTest || !temporarySlot) return false;
+    match.temporarySlot = temporarySlot;
 
     IR::Instruction* finalTest = nullptr;
     for (auto* instruction : instructions) {
@@ -328,6 +347,596 @@ bool matchSoftwareBitLoop(IR::Function* function, SoftwareBitLoop& match) {
     return false;
 }
 
+template <typename Predicate>
+IR::Instruction* findUniqueInstruction(IR::Function* function,
+                                       Predicate predicate) {
+    IR::Instruction* result = nullptr;
+    for (const auto& block : function->getBlocks()) {
+        for (const auto& instruction : block->getInstructions()) {
+            if (!predicate(instruction.get())) continue;
+            if (result) return nullptr;
+            result = instruction.get();
+        }
+    }
+    return result;
+}
+
+bool hasExactInstructionUses(
+    IR::Value* value, const std::vector<IR::Instruction*>& expectedUses) {
+    std::unordered_set<IR::Instruction*> remaining(
+        expectedUses.begin(), expectedUses.end());
+    if (remaining.size() != expectedUses.size()) return false;
+    for (const auto& use : value->getUses()) {
+        auto* instruction = dynamic_cast<IR::Instruction*>(use.user);
+        if (!instruction || remaining.erase(instruction) != 1) return false;
+    }
+    return remaining.empty();
+}
+
+bool isI32Alloca(IR::Value* value) {
+    auto* instruction = dynamic_cast<IR::Instruction*>(value);
+    auto* pointerType = instruction
+        ? dynamic_cast<IR::PointerType*>(instruction->getType())
+        : nullptr;
+    return instruction && instruction->getOpcode() == Opcode::ALLOCA &&
+           pointerType &&
+           pointerType->getPointeeType() == IR::IntegerType::I32;
+}
+
+bool isBranchTo(IR::BasicBlock* block, IR::BasicBlock* target) {
+    auto* terminator = block ? block->getTerminator() : nullptr;
+    return terminator && terminator->getOpcode() == Opcode::BR &&
+           terminator->getNumOperands() == 1 &&
+           terminator->getOperand(0) == target;
+}
+
+bool hasExactInstructionOrder(
+    IR::BasicBlock* block,
+    const std::vector<IR::Instruction*>& expectedInstructions) {
+    if (!block || block->getInstructions().size() !=
+                      expectedInstructions.size()) {
+        return false;
+    }
+    std::size_t index = 0;
+    for (const auto& instruction : block->getInstructions()) {
+        if (instruction.get() != expectedInstructions[index++]) return false;
+    }
+    return true;
+}
+
+bool validateExactSoftwareBitLoop(IR::Function* function,
+                                  const SoftwareBitLoop& match) {
+    auto* entry = function ? function->getEntryBlock() : nullptr;
+    if (!entry || !match.resultAdd ||
+        !isI32Alloca(match.argumentSlots[0]) ||
+        !isI32Alloca(match.argumentSlots[1]) ||
+        !isI32Alloca(match.bitSlots[0]) ||
+        !isI32Alloca(match.bitSlots[1]) ||
+        !isI32Alloca(match.lengthSlot) ||
+        !isI32Alloca(match.powerSlot) ||
+        !isI32Alloca(match.resultSlot)) {
+        return false;
+    }
+
+    auto isStore = [](IR::Instruction* instruction, IR::Value* value,
+                      IR::Value* pointer) {
+        return instruction->getOpcode() == Opcode::STORE &&
+               instruction->getNumOperands() == 2 &&
+               instruction->getOperand(0) == value &&
+               instruction->getOperand(1) == pointer;
+    };
+    auto isConstantStore = [](IR::Instruction* instruction,
+                              IR::Value* pointer, int64_t value) {
+        return instruction->getOpcode() == Opcode::STORE &&
+               instruction->getNumOperands() == 2 &&
+               instruction->getOperand(1) == pointer &&
+               isIntConstant(instruction->getOperand(0), value);
+    };
+    auto isLoad = [](IR::Instruction* instruction, IR::Value* pointer) {
+        return instruction->getOpcode() == Opcode::LOAD &&
+               instruction->getNumOperands() == 1 &&
+               instruction->getOperand(0) == pointer;
+    };
+
+    IR::Instruction* argumentInitializers[2] = {nullptr, nullptr};
+    IR::Instruction* remainderLoads[2] = {nullptr, nullptr};
+    IR::Instruction* remainders[2] = {nullptr, nullptr};
+    IR::Instruction* remainderStores[2] = {nullptr, nullptr};
+    IR::Instruction* divisionLoads[2] = {nullptr, nullptr};
+    IR::Instruction* divisions[2] = {nullptr, nullptr};
+    IR::Instruction* divisionStores[2] = {nullptr, nullptr};
+
+    for (int index = 0; index < 2; ++index) {
+        argumentInitializers[index] = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return isStore(instruction, function->getArg(index),
+                               match.argumentSlots[index]);
+            });
+        remainders[index] = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return instruction->getOpcode() == Opcode::SREM &&
+                       instruction->getNumOperands() == 2 &&
+                       getLoadedPointer(instruction->getOperand(0)) ==
+                           match.argumentSlots[index] &&
+                       isIntConstant(instruction->getOperand(1), 2);
+            });
+        divisions[index] = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return instruction->getOpcode() == Opcode::SDIV &&
+                       instruction->getNumOperands() == 2 &&
+                       getLoadedPointer(instruction->getOperand(0)) ==
+                           match.argumentSlots[index] &&
+                       isIntConstant(instruction->getOperand(1), 2);
+            });
+        if (!argumentInitializers[index] || !remainders[index] ||
+            !divisions[index]) {
+            return false;
+        }
+        remainderLoads[index] = dynamic_cast<IR::Instruction*>(
+            remainders[index]->getOperand(0));
+        divisionLoads[index] = dynamic_cast<IR::Instruction*>(
+            divisions[index]->getOperand(0));
+        remainderStores[index] = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return isStore(instruction, remainders[index],
+                               match.bitSlots[index]);
+            });
+        divisionStores[index] = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return isStore(instruction, divisions[index],
+                               match.argumentSlots[index]);
+            });
+        if (!remainderStores[index] || !divisionStores[index] ||
+            argumentInitializers[index]->getParent() != entry ||
+            !hasExactInstructionUses(
+                match.argumentSlots[index],
+                {argumentInitializers[index], remainderLoads[index],
+                 divisionLoads[index], divisionStores[index]})) {
+            return false;
+        }
+    }
+
+    auto* lengthInitializer = findUniqueInstruction(
+        function, [&](IR::Instruction* instruction) {
+            return isConstantStore(instruction, match.lengthSlot, 32);
+        });
+    auto* resultInitializer = findUniqueInstruction(
+        function, [&](IR::Instruction* instruction) {
+            return isConstantStore(instruction, match.resultSlot, 0);
+        });
+    auto* powerInitializer = findUniqueInstruction(
+        function, [&](IR::Instruction* instruction) {
+            return isConstantStore(instruction, match.powerSlot, 1);
+        });
+    if (!lengthInitializer || !resultInitializer || !powerInitializer ||
+        lengthInitializer->getParent() != entry ||
+        resultInitializer->getParent() != entry ||
+        powerInitializer->getParent() != entry) {
+        return false;
+    }
+
+    auto* lengthCondition = findUniqueInstruction(
+        function, [&](IR::Instruction* instruction) {
+            if (instruction->getOpcode() != Opcode::ICMP ||
+                instruction->getName() != "ne" ||
+                instruction->getNumOperands() != 2) {
+                return false;
+            }
+            return (getLoadedPointer(instruction->getOperand(0)) ==
+                        match.lengthSlot &&
+                    isIntConstant(instruction->getOperand(1), 0)) ||
+                   (getLoadedPointer(instruction->getOperand(1)) ==
+                        match.lengthSlot &&
+                    isIntConstant(instruction->getOperand(0), 0));
+        });
+    auto* lengthBranch = lengthCondition
+        ? findUniqueInstruction(function, [&](IR::Instruction* instruction) {
+              return instruction->getOpcode() == Opcode::COND_BR &&
+                     instruction->getNumOperands() == 3 &&
+                     instruction->getOperand(0) == lengthCondition;
+          })
+        : nullptr;
+    auto* lengthConditionLoad = lengthCondition
+        ? dynamic_cast<IR::Instruction*>(
+              getLoadedPointer(lengthCondition->getOperand(0)) ==
+                      match.lengthSlot
+                  ? lengthCondition->getOperand(0)
+                  : lengthCondition->getOperand(1))
+        : nullptr;
+    if (!lengthBranch || !lengthConditionLoad) return false;
+
+    auto* header = lengthCondition->getParent();
+    auto* body = dynamic_cast<IR::BasicBlock*>(lengthBranch->getOperand(1));
+    auto* exit = dynamic_cast<IR::BasicBlock*>(lengthBranch->getOperand(2));
+    if (!header || !body || !exit || header == body || header == exit ||
+        body == exit || !isBranchTo(entry, header)) {
+        return false;
+    }
+    for (int index = 0; index < 2; ++index) {
+        if (remainders[index]->getParent() != body ||
+            remainderStores[index]->getParent() != body ||
+            divisions[index]->getParent() != body ||
+            divisionStores[index]->getParent() != body) {
+            return false;
+        }
+    }
+
+    auto* resultReturn = findUniqueInstruction(
+        function, [](IR::Instruction* instruction) {
+            return instruction->getOpcode() == Opcode::RET &&
+                   instruction->getNumOperands() == 1;
+        });
+    auto* resultReturnLoad = resultReturn
+        ? dynamic_cast<IR::Instruction*>(resultReturn->getOperand(0))
+        : nullptr;
+    if (!resultReturnLoad || !isLoad(resultReturnLoad, match.resultSlot) ||
+        resultReturn->getParent() != exit) {
+        return false;
+    }
+
+    IR::Instruction* resultLoad = nullptr;
+    IR::Instruction* powerAddLoad = nullptr;
+    if (match.resultAdd->getOpcode() != Opcode::ADD ||
+        match.resultAdd->getNumOperands() != 2) {
+        return false;
+    }
+    for (unsigned operand = 0; operand < 2; ++operand) {
+        auto* load = dynamic_cast<IR::Instruction*>(
+            match.resultAdd->getOperand(operand));
+        if (!load || load->getOpcode() != Opcode::LOAD) return false;
+        if (load->getOperand(0) == match.resultSlot) resultLoad = load;
+        if (load->getOperand(0) == match.powerSlot) powerAddLoad = load;
+    }
+    auto* resultStore = findUniqueInstruction(
+        function, [&](IR::Instruction* instruction) {
+            return isStore(instruction, match.resultAdd, match.resultSlot);
+        });
+    if (!resultLoad || !powerAddLoad || !resultStore) return false;
+
+    auto* powerUpdate = findUniqueInstruction(
+        function, [&](IR::Instruction* instruction) {
+            if (instruction->getOpcode() != Opcode::MUL ||
+                instruction->getNumOperands() != 2) {
+                return false;
+            }
+            return (getLoadedPointer(instruction->getOperand(0)) ==
+                        match.powerSlot &&
+                    isIntConstant(instruction->getOperand(1), 2)) ||
+                   (getLoadedPointer(instruction->getOperand(1)) ==
+                        match.powerSlot &&
+                    isIntConstant(instruction->getOperand(0), 2));
+        });
+    auto* powerUpdateLoad = powerUpdate
+        ? dynamic_cast<IR::Instruction*>(
+              getLoadedPointer(powerUpdate->getOperand(0)) == match.powerSlot
+                  ? powerUpdate->getOperand(0)
+                  : powerUpdate->getOperand(1))
+        : nullptr;
+    auto* powerStore = powerUpdate
+        ? findUniqueInstruction(function, [&](IR::Instruction* instruction) {
+              return isStore(instruction, powerUpdate, match.powerSlot);
+          })
+        : nullptr;
+
+    auto* lengthUpdate = findUniqueInstruction(
+        function, [&](IR::Instruction* instruction) {
+            return instruction->getOpcode() == Opcode::SUB &&
+                   instruction->getNumOperands() == 2 &&
+                   getLoadedPointer(instruction->getOperand(0)) ==
+                       match.lengthSlot &&
+                   isIntConstant(instruction->getOperand(1), 1);
+        });
+    auto* lengthUpdateLoad = lengthUpdate
+        ? dynamic_cast<IR::Instruction*>(lengthUpdate->getOperand(0))
+        : nullptr;
+    auto* lengthStore = lengthUpdate
+        ? findUniqueInstruction(function, [&](IR::Instruction* instruction) {
+              return isStore(instruction, lengthUpdate, match.lengthSlot);
+          })
+        : nullptr;
+    if (!powerUpdate || !powerUpdateLoad || !powerStore || !lengthUpdate ||
+        !lengthUpdateLoad || !lengthStore ||
+        powerUpdate->getParent() != lengthUpdate->getParent()) {
+        return false;
+    }
+    auto* latch = powerUpdate->getParent();
+    auto* resultBlock = match.resultAdd->getParent();
+    if (!latch || !resultBlock || resultStore->getParent() != resultBlock ||
+        powerStore->getParent() != latch || lengthStore->getParent() != latch ||
+        !isBranchTo(resultBlock, latch) || !isBranchTo(latch, header)) {
+        return false;
+    }
+
+    if (!hasExactInstructionUses(
+            match.lengthSlot,
+            {lengthInitializer, lengthConditionLoad, lengthUpdateLoad,
+             lengthStore}) ||
+        !hasExactInstructionUses(
+            match.powerSlot,
+            {powerInitializer, powerAddLoad, powerUpdateLoad, powerStore}) ||
+        !hasExactInstructionUses(
+            match.resultSlot,
+            {resultInitializer, resultLoad, resultStore, resultReturnLoad})) {
+        return false;
+    }
+
+    std::vector<IR::Instruction*> entryOrder = {
+        dynamic_cast<IR::Instruction*>(match.argumentSlots[0]),
+        argumentInitializers[0],
+        dynamic_cast<IR::Instruction*>(match.argumentSlots[1]),
+        argumentInitializers[1],
+        dynamic_cast<IR::Instruction*>(match.bitSlots[0]),
+        dynamic_cast<IR::Instruction*>(match.bitSlots[1]),
+        dynamic_cast<IR::Instruction*>(match.lengthSlot),
+        lengthInitializer,
+        dynamic_cast<IR::Instruction*>(match.resultSlot),
+        resultInitializer,
+        dynamic_cast<IR::Instruction*>(match.powerSlot),
+        powerInitializer,
+        entry->getTerminator()};
+    std::vector<IR::Instruction*> bodyPrefix = {
+        remainderLoads[0], remainders[0], remainderStores[0],
+        remainderLoads[1], remainders[1], remainderStores[1],
+        divisionLoads[0], divisions[0], divisionStores[0],
+        divisionLoads[1], divisions[1], divisionStores[1]};
+    if (!hasExactInstructionOrder(entry, entryOrder) ||
+        !hasExactInstructionOrder(
+            header, {lengthConditionLoad, lengthCondition, lengthBranch}) ||
+        !hasExactInstructionOrder(exit, {resultReturnLoad, resultReturn}) ||
+        !hasExactInstructionOrder(
+            resultBlock,
+            {resultLoad, powerAddLoad, match.resultAdd, resultStore,
+             resultBlock->getTerminator()}) ||
+        !hasExactInstructionOrder(
+            latch,
+            {powerUpdateLoad, powerUpdate, powerStore, lengthUpdateLoad,
+             lengthUpdate, lengthStore, latch->getTerminator()})) {
+        return false;
+    }
+
+    std::unordered_set<IR::Instruction*> expectedInstructions;
+    auto expect = [&](IR::Instruction* instruction) {
+        if (!instruction) return false;
+        return expectedInstructions.insert(instruction).second;
+    };
+    for (IR::Value* slot : {match.argumentSlots[0], match.argumentSlots[1],
+                            match.bitSlots[0], match.bitSlots[1],
+                            match.lengthSlot, match.resultSlot,
+                            match.powerSlot}) {
+        if (!expect(dynamic_cast<IR::Instruction*>(slot))) return false;
+    }
+    for (int index = 0; index < 2; ++index) {
+        for (auto* instruction :
+             {argumentInitializers[index], remainderLoads[index],
+              remainders[index], remainderStores[index], divisionLoads[index],
+              divisions[index], divisionStores[index]}) {
+            if (!expect(instruction)) return false;
+        }
+    }
+    for (auto* instruction :
+         {lengthInitializer, resultInitializer, powerInitializer,
+          entry->getTerminator(), lengthConditionLoad, lengthCondition,
+          lengthBranch, resultReturnLoad, resultReturn, resultLoad,
+          powerAddLoad, match.resultAdd, resultStore,
+          resultBlock->getTerminator(), powerUpdateLoad, powerUpdate,
+          powerStore, lengthUpdateLoad, lengthUpdate, lengthStore,
+          latch->getTerminator()}) {
+        if (!expect(instruction)) return false;
+    }
+
+    std::unordered_set<IR::BasicBlock*> expectedBlocks = {
+        entry, header, body, exit, resultBlock, latch};
+
+    if (match.nativeOpcode == Opcode::XOR) {
+        auto* bitCondition = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                if (instruction->getOpcode() != Opcode::ICMP ||
+                    instruction->getName() != "ne" ||
+                    instruction->getNumOperands() != 2) {
+                    return false;
+                }
+                IR::Value* left = getLoadedPointer(instruction->getOperand(0));
+                IR::Value* right = getLoadedPointer(instruction->getOperand(1));
+                return (left == match.bitSlots[0] &&
+                        right == match.bitSlots[1]) ||
+                       (left == match.bitSlots[1] &&
+                        right == match.bitSlots[0]);
+            });
+        auto* bitBranch = bitCondition
+            ? findUniqueInstruction(function,
+                  [&](IR::Instruction* instruction) {
+                      return instruction->getOpcode() == Opcode::COND_BR &&
+                             instruction->getNumOperands() == 3 &&
+                             instruction->getOperand(0) == bitCondition;
+                  })
+            : nullptr;
+        if (!bitBranch || bitCondition->getParent() != body ||
+            bitBranch->getOperand(1) != resultBlock) {
+            return false;
+        }
+        auto* skipBlock =
+            dynamic_cast<IR::BasicBlock*>(bitBranch->getOperand(2));
+        IR::Instruction* bitLoads[2] = {
+            dynamic_cast<IR::Instruction*>(bitCondition->getOperand(0)),
+            dynamic_cast<IR::Instruction*>(bitCondition->getOperand(1))};
+        if (!skipBlock || !isBranchTo(skipBlock, latch)) return false;
+        if (getLoadedPointer(bitLoads[0]) == match.bitSlots[1])
+            std::swap(bitLoads[0], bitLoads[1]);
+        for (int index = 0; index < 2; ++index) {
+            if (!bitLoads[index] ||
+                getLoadedPointer(bitLoads[index]) != match.bitSlots[index] ||
+                !hasExactInstructionUses(
+                    match.bitSlots[index],
+                    {remainderStores[index], bitLoads[index]})) {
+                return false;
+            }
+            if (!expect(bitLoads[index])) return false;
+        }
+        auto xorBodyOrder = bodyPrefix;
+        xorBodyOrder.insert(xorBodyOrder.end(),
+                            {bitLoads[0], bitLoads[1], bitCondition,
+                             bitBranch});
+        if (!hasExactInstructionOrder(body, xorBodyOrder) ||
+            !hasExactInstructionOrder(
+                skipBlock, {skipBlock->getTerminator()})) {
+            return false;
+        }
+        if (!expect(bitCondition) || !expect(bitBranch) ||
+            !expect(skipBlock->getTerminator())) {
+            return false;
+        }
+        expectedBlocks.insert(skipBlock);
+    } else {
+        if (!isI32Alloca(match.temporarySlot)) return false;
+        auto* temporaryAlloca =
+            dynamic_cast<IR::Instruction*>(match.temporarySlot);
+        int64_t defaultValue =
+            match.nativeOpcode == Opcode::AND ? 0 : 1;
+        auto* temporaryInitializer = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return isConstantStore(instruction, match.temporarySlot,
+                                       defaultValue);
+            });
+        IR::Instruction* bitConditions[2] = {nullptr, nullptr};
+        IR::Instruction* bitLoads[2] = {nullptr, nullptr};
+        for (int index = 0; index < 2; ++index) {
+            bitConditions[index] = findUniqueInstruction(
+                function, [&](IR::Instruction* instruction) {
+                    if (instruction->getOpcode() != Opcode::ICMP ||
+                        instruction->getName() != "eq" ||
+                        instruction->getNumOperands() != 2) {
+                        return false;
+                    }
+                    return (getLoadedPointer(instruction->getOperand(0)) ==
+                                match.bitSlots[index] &&
+                            isIntConstant(instruction->getOperand(1), 1)) ||
+                           (getLoadedPointer(instruction->getOperand(1)) ==
+                                match.bitSlots[index] &&
+                            isIntConstant(instruction->getOperand(0), 1));
+                });
+            if (!bitConditions[index]) return false;
+            bitLoads[index] = dynamic_cast<IR::Instruction*>(
+                getLoadedPointer(bitConditions[index]->getOperand(0)) ==
+                        match.bitSlots[index]
+                    ? bitConditions[index]->getOperand(0)
+                    : bitConditions[index]->getOperand(1));
+        }
+        auto* firstBranch = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return instruction->getOpcode() == Opcode::COND_BR &&
+                       instruction->getNumOperands() == 3 &&
+                       instruction->getOperand(0) == bitConditions[0];
+            });
+        auto* secondStore = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return isStore(instruction, bitConditions[1],
+                               match.temporarySlot);
+            });
+        auto* temporaryLoad = findUniqueInstruction(
+            function, [&](IR::Instruction* instruction) {
+                return isLoad(instruction, match.temporarySlot);
+            });
+        auto* finalCondition = temporaryLoad
+            ? findUniqueInstruction(function,
+                  [&](IR::Instruction* instruction) {
+                      if (instruction->getOpcode() != Opcode::ICMP ||
+                          instruction->getName() != "ne" ||
+                          instruction->getNumOperands() != 2) {
+                          return false;
+                      }
+                      return (instruction->getOperand(0) == temporaryLoad &&
+                              isIntConstant(instruction->getOperand(1), 0)) ||
+                             (instruction->getOperand(1) == temporaryLoad &&
+                              isIntConstant(instruction->getOperand(0), 0));
+                  })
+            : nullptr;
+        auto* finalBranch = finalCondition
+            ? findUniqueInstruction(function,
+                  [&](IR::Instruction* instruction) {
+                      return instruction->getOpcode() == Opcode::COND_BR &&
+                             instruction->getNumOperands() == 3 &&
+                             instruction->getOperand(0) == finalCondition;
+                  })
+            : nullptr;
+        if (!temporaryInitializer || !firstBranch || !secondStore ||
+            !temporaryLoad || !finalBranch ||
+            temporaryAlloca->getParent() != body ||
+            temporaryInitializer->getParent() != body ||
+            bitConditions[0]->getParent() != body ||
+            finalBranch->getOperand(1) != resultBlock) {
+            return false;
+        }
+        auto* booleanMerge = finalCondition->getParent();
+        auto* rightBlock = bitConditions[1]->getParent();
+        auto* skipBlock =
+            dynamic_cast<IR::BasicBlock*>(finalBranch->getOperand(2));
+        if (!booleanMerge || !rightBlock || !skipBlock ||
+            secondStore->getParent() != rightBlock ||
+            !isBranchTo(rightBlock, booleanMerge) ||
+            !isBranchTo(skipBlock, latch)) {
+            return false;
+        }
+        auto* firstTrue =
+            dynamic_cast<IR::BasicBlock*>(firstBranch->getOperand(1));
+        auto* firstFalse =
+            dynamic_cast<IR::BasicBlock*>(firstBranch->getOperand(2));
+        bool correctShortCircuit = match.nativeOpcode == Opcode::AND
+            ? firstTrue == rightBlock && firstFalse == booleanMerge
+            : firstTrue == booleanMerge && firstFalse == rightBlock;
+        if (!correctShortCircuit ||
+            !hasExactInstructionUses(
+                match.temporarySlot,
+                {temporaryInitializer, secondStore, temporaryLoad})) {
+            return false;
+        }
+        for (int index = 0; index < 2; ++index) {
+            if (!hasExactInstructionUses(
+                    match.bitSlots[index],
+                    {remainderStores[index], bitLoads[index]})) {
+                return false;
+            }
+            if (!expect(bitLoads[index]) || !expect(bitConditions[index]))
+                return false;
+        }
+        auto shortCircuitBodyOrder = bodyPrefix;
+        shortCircuitBodyOrder.insert(
+            shortCircuitBodyOrder.end(),
+            {bitLoads[0], bitConditions[0], temporaryAlloca,
+             temporaryInitializer, firstBranch});
+        if (!hasExactInstructionOrder(body, shortCircuitBodyOrder) ||
+            !hasExactInstructionOrder(
+                rightBlock,
+                {bitLoads[1], bitConditions[1], secondStore,
+                 rightBlock->getTerminator()}) ||
+            !hasExactInstructionOrder(
+                booleanMerge,
+                {temporaryLoad, finalCondition, finalBranch}) ||
+            !hasExactInstructionOrder(
+                skipBlock, {skipBlock->getTerminator()})) {
+            return false;
+        }
+        for (auto* instruction :
+             {temporaryAlloca, temporaryInitializer, firstBranch, secondStore,
+              rightBlock->getTerminator(), temporaryLoad, finalCondition,
+              finalBranch, skipBlock->getTerminator()}) {
+            if (!expect(instruction)) return false;
+        }
+        expectedBlocks.insert(rightBlock);
+        expectedBlocks.insert(booleanMerge);
+        expectedBlocks.insert(skipBlock);
+    }
+
+    if (expectedBlocks.size() != function->getBlocks().size()) return false;
+    for (const auto& block : function->getBlocks()) {
+        if (expectedBlocks.erase(block.get()) != 1) return false;
+        for (const auto& instruction : block->getInstructions()) {
+            if (expectedInstructions.erase(instruction.get()) != 1)
+                return false;
+        }
+    }
+    return expectedBlocks.empty() && expectedInstructions.empty();
+}
+
 void addGuardedNativeFastPath(IR::Function* function, Opcode nativeOpcode) {
     auto* slowEntry = function->getEntryBlock();
     auto* guard = function->insertBlock("bitloop.guard", slowEntry);
@@ -359,6 +968,7 @@ bool recognizeSoftwareBitLoops(IR::Module* module) {
     for (auto& function : module->getFunctions()) {
         SoftwareBitLoop match;
         if (!matchSoftwareBitLoop(function.get(), match)) continue;
+        if (!validateExactSoftwareBitLoop(function.get(), match)) continue;
         addGuardedNativeFastPath(function.get(), match.nativeOpcode);
         changed = true;
     }
@@ -538,7 +1148,10 @@ bool tryFuseXorOrWithConstants(IR::Instruction* inst) {
 // 反例：若 m 覆盖结果所有可能位，可移除 AND
 bool trySimplifyShiftAndMask(IR::Instruction* inst) {
     if (inst->getOpcode() != IR::Instruction::Opcode::AND) return false;
-    if (inst->getNumOperands() < 2) return false;
+    if (inst->getNumOperands() != 2 ||
+        inst->getType() != IR::IntegerType::I32) {
+        return false;
+    }
 
     auto* maskConst = dynamic_cast<IR::ConstantInt*>(inst->getOperand(1));
     if (!maskConst) return false;
@@ -548,21 +1161,33 @@ bool trySimplifyShiftAndMask(IR::Instruction* inst) {
     if (shiftInst->getOpcode() != IR::Instruction::Opcode::ASHR &&
         shiftInst->getOpcode() != IR::Instruction::Opcode::SHL)
         return false;
-    if (shiftInst->getNumOperands() < 2) return false;
+    if (shiftInst->getNumOperands() != 2 ||
+        shiftInst->getType() != IR::IntegerType::I32 ||
+        shiftInst->getOperand(0)->getType() != IR::IntegerType::I32 ||
+        shiftInst->getOperand(1)->getType() != IR::IntegerType::I32) {
+        return false;
+    }
 
     auto* shiftCnt = dynamic_cast<IR::ConstantInt*>(shiftInst->getOperand(1));
     if (!shiftCnt) return false;
 
     int64_t shift = shiftCnt->getValue();
-    int64_t mask = maskConst->getValue();
+    if (shift < 0 || shift >= 32) return false;
 
-    // 计算移位后有效位数
-    int effectiveBits = 32 - static_cast<int>(shift);
-    if (effectiveBits <= 0) return false;
+    const uint32_t mask = static_cast<uint32_t>(maskConst->getValue());
 
-    // 如果 mask 覆盖了所有有效位，AND 是冗余的
-    int64_t fullMask = (1LL << effectiveBits) - 1;
-    if ((mask & fullMask) == fullMask) {
+    bool redundant = mask == UINT32_MAX;
+    if (shiftInst->getOpcode() == IR::Instruction::Opcode::SHL) {
+        // SHL guarantees only the low `shift` bits are zero. Every other bit
+        // may be set, so the mask may clear guaranteed-zero bits only.
+        const uint32_t guaranteedZero =
+            shift == 0 ? 0u : ((uint32_t{1} << shift) - 1u);
+        redundant = (mask | guaranteedZero) == UINT32_MAX;
+    }
+
+    // ASHR can produce either value in every bit position depending on the
+    // signed input, hence only an all-ones mask is redundant.
+    if (redundant) {
         inst->replaceAllUsesWith(shiftInst);
         inst->dropAllUses();
         auto* bb = inst->getParent();

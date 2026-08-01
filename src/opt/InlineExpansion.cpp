@@ -413,8 +413,7 @@ bool tryInlineMultiBBCall(IR::Instruction* callInst, IR::Function* callee,
     //   所有引用 callBB 作为前驱的 PHI 节点必须更新为 contBB。
     //   否则 PHI 的 block 操作数指向错误的前驱 → 寄存器分配器
     //   计算 live interval 时遗漏回边 → 循环变量永不更新 → 无限循环
-    //   （59_sort_test5 根因：while_cond_14 的 PHI 仍引用 while_body_15
-    //   而非 inline_cont_heap_ajust_2，导致 i=i-1 的结果进入错误 PHI 条目）
+    //   例如 PHI 若仍引用被拆分前的块，归纳变量更新会进入错误的 PHI 条目。
     for (auto& bb : caller->getBlocks()) {
         for (auto& inst : bb->getInstructions()) {
             if (inst->getOpcode() != Opc::PHI) continue;
@@ -587,7 +586,7 @@ bool tryInlineMultiBBCall(IR::Instruction* callInst, IR::Function* callee,
     // 7. 防御性清理：删除克隆 BB 中第一条 terminator 之后的所有指令
     //   SimplifyCFG 合并空块时可能遗留额外的 BR，导致同一 BB
     //   出现多条 terminator。getTerminator() 返回 insts.back()
-    //   会选择错误的 terminator → 无限循环（59_sort_test5 根因）
+    //   会选择错误的 terminator，进而可能形成无限循环。
     // ================================================================
     for (auto* clonedBB : clonedBBs) {
         bool seenTerm = false;

@@ -493,7 +493,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
 
         // ★ BB 内局部值编号（Local Value Numbering）
         // 消除同一 BB 内的冗余指令：相同 (opcode, 源操作数) 的指令若源操作数未变，则冗余
-        // 典型场景：shuffle1 中 slli+add+lw 序列在 beqz 后重复（操作数未变）
+        // 典型场景：slli+add+lw 序列在条件分支后重复且操作数未变。
         // ★ QEMU 安全：运行在寄存器分配之后，仅删除指令或替换为 mv，不改变寄存器分配（规则 14）
         // 可通过环境变量 PEEPHOLE_NO_LVN=1 禁用（调试用）
         if (!getenv("PEEPHOLE_NO_LVN")) {
@@ -508,7 +508,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
             // ★ 预处理：统计被跳转指令引用的标签
             // 引用计数为 0 的标签是纯 fall-through 目标（无跳转指令跳到它），
             // LVN 可保留跟踪，消除跨 fall-through 标签的冗余指令。
-            // 典型场景：shuffle1 中 beq 后 fall-through 到 endif 标签，
+            // 典型场景：beq 后 fall-through 到 endif 标签，
             //   slli t1,t4,2 在 beq 前后重复（t1/t4 未变），但 LVN 因标签清空未消除。
             // 安全性：纯 fall-through 标签只有一个前驱（上一条指令的 fall-through），
             //   寄存器值和前一条指令执行后一样，lastSeen 有效。
@@ -580,7 +580,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     // ★ 纯 fall-through 标签（未被任何跳转指令引用）：保留 LVN 跟踪
                     // 这类标签只有一个前驱（上一条指令的 fall-through），
                     // 寄存器值和前一条指令执行后一样，lastSeen/regLastWritten 仍有效。
-                    // 典型收益：shuffle1 中 beq 后 fall-through 到 endif，
+                    // 典型收益：beq 后 fall-through 到 endif 时，
                     //   slli t1,t4,2 在 beq 前后重复，保留跟踪后可消除冗余 slli。
                     std::string trimmed = line;
                     while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
@@ -681,7 +681,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
                             // 使用的源操作数不同，不是冗余的。
                             // 典型场景：seqz s2, s2（s2 = (s2 == 0)）改变了 s2，
                             // 后续 seqz t0, s2 使用的 s2 是修改后的值，不是冗余的。
-                            // 03_sort2 TIMEOUT 根因：缺少此检查导致 seqz t0,s2 被错误
+                            // 缺少此检查会导致 seqz t0,s2 被错误
                             // 替换为 mv t0,s2，改变了条件判断语义 → 无限循环。
                             if (r == prevRd) {
                                 srcChanged = true;
@@ -1018,7 +1018,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
             // 因为 op 重新定义 rd，mv 拷贝的值在 op 执行时即死亡，无需 liveness 检查。
             // 安全性：rd 的最终值 = op(rs, X)，与原序列 (rd=rs; rd=op(rd,X)) 完全一致；
             //   rd != rs 保证 mv 非空操作，op 只写 rd 不写 rs，故 rs 值在两种序列中相同。
-            // 典型场景：h-5-01 内层循环 `mv t1, s7; mul t1, t1, s0` → `mul t1, s7, s0`，
+            // 典型场景：内层循环 `mv t1, s7; mul t1, t1, s0` → `mul t1, s7, s0`，
             //   消除每次迭代的一条 mv 并缩短依赖链。
             if (!matched && i + 1 < lines.size() && !isEmptyOrComment(lines[i + 1])) {
                 std::string mvRd, mvRs;

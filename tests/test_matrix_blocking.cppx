@@ -70,6 +70,17 @@ OptimizationResult optimizeToO2(const std::string& source) {
     return result;
 }
 
+std::size_t countOccurrences(const std::string& text,
+                             const std::string& needle) {
+    std::size_t count = 0;
+    std::size_t offset = 0;
+    while ((offset = text.find(needle, offset)) != std::string::npos) {
+        ++count;
+        offset += needle.size();
+    }
+    return count;
+}
+
 } // namespace
 
 int main() {
@@ -175,6 +186,90 @@ int main() {
     if (!genericFixedPoint.changed ||
         genericFixedPoint.ir.find("fixedpoint.ready") == std::string::npos) {
         std::cerr << "renamed dynamic fixed-point variant did not trigger\n";
+        return 1;
+    }
+
+    const OptimizationResult countDependent = runFocusedPass(
+        "../test/optimization/dynamic_count_dependent_negative.sy",
+        Opt::dynamicIdempotentLoopElimination);
+    if (countDependent.changed ||
+        countDependent.ir.find("fixedpoint.ready") != std::string::npos) {
+        std::cerr << "count-dependent dynamic loop was transformed\n";
+        return 1;
+    }
+
+    const OptimizationResult multiState = runFocusedPass(
+        "../test/optimization/dynamic_multi_state_variant.sy",
+        Opt::dynamicIdempotentLoopElimination);
+    if (!multiState.changed ||
+        multiState.ir.find("fixedpoint.same") == std::string::npos ||
+        countOccurrences(multiState.ir, "%fixedpoint.entry = load") != 2) {
+        std::cerr << "dynamic fixed-point guard did not compare all state: "
+                  << countOccurrences(
+                         multiState.ir, "%fixedpoint.entry = load")
+                  << " entry loads\n";
+        return 1;
+    }
+
+    const OptimizationResult memoized = optimizeToO2(
+        "../test/optimization/memo_mutable_global_multicall.sy");
+    if (memoized.ir.find("__opt_memo_key_a") == std::string::npos ||
+        memoized.ir.find("__opt_memo_key_b") == std::string::npos ||
+        memoized.ir.find("memo.generation.selected") ==
+            std::string::npos) {
+        std::cerr << "memoization is missing full-key epoch isolation\n";
+        return 1;
+    }
+
+    const OptimizationResult overwrittenDigit = runFocusedPass(
+        "../test/optimization/repeated_divrem_overwrite_negative.sy",
+        Opt::repeatedDivRemToNative);
+    if (overwrittenDigit.changed ||
+        overwrittenDigit.ir.find("digit.result") != std::string::npos) {
+        std::cerr << "digit extraction accepted an extra state overwrite\n";
+        return 1;
+    }
+
+    const OptimizationResult exactBitLoop = runFocusedPass(
+        "../test/performance/crc1.sy", Opt::bitOpPatternRecognition);
+    if (!exactBitLoop.changed ||
+        countOccurrences(exactBitLoop.ir, "%bitloop.native =") != 2) {
+        std::cerr << "exact software bit loops did not trigger\n";
+        return 1;
+    }
+
+    const OptimizationResult modifiedBitLoop = runFocusedPass(
+        "../test/optimization/software_bitloop_extra_update_negative.sy",
+        Opt::bitOpPatternRecognition);
+    if (modifiedBitLoop.ir.find("bitloop.native") != std::string::npos) {
+        std::cerr << "modified software bit loop triggered native lowering\n";
+        return 1;
+    }
+
+    const OptimizationResult structuralBitLoopNegatives = runFocusedPass(
+        "../test/optimization/software_bitloop_structural_negatives.sy",
+        Opt::bitOpPatternRecognition);
+    if (structuralBitLoopNegatives.ir.find("bitloop.native") !=
+        std::string::npos) {
+        std::cerr << "non-canonical software bit loop triggered lowering\n";
+        return 1;
+    }
+
+    const OptimizationResult modularMultiply = runFocusedPass(
+        "../test/performance/fft0.sy",
+        Opt::recursiveModularMulToNative);
+    if (!modularMultiply.changed ||
+        countOccurrences(modularMultiply.ir, "%modmul.wide =") != 1) {
+        std::cerr << "canonical recursive modular multiply did not lower\n";
+        return 1;
+    }
+
+    const OptimizationResult unsafeModularMultiply = runFocusedPass(
+        "../test/optimization/recursive_modmul_structural_negatives.sy",
+        Opt::recursiveModularMulToNative);
+    if (unsafeModularMultiply.ir.find("modmul.wide") !=
+        std::string::npos) {
+        std::cerr << "non-canonical recursive modular multiply lowered\n";
         return 1;
     }
 

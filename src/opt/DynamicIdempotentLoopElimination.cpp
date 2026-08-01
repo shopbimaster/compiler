@@ -20,8 +20,7 @@ struct FixedPointLoopPlan {
     IR::BasicBlock* body = nullptr;
     IR::Instruction* countLoad = nullptr;
     IR::Instruction* decrement = nullptr;
-    IR::GlobalVariable* carry = nullptr;
-    int64_t initialCount = 0;
+    std::vector<IR::GlobalVariable*> carries;
 };
 
 bool isConstant(IR::Value* value, int64_t expected) {
@@ -38,6 +37,24 @@ bool isLoadFrom(IR::Value* value, IR::Value* pointer) {
 bool isDirectAlloca(IR::Value* value) {
     auto* instruction = dynamic_cast<IR::Instruction*>(value);
     return instruction && instruction->getOpcode() == Opc::ALLOCA;
+}
+
+bool hasOnlyDirectMemoryAccesses(IR::Value* object) {
+    for (const auto& use : object->getUses()) {
+        auto* instruction = dynamic_cast<IR::Instruction*>(use.user);
+        if (!instruction ||
+            (instruction->getOpcode() != Opc::LOAD &&
+             instruction->getOpcode() != Opc::STORE)) {
+            return false;
+        }
+        const unsigned pointerOperand =
+            instruction->getOpcode() == Opc::LOAD ? 0 : 1;
+        if (instruction->getNumOperands() <= pointerOperand ||
+            instruction->getOperand(pointerOperand) != object) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool findUniquePreheader(
@@ -65,12 +82,69 @@ IR::Function* calledFunction(IR::Instruction* instruction) {
     return dynamic_cast<IR::Function*>(instruction->getOperand(0));
 }
 
+bool instructionPrecedesInBlock(
+    IR::BasicBlock* block, IR::Instruction* before,
+    IR::Instruction* after) {
+    bool sawBefore = false;
+    for (const auto& owned : block->getInstructions()) {
+        if (owned.get() == before) sawBefore = true;
+        if (owned.get() == after) return sawBefore;
+    }
+    return false;
+}
+
+bool localLoadsAreInitialized(IR::Function* function) {
+    auto dominators = computeDominators(function);
+    std::unordered_map<IR::Value*, std::vector<IR::Instruction*>> stores;
+    for (const auto& block : function->getBlocks()) {
+        for (const auto& owned : block->getInstructions()) {
+            auto* instruction = owned.get();
+            if (instruction->getOpcode() == Opc::ALLOCA &&
+                !hasOnlyDirectMemoryAccesses(instruction)) {
+                return false;
+            }
+            if (instruction->getOpcode() == Opc::STORE &&
+                instruction->getNumOperands() == 2 &&
+                isDirectAlloca(instruction->getOperand(1))) {
+                stores[instruction->getOperand(1)].push_back(instruction);
+            }
+        }
+    }
+    for (const auto& block : function->getBlocks()) {
+        for (const auto& owned : block->getInstructions()) {
+            auto* load = owned.get();
+            if (load->getOpcode() != Opc::LOAD ||
+                load->getNumOperands() != 1 ||
+                !isDirectAlloca(load->getOperand(0))) {
+                continue;
+            }
+            bool initialized = false;
+            for (auto* store : stores[load->getOperand(0)]) {
+                if (store->getParent() == load->getParent()) {
+                    initialized |= instructionPrecedesInBlock(
+                        load->getParent(), store, load);
+                } else {
+                    initialized |= dominators[load->getParent()].count(
+                        store->getParent()) != 0;
+                }
+                if (initialized) break;
+            }
+            if (!initialized) return false;
+        }
+    }
+    return true;
+}
+
 bool collectCalleeClosureImpl(
     IR::Function* function,
     std::unordered_set<IR::Function*>& visiting,
     std::unordered_set<IR::Function*>& closure) {
     if (!function || function->isExternal() ||
         !visiting.insert(function).second) {
+        return false;
+    }
+    if (!localLoadsAreInitialized(function)) {
+        visiting.erase(function);
         return false;
     }
     for (unsigned index = 0; index < function->getNumArgs(); ++index) {
@@ -156,8 +230,15 @@ void addGlobalEffects(
     }
 }
 
-bool hasResetBeforeCalls(
+bool isI32ScalarGlobal(IR::GlobalVariable* global) {
+    if (!global) return false;
+    auto* pointer = dynamic_cast<IR::PointerType*>(global->getType());
+    return pointer && pointer->getPointeeType() == IR::IntegerType::I32;
+}
+
+bool hasConstantResetBeforeCalls(
     IR::BasicBlock* body, IR::GlobalVariable* global) {
+    if (!isI32ScalarGlobal(global)) return false;
     bool reset = false;
     for (const auto& owned : body->getInstructions()) {
         auto* instruction = owned.get();
@@ -168,41 +249,14 @@ bool hasResetBeforeCalls(
         }
         if (instruction->getOpcode() == Opc::STORE &&
             rootGlobal(instruction->getOperand(1)) == global) {
-            if (reset || !isConstant(instruction->getOperand(0), 0)) {
+            if (reset || instruction->getOperand(1) != global ||
+                !dynamic_cast<IR::ConstantInt*>(instruction->getOperand(0))) {
                 return false;
             }
             reset = true;
         }
     }
     return false;
-}
-
-bool isZeroInitializedScalar(IR::GlobalVariable* global) {
-    if (!global || !global->getInitData().empty()) return false;
-    auto* pointer = dynamic_cast<IR::PointerType*>(global->getType());
-    if (!pointer || pointer->getPointeeType() != IR::IntegerType::I32) {
-        return false;
-    }
-    auto* initializer = global->getInitializer();
-    return !initializer || isConstant(initializer, 0);
-}
-
-bool carryHasNoEscapes(IR::GlobalVariable* carry) {
-    for (const auto& use : carry->getUses()) {
-        auto* instruction = dynamic_cast<IR::Instruction*>(use.user);
-        if (!instruction ||
-            (instruction->getOpcode() != Opc::LOAD &&
-             instruction->getOpcode() != Opc::STORE)) {
-            return false;
-        }
-        const unsigned pointerOperand =
-            instruction->getOpcode() == Opc::LOAD ? 0 : 1;
-        if (instruction->getNumOperands() <= pointerOperand ||
-            instruction->getOperand(pointerOperand) != carry) {
-            return false;
-        }
-    }
-    return true;
 }
 
 bool closureHasNoOutsideCallsOrCarryStores(
@@ -246,13 +300,15 @@ bool localLoopStateIsOverwritten(
         const unsigned pointerOperand =
             instruction->getOpcode() == Opc::LOAD ? 0 : 1;
         auto* pointer = instruction->getOperand(pointerOperand);
-        if (!isDirectAlloca(pointer) || pointer == countPointer) continue;
+        if (pointer == countPointer || rootGlobal(pointer)) continue;
+        if (!isDirectAlloca(pointer)) return false;
         auto& effect = effects[pointer];
         if (instruction->getOpcode() == Opc::LOAD) ++effect.loads;
         if (instruction->getOpcode() == Opc::STORE) ++effect.stores;
     }
     return std::all_of(effects.begin(), effects.end(), [](const auto& item) {
-        return item.second.stores > 0 && item.second.loads == 0;
+        return item.second.stores > 0 && item.second.loads == 0 &&
+               hasOnlyDirectMemoryAccesses(item.first);
     });
 }
 
@@ -270,9 +326,11 @@ bool matchCountDownLoop(
         compare->getNumOperands() != 2) {
         return false;
     }
+    IR::Instruction* headerCountLoad = nullptr;
     if (compare->getName() == "sgt" &&
         isConstant(compare->getOperand(1), 0)) {
         auto* load = dynamic_cast<IR::Instruction*>(compare->getOperand(0));
+        headerCountLoad = load;
         countPointer = load && load->getOpcode() == Opc::LOAD &&
                 load->getNumOperands() == 1
             ? load->getOperand(0)
@@ -280,6 +338,7 @@ bool matchCountDownLoop(
     } else if (compare->getName() == "slt" &&
                isConstant(compare->getOperand(0), 0)) {
         auto* load = dynamic_cast<IR::Instruction*>(compare->getOperand(1));
+        headerCountLoad = load;
         countPointer = load && load->getOpcode() == Opc::LOAD &&
                 load->getNumOperands() == 1
             ? load->getOperand(0)
@@ -353,6 +412,45 @@ bool matchCountDownLoop(
         body->getInstructions().size() < 4) {
         return false;
     }
+    if (!headerCountLoad || headerCountLoad->getUses().size() != 1 ||
+        headerCountLoad->getUses().front().user != compare ||
+        countLoad->getUses().size() != 1 ||
+        countLoad->getUses().front().user != decrement ||
+        decrement->getUses().size() != 1 ||
+        decrement->getUses().front().user != decrementStore) {
+        return false;
+    }
+    const auto& headerInstructions = loop.header->getInstructions();
+    if (headerInstructions.size() != 3 ||
+        headerInstructions[0].get() != headerCountLoad ||
+        headerInstructions[1].get() != compare ||
+        headerInstructions[2].get() != branch) {
+        return false;
+    }
+    for (const auto& owned : body->getInstructions()) {
+        auto* instruction = owned.get();
+        if (instruction->getOpcode() == Opc::PHI) return false;
+        if (instruction->getOpcode() == Opc::LOAD &&
+            instruction->getNumOperands() == 1 &&
+            instruction->getOperand(0) == countPointer &&
+            instruction != countLoad) {
+            return false;
+        }
+        if (instruction->getOpcode() == Opc::STORE &&
+            instruction->getNumOperands() == 2 &&
+            instruction->getOperand(1) == countPointer &&
+            instruction != decrementStore) {
+            return false;
+        }
+        for (unsigned operand = 0;
+             operand < instruction->getNumOperands(); ++operand) {
+            if (instruction->getOperand(operand) == countPointer &&
+                instruction != countLoad &&
+                instruction != decrementStore) {
+                return false;
+            }
+        }
+    }
     const auto count = body->getInstructions().size();
     return body->getInstructions()[count - 4].get() == countLoad &&
            body->getInstructions()[count - 3].get() == decrement &&
@@ -393,50 +491,85 @@ bool matchFixedPointLoop(
     std::vector<IR::GlobalVariable*> carries;
     for (const auto& [global, effect] : effects) {
         if (effect.loads == 0 || effect.stores == 0) continue;
-        if (hasResetBeforeCalls(body, global)) continue;
+        if (hasConstantResetBeforeCalls(body, global)) {
+            if (!hasOnlyDirectMemoryAccesses(global)) return false;
+            continue;
+        }
         carries.push_back(global);
     }
-    if (carries.size() != 1 ||
-        !isZeroInitializedScalar(carries.front()) ||
-        !carryHasNoEscapes(carries.front()) ||
-        !closureHasNoOutsideCallsOrCarryStores(
-            module, function, loop.body, closure, carries.front())) {
-        return false;
+    if (carries.empty()) return false;
+    for (auto* carry : carries) {
+        if (!isI32ScalarGlobal(carry) ||
+            !hasOnlyDirectMemoryAccesses(carry) ||
+            !closureHasNoOutsideCallsOrCarryStores(
+                module, function, loop.body, closure, carry)) {
+            return false;
+        }
     }
+    std::sort(carries.begin(), carries.end(), [](const auto* left,
+                                                  const auto* right) {
+        return left->getName() < right->getName();
+    });
 
     plan.body = body;
     plan.countLoad = countLoad;
     plan.decrement = decrement;
-    plan.carry = carries.front();
-    plan.initialCount = initialCount;
+    plan.carries = std::move(carries);
     return true;
 }
 
 void applyFixedPointGuard(const FixedPointLoopPlan& plan) {
+    // The matcher partitions memory into immutable inputs, write-only outputs,
+    // constant-reset scalars, and these non-reset scalar carries.  If every
+    // carry has the same value before and after an iteration, the deterministic
+    // closed call graph will repeat the same state transition and output stores.
+    std::vector<IR::Instruction*> entryValues;
+    entryValues.reserve(plan.carries.size());
+    auto entryPosition = plan.body->begin();
+    for (auto* carry : plan.carries) {
+        auto* entryValue = IR::Instruction::createLoad(
+            IR::IntegerType::I32, carry, "fixedpoint.entry");
+        entryPosition = plan.body->insert(entryPosition, entryValue);
+        ++entryPosition;
+        entryValues.push_back(entryValue);
+    }
+
     auto position = std::find_if(
         plan.body->begin(), plan.body->end(), [&](const auto& instruction) {
             return instruction.get() == plan.decrement;
         });
     if (position == plan.body->end()) return;
     auto* i32 = IR::IntegerType::I32;
-    auto* carryLoad = IR::Instruction::createLoad(
-        i32, plan.carry, "fixedpoint.carry");
-    auto* carryReset = IR::Instruction::createCmp(
-        Opc::ICMP, carryLoad, IR::ConstantInt::get(i32, 0), "eq");
-    auto* firstIteration = IR::Instruction::createCmp(
-        Opc::ICMP, plan.countLoad,
-        IR::ConstantInt::get(i32, plan.initialCount), "eq");
+    IR::Value* unchanged = nullptr;
+    for (size_t index = 0; index < plan.carries.size(); ++index) {
+        auto* exitValue = IR::Instruction::createLoad(
+            i32, plan.carries[index], "fixedpoint.exit");
+        auto* same = IR::Instruction::createCmp(
+            Opc::ICMP, exitValue, entryValues[index], "eq");
+        position = plan.body->insert(position, exitValue);
+        ++position;
+        position = plan.body->insert(position, same);
+        ++position;
+        if (!unchanged) {
+            unchanged = same;
+            continue;
+        }
+        auto* allSame = IR::Instruction::createBinOp(
+            Opc::AND, IR::IntegerType::I1, "fixedpoint.same",
+            unchanged, same);
+        position = plan.body->insert(position, allSame);
+        ++position;
+        unchanged = allSame;
+    }
+    auto* moreIterations = IR::Instruction::createCmp(
+        Opc::ICMP, plan.countLoad, IR::ConstantInt::get(i32, 1), "sgt");
     auto* fixedPoint = IR::Instruction::createBinOp(
         Opc::AND, IR::IntegerType::I1, "fixedpoint.ready",
-        carryReset, firstIteration);
+        unchanged, moreIterations);
     auto* selectedCount = IR::Instruction::createSelect(
         fixedPoint, IR::ConstantInt::get(i32, 1),
         plan.countLoad, "fixedpoint.count");
-    position = plan.body->insert(position, carryLoad);
-    ++position;
-    position = plan.body->insert(position, carryReset);
-    ++position;
-    position = plan.body->insert(position, firstIteration);
+    position = plan.body->insert(position, moreIterations);
     ++position;
     position = plan.body->insert(position, fixedPoint);
     ++position;

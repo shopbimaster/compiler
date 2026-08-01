@@ -1,0 +1,18 @@
+int stable_state;
+int changing_state;
+
+void update() {
+    stable_state = stable_state;
+    changing_state = changing_state + 1;
+}
+
+int main() {
+    int rounds = 5;
+    while (rounds > 0) {
+        update();
+        rounds = rounds - 1;
+    }
+    putint(changing_state);
+    putch(10);
+    return 0;
+}

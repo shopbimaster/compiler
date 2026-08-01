@@ -319,7 +319,7 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
     // to survive across the other body's blocks (e.g., then_12 with
     // continue) would not have its live interval extended to cover
     // those blocks, causing the register allocator to reuse its
-    // register and clobber it (01_mm1 SEGFAULT root cause).
+    // register and clobber it in a loop with an early continue.
     struct LoopInfo {
         Opt::BBSet body;
         IR::BasicBlock* header;
@@ -418,7 +418,7 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
     // control flow) must be live across the entire loop body, including
     // blocks that come after its last use in the linear order.
     //
-    // Example (56_sort_test2):
+    // Example (a loop with non-linear block layout):
     //   Block layout: while_cond_0 → while_body_1 → ... → while_end_5 → and_rhs_6
     //   Control flow: while_cond_3 → and_rhs_6 → and_merge_7 → ... → while_end_5
     //   %i.phi is defined in while_cond_0 (ID 5), last used in while_end_5 (ID 30).
@@ -712,15 +712,12 @@ void RegisterAllocator::buildIntervals(IR::Function& func) {
     // 排序必须是全序，否则 intervals 会保留 firstSeen（unordered_map<IR::Value*,...>）
     // 的迭代顺序 —— 那个顺序取决于指针值，也就是取决于 ASLR。
     //
-    // 之前的平局判据止于 getName()，看似足够，但 IR 里的名字并不唯一：crc1 中
-    // %div.pow2.sum / %div.pow2.q 等各出现 10 次（除法降级会为每个展开点生成同名值）。
+    // 之前的平局判据止于 getName()，看似足够，但 IR 里的名字并不唯一：除法降级
+    // 会在多个展开点生成同名的 %div.pow2.sum / %div.pow2.q 临时值。
     // 于是 (start, end, name) 三元组相同的区间之间顺序不定，线性扫描分配器按此
     // 顺序分配寄存器，结果漂移。
     //
-    // 实测（scripts/_det_aslr.sh crc1 10）：
-    //     ASLR 开：10 次编译产生 7 种不同的 .s
-    //     ASLR 关：10 次编译产生 1 种
-    // 受影响的是 crc1/crc2/crc3/huffman-01 共 4 例（scripts/_determinism.sh）。
+    // 重复编译验证表明，ASLR 开启时可能产生多种汇编；关闭后结果稳定。
     //
     // 这会让任何 A/B 对比失真——一次编译的差异可能只是噪声，而非改动效果——
     // 也意味着提交同一份代码，评测机上的性能可能随运行而变。
@@ -856,7 +853,7 @@ bool RegisterAllocator::colorRegClass(bool isFloat) {
     // 不跨调用值优先 caller-saved（t*/ft*）：不进 prologue（零 save/restore 成本），
     //   且因不跨调用，call site 也无需保护它。
     // 这复刻线性扫描的 RA-CALL 策略——朴素图着色无差别抢 s* 破坏了它，
-    // 导致 knapsack 等深递归/调用密集程序 prologue 膨胀（平台实测 +22.8%）。
+    // 导致深递归或调用密集程序的 prologue 膨胀。
     auto isCalleeSaved = [](const std::string& r) {
         // s0-s11 / fs0-fs11 为 callee-saved；t*/ft* 为 caller-saved
         if (r.size() >= 2 && r[0] == 'f' && r[1] == 's') return true;   // fs*
@@ -1163,7 +1160,7 @@ bool RegisterAllocator::isClassicRmwCoalesce(IR::Value* incoming,
 //   - PHI 在 incoming 定义点之后仍有 use → 区间覆盖定义点 → 重叠 → 拒绝（等价旧安全检查）
 //   - 但不再要求 incoming 单 use / 必须是 read-modify-write，覆盖面更广。
 //
-// Example (h-5-01 inner loop):
+// Example (a decrementing inner loop):
 //   subw s11, s7, s1    # t27 = w - mul
 //   mv  s7, s11         # w.phi = t27
 // After coalescing:

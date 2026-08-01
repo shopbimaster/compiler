@@ -1,0 +1,36 @@
+int observed;
+
+int side_effect_multiply(int left, int right) {
+    if (right == 0) {
+        return 0;
+    }
+    if (right == 1) {
+        return left % 998244353;
+    }
+    int current = side_effect_multiply(left, right / 2);
+    current = (current + current) % 998244353;
+    observed = observed + 1;
+    if (right % 2 == 1) {
+        return (current + left) % 998244353;
+    }
+    return current;
+}
+
+int wrong_even_multiply(int left, int right) {
+    if (right == 0) {
+        return 0;
+    }
+    if (right == 1) {
+        return left % 998244353;
+    }
+    int current = wrong_even_multiply(left, right / 2);
+    current = (current + current) % 998244353;
+    if (right % 2 == 1) {
+        return (current + left) % 998244353;
+    }
+    return current + 1;
+}
+
+int main() {
+    return side_effect_multiply(5, 8) + wrong_even_multiply(5, 8);
+}

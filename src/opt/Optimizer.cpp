@@ -75,6 +75,11 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
+    if (PASS_CALL(recursiveModularMulToNative)) {
+        constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
     // 纯自递归函数记忆化：在尾递归消除/内联之前运行，因为匹配逻辑依赖
     // 恰好一个外部调用点和 alloca/load/store（非 PHI）的原始形态；
     // 这两个前提在内联或尾递归转换后不再成立。
@@ -85,11 +90,6 @@ void runO2(IR::Module* mod) {
 
 
     if (PASS_CALL(repeatedDivRemToNative)) {
-        constantFolding(mod);
-        deadCodeElimination(mod);
-    }
-
-    if (PASS_CALL(recursiveModularMulToNative)) {
         constantFolding(mod);
         deadCodeElimination(mod);
     }
@@ -144,7 +144,7 @@ void runO2(IR::Module* mod) {
     }
 
     // 1d. 二次树摇：内联后被内联函数的 useCount 降为 0，成为死函数。
-    //     ★ 已禁用：实测表明删除死函数会改变代码布局，导致 shuffle1 回归 +300ms。
+    //     ★ 已禁用：删除死函数会改变代码布局，并可能显著影响热点循环性能。
     //     死函数在汇编中作为"填充"使热点函数恰好对齐 cache line，删除后热点函数
     //     跨 cache line 边界，icache miss 增加。正确做法是添加函数对齐而非保留死代码。
     //     保留代码以备未来添加函数对齐后重新启用。
@@ -407,7 +407,7 @@ void runO2(IR::Module* mod) {
         simplifyCFG(mod);  // 清理 IfConversion 产生的同目标 COND_BR
         // IfConversion 把 `||`/`&&` 降级成 select(cond,1,x)/select(cond,x,0)。
         // 这类 i1 select 等价于单条 or/and，否则后端展开成 seqz/neg/and/or 多条
-        // 指令（knapsack 递归体 `i==0||w==0`、短路求值等热路径每次都执行）。
+        // 指令；递归基例与短路求值等热路径会频繁执行这类序列。
         // 此处补一次 algebraicSimplification 折叠这些新 select，再清理。
         algebraicSimplification(mod);
         constantFolding(mod);

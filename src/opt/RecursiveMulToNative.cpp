@@ -509,6 +509,268 @@ bool hasArgumentEqualityTest(IR::Function* function, IR::Argument* argument,
     return false;
 }
 
+bool isI32AllocaValue(IR::Value* value) {
+    auto* instruction = dynamic_cast<IR::Instruction*>(value);
+    auto* pointerType = instruction
+        ? dynamic_cast<IR::PointerType*>(instruction->getType())
+        : nullptr;
+    return instruction &&
+           instruction->getOpcode() == IR::Instruction::Opcode::ALLOCA &&
+           pointerType &&
+           pointerType->getPointeeType() == IR::IntegerType::I32;
+}
+
+bool hasExactDirectUses(
+    IR::Value* value, const std::vector<IR::Instruction*>& expectedUses) {
+    std::unordered_set<IR::Instruction*> remaining(
+        expectedUses.begin(), expectedUses.end());
+    if (remaining.size() != expectedUses.size()) return false;
+    for (const auto& use : value->getUses()) {
+        auto* instruction = dynamic_cast<IR::Instruction*>(use.user);
+        if (!instruction || remaining.erase(instruction) != 1) return false;
+    }
+    return remaining.empty();
+}
+
+bool isExactBranch(IR::Instruction* instruction, IR::BasicBlock* target) {
+    return instruction &&
+           instruction->getOpcode() == IR::Instruction::Opcode::BR &&
+           instruction->getNumOperands() == 1 &&
+           instruction->getOperand(0) == target;
+}
+
+// Prove the complete canonical recurrence before enabling the guarded native
+// path. This deliberately accepts one exact IRBuilder shape rather than
+// inferring semantics from a collection of arithmetic instructions.
+bool validateCanonicalModularMultiply(IR::Function* function, int modulus) {
+    using Opc = IR::Instruction::Opcode;
+    if (!function || function->getBlocks().size() != 10 || modulus <= 1 ||
+        modulus > std::numeric_limits<int>::max() / 2) {
+        return false;
+    }
+    auto* entry = function->getEntryBlock();
+    if (!entry || entry->getInstructions().size() != 7) return false;
+
+    auto instructionAt = [](IR::BasicBlock* block, std::size_t index) {
+        return block->getInstructions()[index].get();
+    };
+    auto isLoad = [&](IR::Instruction* instruction, IR::Value* pointer) {
+        return instruction->getOpcode() == Opc::LOAD &&
+               instruction->getNumOperands() == 1 &&
+               instruction->getOperand(0) == pointer;
+    };
+    auto isStore = [&](IR::Instruction* instruction, IR::Value* value,
+                       IR::Value* pointer) {
+        return instruction->getOpcode() == Opc::STORE &&
+               instruction->getNumOperands() == 2 &&
+               instruction->getOperand(0) == value &&
+               instruction->getOperand(1) == pointer;
+    };
+    auto isEq = [&](IR::Instruction* instruction, IR::Value* value,
+                    int constant) {
+        return instruction->getOpcode() == Opc::ICMP &&
+               instruction->getName() == "eq" &&
+               instruction->getNumOperands() == 2 &&
+               ((instruction->getOperand(0) == value &&
+                 isConstantValue(instruction->getOperand(1), constant)) ||
+                (instruction->getOperand(1) == value &&
+                 isConstantValue(instruction->getOperand(0), constant)));
+    };
+    auto isCondBranch = [&](IR::Instruction* instruction,
+                            IR::Value* condition) {
+        return instruction->getOpcode() == Opc::COND_BR &&
+               instruction->getNumOperands() == 3 &&
+               instruction->getOperand(0) == condition;
+    };
+    auto isRemainder = [&](IR::Instruction* instruction, IR::Value* value,
+                           int divisor) {
+        return instruction->getOpcode() == Opc::SREM &&
+               instruction->getNumOperands() == 2 &&
+               instruction->getOperand(0) == value &&
+               isConstantValue(instruction->getOperand(1), divisor);
+    };
+    auto isReturn = [&](IR::Instruction* instruction, IR::Value* value) {
+        return instruction->getOpcode() == Opc::RET &&
+               instruction->getNumOperands() == 1 &&
+               instruction->getOperand(0) == value;
+    };
+
+    auto* argumentASlot = instructionAt(entry, 0);
+    auto* argumentAStore = instructionAt(entry, 1);
+    auto* argumentBSlot = instructionAt(entry, 2);
+    auto* argumentBStore = instructionAt(entry, 3);
+    auto* zeroTestLoad = instructionAt(entry, 4);
+    auto* zeroTest = instructionAt(entry, 5);
+    auto* zeroBranch = instructionAt(entry, 6);
+    if (!isI32AllocaValue(argumentASlot) ||
+        !isStore(argumentAStore, function->getArg(0), argumentASlot) ||
+        !isI32AllocaValue(argumentBSlot) ||
+        !isStore(argumentBStore, function->getArg(1), argumentBSlot) ||
+        !isLoad(zeroTestLoad, argumentBSlot) ||
+        !isEq(zeroTest, zeroTestLoad, 0) ||
+        !isCondBranch(zeroBranch, zeroTest)) {
+        return false;
+    }
+
+    auto* zeroReturnBlock =
+        dynamic_cast<IR::BasicBlock*>(zeroBranch->getOperand(1));
+    auto* afterZeroBlock =
+        dynamic_cast<IR::BasicBlock*>(zeroBranch->getOperand(2));
+    auto* zeroReturn = zeroReturnBlock &&
+                               zeroReturnBlock->getInstructions().size() == 1
+        ? instructionAt(zeroReturnBlock, 0)
+        : nullptr;
+    if (!zeroReturnBlock || !afterZeroBlock ||
+        zeroReturnBlock->getInstructions().size() != 1 ||
+        afterZeroBlock->getInstructions().size() != 1 ||
+        !zeroReturn || zeroReturn->getOpcode() != Opc::RET ||
+        zeroReturn->getNumOperands() != 1 ||
+        !isConstantValue(zeroReturn->getOperand(0), 0)) {
+        return false;
+    }
+
+    auto* afterZeroBranch = instructionAt(afterZeroBlock, 0);
+    if (afterZeroBranch->getOpcode() != Opc::BR ||
+        afterZeroBranch->getNumOperands() != 1) {
+        return false;
+    }
+    auto* oneTestBlock = dynamic_cast<IR::BasicBlock*>(
+        afterZeroBranch->getOperand(0));
+    if (!oneTestBlock || !isExactBranch(afterZeroBranch, oneTestBlock) ||
+        oneTestBlock->getInstructions().size() != 3) {
+        return false;
+    }
+    auto* oneTestLoad = instructionAt(oneTestBlock, 0);
+    auto* oneTest = instructionAt(oneTestBlock, 1);
+    auto* oneBranch = instructionAt(oneTestBlock, 2);
+    if (!isLoad(oneTestLoad, argumentBSlot) ||
+        !isEq(oneTest, oneTestLoad, 1) ||
+        !isCondBranch(oneBranch, oneTest)) {
+        return false;
+    }
+
+    auto* baseReturnBlock =
+        dynamic_cast<IR::BasicBlock*>(oneBranch->getOperand(1));
+    auto* afterOneBlock =
+        dynamic_cast<IR::BasicBlock*>(oneBranch->getOperand(2));
+    if (!baseReturnBlock || !afterOneBlock ||
+        baseReturnBlock->getInstructions().size() != 3 ||
+        afterOneBlock->getInstructions().size() != 1) {
+        return false;
+    }
+    auto* baseLoadA = instructionAt(baseReturnBlock, 0);
+    auto* baseRemainder = instructionAt(baseReturnBlock, 1);
+    auto* baseReturn = instructionAt(baseReturnBlock, 2);
+    if (!isLoad(baseLoadA, argumentASlot) ||
+        !isRemainder(baseRemainder, baseLoadA, modulus) ||
+        !isReturn(baseReturn, baseRemainder)) {
+        return false;
+    }
+
+    auto* afterOneBranch = instructionAt(afterOneBlock, 0);
+    if (afterOneBranch->getOpcode() != Opc::BR ||
+        afterOneBranch->getNumOperands() != 1) {
+        return false;
+    }
+    auto* recursionBlock = dynamic_cast<IR::BasicBlock*>(
+        afterOneBranch->getOperand(0));
+    if (!recursionBlock || !isExactBranch(afterOneBranch, recursionBlock) ||
+        recursionBlock->getInstructions().size() != 14) {
+        return false;
+    }
+    auto* currentSlot = instructionAt(recursionBlock, 0);
+    auto* callLoadA = instructionAt(recursionBlock, 1);
+    auto* halfLoadB = instructionAt(recursionBlock, 2);
+    auto* half = instructionAt(recursionBlock, 3);
+    auto* selfCall = instructionAt(recursionBlock, 4);
+    auto* callStore = instructionAt(recursionBlock, 5);
+    auto* doubleLoad = instructionAt(recursionBlock, 6);
+    auto* doubleAdd = instructionAt(recursionBlock, 7);
+    auto* doubleRemainder = instructionAt(recursionBlock, 8);
+    auto* doubleStore = instructionAt(recursionBlock, 9);
+    auto* parityLoad = instructionAt(recursionBlock, 10);
+    auto* parityRemainder = instructionAt(recursionBlock, 11);
+    auto* parityTest = instructionAt(recursionBlock, 12);
+    auto* parityBranch = instructionAt(recursionBlock, 13);
+    if (!isI32AllocaValue(currentSlot) ||
+        !isLoad(callLoadA, argumentASlot) ||
+        !isLoad(halfLoadB, argumentBSlot) ||
+        half->getOpcode() != Opc::SDIV || half->getNumOperands() != 2 ||
+        half->getOperand(0) != halfLoadB ||
+        !isConstantValue(half->getOperand(1), 2) ||
+        selfCall->getOpcode() != Opc::CALL ||
+        selfCall->getNumOperands() != 3 ||
+        selfCall->getOperand(0) != function ||
+        selfCall->getOperand(1) != callLoadA ||
+        selfCall->getOperand(2) != half ||
+        !isStore(callStore, selfCall, currentSlot) ||
+        !isLoad(doubleLoad, currentSlot) ||
+        doubleAdd->getOpcode() != Opc::ADD ||
+        doubleAdd->getNumOperands() != 2 ||
+        doubleAdd->getOperand(0) != doubleLoad ||
+        doubleAdd->getOperand(1) != doubleLoad ||
+        !isRemainder(doubleRemainder, doubleAdd, modulus) ||
+        !isStore(doubleStore, doubleRemainder, currentSlot) ||
+        !isLoad(parityLoad, argumentBSlot) ||
+        !isRemainder(parityRemainder, parityLoad, 2) ||
+        !isEq(parityTest, parityRemainder, 1) ||
+        !isCondBranch(parityBranch, parityTest)) {
+        return false;
+    }
+
+    auto* oddBlock =
+        dynamic_cast<IR::BasicBlock*>(parityBranch->getOperand(1));
+    auto* evenBlock =
+        dynamic_cast<IR::BasicBlock*>(parityBranch->getOperand(2));
+    if (!oddBlock || !evenBlock || oddBlock->getInstructions().size() != 5 ||
+        evenBlock->getInstructions().size() != 2) {
+        return false;
+    }
+    auto* oddLoadCurrent = instructionAt(oddBlock, 0);
+    auto* oddLoadA = instructionAt(oddBlock, 1);
+    auto* oddAdd = instructionAt(oddBlock, 2);
+    auto* oddRemainder = instructionAt(oddBlock, 3);
+    auto* oddReturn = instructionAt(oddBlock, 4);
+    if (!isLoad(oddLoadCurrent, currentSlot) ||
+        !isLoad(oddLoadA, argumentASlot) ||
+        oddAdd->getOpcode() != Opc::ADD || oddAdd->getNumOperands() != 2 ||
+        oddAdd->getOperand(0) != oddLoadCurrent ||
+        oddAdd->getOperand(1) != oddLoadA ||
+        !isRemainder(oddRemainder, oddAdd, modulus) ||
+        !isReturn(oddReturn, oddRemainder)) {
+        return false;
+    }
+    auto* evenLoadCurrent = instructionAt(evenBlock, 0);
+    auto* evenReturn = instructionAt(evenBlock, 1);
+    if (!isLoad(evenLoadCurrent, currentSlot) ||
+        !isReturn(evenReturn, evenLoadCurrent)) {
+        return false;
+    }
+
+    std::unordered_set<IR::BasicBlock*> provenBlocks = {
+        entry, zeroReturnBlock, afterZeroBlock, oneTestBlock,
+        baseReturnBlock, afterOneBlock, recursionBlock, oddBlock, evenBlock};
+    IR::BasicBlock* emptyMerge = nullptr;
+    for (const auto& block : function->getBlocks()) {
+        if (provenBlocks.count(block.get())) continue;
+        if (emptyMerge || !block->empty()) return false;
+        emptyMerge = block.get();
+    }
+    if (!emptyMerge || provenBlocks.size() != 9) return false;
+
+    return hasExactDirectUses(
+               argumentASlot,
+               {argumentAStore, baseLoadA, callLoadA, oddLoadA}) &&
+           hasExactDirectUses(
+               argumentBSlot,
+               {argumentBStore, zeroTestLoad, oneTestLoad, halfLoadB,
+                parityLoad}) &&
+           hasExactDirectUses(
+               currentSlot,
+               {callStore, doubleLoad, doubleStore, oddLoadCurrent,
+                evenLoadCurrent});
+}
+
 // Recognize the overflow-safe recursive modular multiplication:
 //   f(a, 0) = 0
 //   f(a, 1) = a % M
@@ -636,6 +898,9 @@ bool matchRecursiveModularMultiply(IR::Function* function, int& modulus) {
     }
     if (!foundBase || !foundDouble || !foundOdd) return false;
 
+    if (!validateCanonicalModularMultiply(function, detectedModulus))
+        return false;
+
     modulus = detectedModulus;
     return true;
 }
@@ -682,18 +947,11 @@ void addGuardedWideModularMultiply(IR::Function* function, int modulus) {
 // recursiveMulToNative 入口
 // ================================================================
 bool recursiveMulToNative(IR::Module* mod) {
-    bool changed = true;
-    bool anyChanged = false;
-    while (changed) {
-        changed = false;
-        for (auto& func : mod->getFunctions()) {
-            if (tryConvertFunction(func.get())) {
-                changed = true;
-                anyChanged = true;
-            }
-        }
-    }
-    return anyChanged;
+    (void)mod;
+    // The legacy structural matchers do not prove the complete recurrence,
+    // return value, and observable effects. Keep the transformation disabled
+    // until those properties are established for every matched function.
+    return false;
 }
 
 bool recursiveModularMulToNative(IR::Module* mod) {

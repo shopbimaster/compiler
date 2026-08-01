@@ -1,0 +1,19 @@
+int state;
+int output;
+
+void update(int round) {
+    int previous = state;
+    state = previous;
+    output = round;
+}
+
+int main() {
+    int rounds = 5;
+    while (rounds > 0) {
+        update(rounds);
+        rounds = rounds - 1;
+    }
+    putint(output);
+    putch(10);
+    return 0;
+}

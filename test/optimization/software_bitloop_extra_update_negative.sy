@@ -1,0 +1,24 @@
+int software_xor(int left, int right) {
+    int left_bit;
+    int right_bit;
+    int length = 32;
+    int result = 0;
+    int power = 1;
+    while (length) {
+        left_bit = left % 2;
+        right_bit = right % 2;
+        left = left / 2;
+        right = right / 2;
+        if (left_bit != right_bit) {
+            result = result + power;
+            result = result + 1;
+        }
+        power = power * 2;
+        length = length - 1;
+    }
+    return result;
+}
+
+int main() {
+    return software_xor(5, 3);
+}

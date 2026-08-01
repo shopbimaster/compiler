@@ -53,11 +53,10 @@ bool canCSE(IR::Instruction* inst) {
     // 这消除了循环体中对同一 ALLOCA 的重复 LOAD，减少冗余 mv 指令
     if (op == Opc::LOAD) return true;
     // GETELEMENTPTR：禁用同 BB 内 CSE
-    //   实测 h-8 启用后从 810ms 回归到 908ms（+98ms×3）。
-    //   原因：CSE 将 15 个紧接 LOAD/STORE 的 GEP 合并为 1 个，GEP 结果活跃区间
+    //   原因：CSE 可能将多个紧接 LOAD/STORE 的 GEP 合并为 1 个，GEP 结果活跃区间
     //   从 1 条指令延长到 15+ 条，增加寄存器压力导致溢出。
     //   GEPStrengthReduce 内部已有 lsrCache 对相同 base/iv 的 GEP 去重，
-    //   CSE 对 LSR 无额外收益。shuffle1 虽 -100ms 但不足以抵消 h-8 回归。
+    //   CSE 对 LSR 无额外收益，且寄存器压力增加可能抵消局部收益。
     //   ★ 深度调查（2026-07）：即使限定为"中间 GEP"（仅被其他 GEP 使用的 GEP），
     //   汇编指令数减少 32%（728→497）、内存操作减少，但 QEMU 性能仍回归 +200ms。
     //   根因：CSE 改变寄存器分配（lsr.ptr 减少→其他值分配到不同寄存器），

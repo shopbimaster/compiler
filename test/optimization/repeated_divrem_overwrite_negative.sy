@@ -1,0 +1,13 @@
+int digit(int value, int position) {
+    value = 7;
+    int index = 0;
+    while (index < position) {
+        value = value / 2;
+        index = index + 1;
+    }
+    return value % 2;
+}
+
+int main() {
+    return digit(123, 1);
+}

@@ -415,7 +415,7 @@ bool tryInterchange(IR::Function* func) {
             if (!outerVar || !innerVar || outerVar == innerVar) continue;
 
             // 安全检查1：内层循环边界不能依赖外层循环变量
-            // 例如 h-5-01: while(j < i) 中内层边界是外层变量 i，交换后语义错误
+            // 例如 while (j < i) 中内层边界依赖外层变量，交换后语义错误。
             if (icmpUsesVar(inner.header, outerVar)) continue;
             // 安全检查1b：外层循环边界也不能依赖内层循环变量
             if (icmpUsesVar(outer.header, innerVar)) continue;
@@ -500,7 +500,7 @@ bool tryInterchange(IR::Function* func) {
             auto* entry = func->getEntryBlock();
 
             // 安全检查2：循环变量不能在循环体外被使用
-            // 例如 matmul1: i,j 在后续的循环嵌套中复用，交换会破坏后续代码的正确性
+            // 循环变量若在后续循环中复用，交换会破坏后续代码的正确性。
             // 允许的 BB 集合：循环体 + entry block（初始化）
             BBSet allowedBBs = outer.body;
             allowedBBs.insert(innerBody);

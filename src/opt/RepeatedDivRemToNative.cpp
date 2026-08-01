@@ -17,6 +17,7 @@
 #include "opt/Optimizer.h"
 #include <algorithm>
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 namespace Opt {
@@ -47,48 +48,10 @@ unsigned exactLog2(int64_t value) {
     return bits;
 }
 
-bool tracesToArgument(IR::Value* value, IR::Argument* argument,
-                      IR::Function* function) {
-    if (!value || !argument) return false;
-    if (value == argument) return true;
-
-    auto* load = dynamic_cast<IR::Instruction*>(value);
-    if (!load || load->getOpcode() != Opc::LOAD ||
-        load->getNumOperands() != 1) {
-        return false;
-    }
-    IR::Value* slot = load->getOperand(0);
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == Opc::STORE &&
-                inst->getNumOperands() == 2 &&
-                inst->getOperand(0) == argument &&
-                inst->getOperand(1) == slot) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 bool isLoadFrom(IR::Value* value, IR::Value* slot) {
     auto* load = dynamic_cast<IR::Instruction*>(value);
     return load && load->getOpcode() == Opc::LOAD &&
            load->getNumOperands() == 1 && load->getOperand(0) == slot;
-}
-
-bool hasStore(IR::Function* function, IR::Value* value, IR::Value* slot) {
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == Opc::STORE &&
-                inst->getNumOperands() == 2 &&
-                inst->getOperand(0) == value &&
-                inst->getOperand(1) == slot) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 bool hasStoreInBlock(IR::BasicBlock* block, IR::Value* value,
@@ -103,6 +66,30 @@ bool hasStoreInBlock(IR::BasicBlock* block, IR::Value* value,
         }
     }
     return false;
+}
+
+bool hasExactDirectUses(
+    IR::Value* slot,
+    std::initializer_list<IR::Instruction*> expectedLoads,
+    std::initializer_list<IR::Instruction*> expectedStores) {
+    std::unordered_set<IR::Instruction*> loads(
+        expectedLoads.begin(), expectedLoads.end());
+    std::unordered_set<IR::Instruction*> stores(
+        expectedStores.begin(), expectedStores.end());
+    for (const auto& use : slot->getUses()) {
+        auto* instruction = dynamic_cast<IR::Instruction*>(use.user);
+        if (!instruction) return false;
+        if (instruction->getOpcode() == Opc::LOAD && use.operandNo == 0) {
+            if (loads.erase(instruction) != 1) return false;
+            continue;
+        }
+        if (instruction->getOpcode() == Opc::STORE && use.operandNo == 1) {
+            if (stores.erase(instruction) != 1) return false;
+            continue;
+        }
+        return false;
+    }
+    return loads.empty() && stores.empty();
 }
 
 bool isDirectlyReturned(IR::Function* function, IR::Value* value) {
@@ -147,6 +134,8 @@ bool matchRepeatedDivRem(IR::Function* function,
     std::vector<IR::Instruction*> remainders;
     std::vector<IR::Instruction*> additions;
     std::vector<IR::Instruction*> comparisons;
+    std::vector<IR::Instruction*> returns;
+    unsigned conditionalBranches = 0;
     for (auto& block : function->getBlocks()) {
         for (auto& inst : block->getInstructions()) {
             switch (inst->getOpcode()) {
@@ -154,17 +143,46 @@ bool matchRepeatedDivRem(IR::Function* function,
             case Opc::SREM: remainders.push_back(inst.get()); break;
             case Opc::ADD: additions.push_back(inst.get()); break;
             case Opc::ICMP: comparisons.push_back(inst.get()); break;
+            case Opc::RET: returns.push_back(inst.get()); break;
+            case Opc::COND_BR: ++conditionalBranches; break;
             case Opc::CALL:
             case Opc::PHI:
             case Opc::SELECT:
                 return false;
-            default:
+            case Opc::LOAD: {
+                if (inst->getNumOperands() != 1) return false;
+                auto* pointer = dynamic_cast<IR::Instruction*>(
+                    inst->getOperand(0));
+                if (!pointer || pointer->getOpcode() != Opc::ALLOCA) {
+                    return false;
+                }
                 break;
+            }
+            case Opc::STORE: {
+                if (inst->getNumOperands() != 2) return false;
+                auto* pointer = dynamic_cast<IR::Instruction*>(
+                    inst->getOperand(1));
+                if (!pointer || pointer->getOpcode() != Opc::ALLOCA) {
+                    return false;
+                }
+                break;
+            }
+            case Opc::ALLOCA:
+            case Opc::BR:
+                break;
+            default:
+                return false;
             }
         }
     }
-    if (divisions.size() != 1 || remainders.size() != 1)
+    if (function->getBlocks().size() != 4 ||
+        divisions.size() != 1 || remainders.size() != 1 ||
+        additions.size() != 1 || comparisons.size() != 1 ||
+        returns.size() != 1 || conditionalBranches != 1) {
         return false;
+    }
+    auto* entry = function->getEntryBlock();
+    if (!entry) return false;
 
     auto* division = divisions.front();
     auto* remainder = remainders.front();
@@ -191,15 +209,16 @@ bool matchRepeatedDivRem(IR::Function* function,
         return false;
     }
     IR::Value* valueSlot = divisionInput->getOperand(0);
-    if (remainderInput->getOperand(0) != valueSlot ||
-        !hasStore(function, function->getArg(0), valueSlot) ||
-        !hasStore(function, division, valueSlot) ||
+    auto* valueAlloca = dynamic_cast<IR::Instruction*>(valueSlot);
+    if (!valueAlloca || valueAlloca->getOpcode() != Opc::ALLOCA ||
+        remainderInput->getOperand(0) != valueSlot ||
         !isDirectlyReturned(function, remainder)) {
         return false;
     }
 
     IR::Value* counterSlot = nullptr;
     IR::Instruction* increment = nullptr;
+    IR::Instruction* incrementLoad = nullptr;
     for (auto* addition : additions) {
         IR::Value* loadedCounter = nullptr;
         if (isConstant(addition->getOperand(0), 1))
@@ -210,16 +229,17 @@ bool matchRepeatedDivRem(IR::Function* function,
             continue;
 
         auto* load = dynamic_cast<IR::Instruction*>(loadedCounter);
-        if (!load || load->getOpcode() != Opc::LOAD) continue;
-        IR::Value* candidateSlot = load->getOperand(0);
-        if (!hasStore(function, addition, candidateSlot) ||
-            !hasStore(function,
-                      IR::ConstantInt::get(IR::IntegerType::I32, 0),
-                      candidateSlot)) {
+        if (!load || load->getOpcode() != Opc::LOAD ||
+            load->getNumOperands() != 1) {
             continue;
         }
+        IR::Value* candidateSlot = load->getOperand(0);
+        auto* candidateAlloca = dynamic_cast<IR::Instruction*>(candidateSlot);
+        if (!candidateAlloca || candidateAlloca->getOpcode() != Opc::ALLOCA)
+            continue;
         if (increment) return false;
         increment = addition;
+        incrementLoad = load;
         counterSlot = candidateSlot;
     }
     if (!increment || !counterSlot || counterSlot == valueSlot)
@@ -227,6 +247,9 @@ bool matchRepeatedDivRem(IR::Function* function,
 
     IR::Instruction* loopCondition = nullptr;
     IR::Instruction* loopBranch = nullptr;
+    IR::Instruction* conditionCounterLoad = nullptr;
+    IR::Instruction* positionLoad = nullptr;
+    IR::Value* positionSlot = nullptr;
     for (auto* comparison : comparisons) {
         if (comparison->getName() != "slt" ||
             comparison->getNumOperands() != 2) {
@@ -235,13 +258,27 @@ bool matchRepeatedDivRem(IR::Function* function,
         auto* controllingBranch =
             findControllingBranch(function, comparison);
         if (!controllingBranch) continue;
-        bool counterFirst =
-            isLoadFrom(comparison->getOperand(0), counterSlot) &&
-            tracesToArgument(comparison->getOperand(1),
-                             function->getArg(1), function);
+        auto* candidateCounterLoad = dynamic_cast<IR::Instruction*>(
+            comparison->getOperand(0));
+        IR::Value* bound = comparison->getOperand(1);
+        auto* candidatePositionLoad = dynamic_cast<IR::Instruction*>(bound);
+        bool exactPosition = bound == function->getArg(1);
+        if (candidatePositionLoad &&
+            candidatePositionLoad->getOpcode() == Opc::LOAD &&
+            candidatePositionLoad->getNumOperands() == 1) {
+            positionSlot = candidatePositionLoad->getOperand(0);
+            auto* positionAlloca =
+                dynamic_cast<IR::Instruction*>(positionSlot);
+            exactPosition = positionAlloca &&
+                positionAlloca->getOpcode() == Opc::ALLOCA;
+        }
+        bool counterFirst = candidateCounterLoad &&
+            isLoadFrom(candidateCounterLoad, counterSlot) && exactPosition;
         if (counterFirst) {
             loopCondition = comparison;
             loopBranch = controllingBranch;
+            conditionCounterLoad = candidateCounterLoad;
+            positionLoad = candidatePositionLoad;
             break;
         }
     }
@@ -251,6 +288,7 @@ bool matchRepeatedDivRem(IR::Function* function,
     }
 
     auto* loopBody = division->getParent();
+    auto* loopHeader = loopCondition->getParent();
     auto* trueTarget =
         dynamic_cast<IR::BasicBlock*>(loopBranch->getOperand(1));
     auto* falseTarget =
@@ -261,10 +299,86 @@ bool matchRepeatedDivRem(IR::Function* function,
         !hasStoreInBlock(loopBody, increment, counterSlot)) {
         return false;
     }
+    auto* entryTerminator = entry ? entry->getTerminator() : nullptr;
+    if (!entry || entry == loopHeader || entry == loopBody ||
+        entry == falseTarget ||
+        !entryTerminator || entryTerminator->getOpcode() != Opc::BR ||
+        entryTerminator->getNumOperands() != 1 ||
+        entryTerminator->getOperand(0) != loopHeader ||
+        returns.front()->getParent() != falseTarget ||
+        returns.front()->getNumOperands() != 1 ||
+        returns.front()->getOperand(0) != remainder) {
+        return false;
+    }
     auto* bodyTerminator = loopBody->getTerminator();
     if (!bodyTerminator || bodyTerminator->getOpcode() != Opc::BR ||
         bodyTerminator->getNumOperands() != 1 ||
         bodyTerminator->getOperand(0) != loopCondition->getParent()) {
+        return false;
+    }
+
+    IR::Instruction* valueInitializer = nullptr;
+    IR::Instruction* valueUpdate = nullptr;
+    IR::Instruction* counterInitializer = nullptr;
+    IR::Instruction* counterUpdate = nullptr;
+    IR::Instruction* positionInitializer = nullptr;
+    for (auto& block : function->getBlocks()) {
+        for (auto& owned : block->getInstructions()) {
+            auto* instruction = owned.get();
+            if (instruction->getOpcode() != Opc::STORE ||
+                instruction->getNumOperands() != 2) {
+                continue;
+            }
+            auto* storedValue = instruction->getOperand(0);
+            auto* destination = instruction->getOperand(1);
+            if (destination == valueSlot) {
+                if (storedValue == function->getArg(0) &&
+                    instruction->getParent() == entry && !valueInitializer) {
+                    valueInitializer = instruction;
+                } else if (storedValue == division &&
+                           instruction->getParent() == loopBody &&
+                           !valueUpdate) {
+                    valueUpdate = instruction;
+                } else {
+                    return false;
+                }
+            } else if (destination == counterSlot) {
+                if (isConstant(storedValue, 0) &&
+                    instruction->getParent() == entry && !counterInitializer) {
+                    counterInitializer = instruction;
+                } else if (storedValue == increment &&
+                           instruction->getParent() == loopBody &&
+                           !counterUpdate) {
+                    counterUpdate = instruction;
+                } else {
+                    return false;
+                }
+            } else if (positionSlot && destination == positionSlot) {
+                if (storedValue == function->getArg(1) &&
+                    instruction->getParent() == entry &&
+                    !positionInitializer) {
+                    positionInitializer = instruction;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    if (!valueInitializer || !valueUpdate || !counterInitializer ||
+        !counterUpdate || !incrementLoad || !conditionCounterLoad ||
+        !hasExactDirectUses(
+            valueSlot, {divisionInput, remainderInput},
+            {valueInitializer, valueUpdate}) ||
+        !hasExactDirectUses(
+            counterSlot, {incrementLoad, conditionCounterLoad},
+            {counterInitializer, counterUpdate})) {
+        return false;
+    }
+    if (positionSlot &&
+        (!positionInitializer || positionSlot == valueSlot ||
+         positionSlot == counterSlot ||
+         !hasExactDirectUses(
+             positionSlot, {positionLoad}, {positionInitializer}))) {
         return false;
     }
 

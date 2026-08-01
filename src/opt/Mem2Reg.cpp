@@ -72,7 +72,7 @@ std::unordered_set<IR::BasicBlock*> computeIteratedDominanceFrontier(
     const DFMap& df) {
     // 标准 Cytron 算法：IDF 从空集开始，仅包含 defBlocks 的迭代支配边界。
     // 注意：defBlock 如果同时也在其他 defBlock 的支配边界中，它会被加入 IDF
-    // 并需要 PHI 来合并来自不同前驱的值（如 h-9-03 的 merge_23）。
+    // 并需要 PHI 来合并来自不同前驱的值。
     std::unordered_set<IR::BasicBlock*> idf;
     std::vector<IR::BasicBlock*> workList(defBlocks.begin(), defBlocks.end());
 
@@ -122,8 +122,8 @@ bool mem2regOnFunction(IR::Function* func) {
 
     // 1. 收集可提升的 alloca
     // 关键设计：entry alloca 先收集、非 entry alloca 后收集。配合下方 PHI 配额，
-    // entry 变量的提升集合与 v4.1.0（cap 14）逐字节一致——crypto 的 temp 等复杂
-    // entry 变量仍被 14 配额挡住，正确性不变；非 entry 循环内变量（matmul 的 k/sum/j）
+    // entry 变量的提升集合与既有安全边界（cap 14）保持一致；复杂 entry 变量仍被
+    // 配额挡住，正确性不变；非 entry 循环内的归纳变量和归约变量
     // 在 entry 变量之后、用额外配额提升。这样既让内层进 SSA，又不触碰 v4.1.0 已验证
     // 安全的 entry 提升边界（那个高 PHI 数触发的重命名 bug）。M2R_ENTRY_ONLY=1 全回退。
     static const bool forceEntryOnly = [] {
@@ -174,12 +174,12 @@ bool mem2regOnFunction(IR::Function* func) {
     }
     // PHI 数配额（双段）：
     //   entry 段：沿用 v4.1.0 的 14——保证 entry 变量提升集合与 v4.1.0 完全一致，
-    //     不触碰高 PHI 数触发的重命名 bug（crypto temp 等复杂 entry 变量仍被挡）。
-    //   非 entry 段：额外配额，容纳循环内归纳变量（matmul k/sum/j）。
+    //     不触碰高 PHI 数触发的重命名缺陷（复杂 entry 变量仍被挡）。
+    //   非 entry 段：额外配额，容纳循环内归纳变量和归约变量。
     // M2R_PHI_CAP / M2R_NONENTRY_BUDGET 可覆盖用于调参与二分。
     size_t ENTRY_PHI_CAP = 14;
     if (const char* c = std::getenv("M2R_PHI_CAP")) ENTRY_PHI_CAP = (size_t)std::atoi(c);
-    size_t NONENTRY_BUDGET = 64;  // 完整版：SCCP PHI + 非entry提升，crypto-1 -32%, matmul1 -19%
+    size_t NONENTRY_BUDGET = 64;  // SCCP PHI 与非 entry 提升的独立预算
     if (const char* c = std::getenv("M2R_NONENTRY_BUDGET")) NONENTRY_BUDGET = (size_t)std::atoi(c);
     size_t MAX_MEM2REG_PHI_NODES_PER_FUNCTION = ENTRY_PHI_CAP + NONENTRY_BUDGET;
 
@@ -229,8 +229,8 @@ bool mem2regOnFunction(IR::Function* func) {
         // 循环体内声明的变量（int len=..; int k=0; int sum=0;）多是"声明即初始化、
         // 随后在本作用域使用"。这类变量的 store 支配全部 load，不需要 PHI——标准
         // IDF 会在循环 header 放一个多余 PHI（因为 def block 在循环里，其支配边界
-        // 含 header），该 PHI 合并 undef 与真值，是 crypto 错值的根源（main::len
-        // defBlocks=1 却 +1 phi）。此处对这类变量直接做 load→storedVal 替换，
+        // 含 header），该 PHI 会错误合并 undef 与真值。此处对这类变量直接做
+        // load→storedVal 替换，
         // 绕开 PHI，既正确又消除多余 PHI。仅对非 entry 且单 store 生效（保守）。
         if (!isEntryAlloca && stores.size() == 1 && !std::getenv("M2R_NO_FASTPATH")) {
             auto* theStore = stores[0];
@@ -297,7 +297,7 @@ bool mem2regOnFunction(IR::Function* func) {
             continue;
         }
 
-        // 非 entry 变量保守判据（防 crypto 类重命名缺陷）：
+        // 非 entry 变量的保守判据（防止复杂 CFG 中的重命名缺陷）：
         //   1. defBlocks 数 ≤ maxDefB（默认 2，规范归纳变量 init+递增）。
         //   2. 变量的 def/use 块均不含 CALL，避免跨调用拉长 SSA 值的生命周期。
         if (!isEntryAlloca) {
@@ -313,14 +313,14 @@ bool mem2regOnFunction(IR::Function* func) {
             for (auto* b : defBlocks) if (blockHasCall(b)) { hasCallInRegion = true; break; }
             if (!hasCallInRegion)
                 for (auto* b : useBlocks) if (blockHasCall(b)) { hasCallInRegion = true; break; }
-            if (hasCallInRegion) continue;  // 跳过跨调用变量（crypto 类）
+            if (hasCallInRegion) continue;  // 跳过跨调用变量
         }
 
         // 3b. 计算 PHI 放置位置（迭代支配边界）
         // 非 entry alloca：过滤掉 allocaBB 不支配的 PHI 块（伪 PHI）。
         // 标准 IDF 对循环体内 alloca 会把外层循环 header/出口也加入 phiBlocks，
         // 但这些块不在 allocaBB 的支配子树内——alloca 每次迭代重新初始化，
-        // 外层循环 header 根本不需要该变量的 PHI（crypto::j 根因）。
+        // 外层循环 header 根本不需要该局部变量的 PHI。
         // 过滤后只保留 allocaBB 支配的块，rename 时 valueStack 不会在这些块为空。
         auto phiBlocks = computeIteratedDominanceFrontier(defBlocks, df);
         if (!isEntryAlloca) {
@@ -360,7 +360,7 @@ bool mem2regOnFunction(IR::Function* func) {
         // 常见于 && / || 表达式将比较结果存入 int 变量），需要插入 zext
         // 进行类型转换，否则 PHI 节点会出现类型不匹配，导致 PhiLowering
         // 生成错误的 store i1, i32* 指令，代码生成器可能用 sb 存储
-        // 而 lw 读取，读到垃圾值→无限循环（56_sort_test2 TIMEOUT 根因）。
+        // 而 lw 读取，读到垃圾值后可能形成无限循环。
         auto* allocaPtrTy = dynamic_cast<IR::PointerType*>(alloca->getType());
         auto* phiTy = allocaPtrTy ? allocaPtrTy->getPointeeType() : IR::IntegerType::I32;
 
@@ -535,10 +535,10 @@ bool mem2regOnFunction(IR::Function* func) {
 } // namespace
 
 bool mem2reg(IR::Module* mod) {
-    // 非 entry 提升只在首次 mem2reg（内联前）启用：内联后的复杂 CFG（如 crypto
-    // 把 _and/_or/rotl 内联进 pseudo_md5）会触发 mem2reg 对循环内变量的重命名缺陷
-    // （valueStack 空时 PHI 填 0，在复杂路径泄漏错值）。内联前 CFG 干净，matmul 的
-    // k/sum 在此时即可安全提升。用调用序号控制。M2R_NONENTRY_ALLPASS=1 可全启用（调试）。
+    // 非 entry 提升只在首次 mem2reg（内联前）启用：内联后的复杂 CFG 可能触发
+    // 循环内变量的重命名缺陷（valueStack 空时 PHI 填 0，在复杂路径泄漏错值）。
+    // 内联前 CFG 较简单，归纳变量和归约变量可在此时安全提升。用调用序号控制；
+    // M2R_NONENTRY_ALLPASS=1 可全启用（调试）。
     static int callSeq = 0;
     ++callSeq;
     bool firstCall = (callSeq == 1);

@@ -252,6 +252,60 @@ bool exitAcceptsBypass(IR::BasicBlock* exit) {
     return true;
 }
 
+bool definitionsStayWithin(
+    const std::unordered_set<IR::BasicBlock*>& region) {
+    for (auto* block : region) {
+        for (const auto& instruction : block->getInstructions()) {
+            for (const auto& use : instruction->getUses()) {
+                auto* user = dynamic_cast<IR::Instruction*>(use.user);
+                if (!user || !region.count(user->getParent())) return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool overwrittenBeforeUse(
+    IR::Function* function, IR::Value* pointer,
+    IR::BasicBlock* start) {
+    for (const auto& use : pointer->getUses()) {
+        auto* instruction = dynamic_cast<IR::Instruction*>(use.user);
+        if (!instruction) return false;
+        const bool directLoad =
+            instruction->getOpcode() == Opc::LOAD && use.operandNo == 0;
+        const bool directStore =
+            instruction->getOpcode() == Opc::STORE && use.operandNo == 1;
+        if (!directLoad && !directStore) return false;
+    }
+
+    auto successors = buildSuccessors(function);
+    std::vector<IR::BasicBlock*> worklist = {start};
+    std::unordered_set<IR::BasicBlock*> visited;
+    while (!worklist.empty()) {
+        auto* block = worklist.back();
+        worklist.pop_back();
+        if (!block || !visited.insert(block).second) continue;
+        bool killed = false;
+        for (const auto& instruction : block->getInstructions()) {
+            if (instruction->getOpcode() == Opc::STORE &&
+                instruction->getNumOperands() == 2 &&
+                instruction->getOperand(1) == pointer) {
+                killed = true;
+                break;
+            }
+            for (unsigned index = 0;
+                 index < instruction->getNumOperands(); ++index) {
+                if (instruction->getOperand(index) == pointer) return false;
+            }
+        }
+        if (killed) continue;
+        for (auto* successor : successors[block]) {
+            worklist.push_back(successor);
+        }
+    }
+    return true;
+}
+
 bool classifyLoad(
     IR::Instruction* load, IR::Value* firstIndex,
     IR::Value* secondIndex, IR::Value* stackIndex,
@@ -495,6 +549,7 @@ bool matchConditionalStore(
 
     unsigned globalLoads = 0;
     unsigned globalStores = 0;
+    std::unordered_set<IR::Value*> localPointers;
     const std::unordered_set<IR::Instruction*> expectedLoads = {
         updateFirst, updateSecond, parityFirst, paritySecond};
     for (auto* block : loopI.body) {
@@ -506,13 +561,19 @@ bool matchConditionalStore(
             }
             const unsigned pointerOperand =
                 instruction->getOpcode() == Opc::LOAD ? 0 : 1;
-            PointerAccess access;
-            if (!collectPointerAccess(
-                    instruction->getOperand(pointerOperand), nullptr,
-                    access)) {
+            auto* pointer = instruction->getOperand(pointerOperand);
+            auto* localPointer = dynamic_cast<IR::Instruction*>(pointer);
+            if (localPointer && localPointer->getOpcode() == Opc::ALLOCA) {
+                localPointers.insert(pointer);
                 continue;
             }
-            if (!dynamic_cast<IR::GlobalVariable*>(access.root)) continue;
+            PointerAccess access;
+            if (!collectPointerAccess(
+                    pointer, nullptr,
+                    access)) {
+                return false;
+            }
+            if (!dynamic_cast<IR::GlobalVariable*>(access.root)) return false;
             if (instruction->getOpcode() == Opc::LOAD) {
                 ++globalLoads;
                 if (!expectedLoads.count(instruction.get())) return false;
@@ -522,7 +583,9 @@ bool matchConditionalStore(
             }
         }
     }
-    if (globalLoads != 4 || globalStores != 1) return false;
+    if (globalLoads != 4 || globalStores != 1) {
+        return false;
+    }
 
     IR::Type* outerA = nullptr;
     IR::Type* outerB = nullptr;
@@ -550,8 +613,12 @@ bool matchConditionalStore(
         ? dynamic_cast<IR::BasicBlock*>(outerTerminator->getOperand(2))
         : nullptr;
     if (!bodyTarget || !exit || !loopI.body.count(bodyTarget) ||
-        loopI.body.count(exit) || !exitAcceptsBypass(exit)) {
+        loopI.body.count(exit) || !exitAcceptsBypass(exit) ||
+        !definitionsStayWithin(loopI.body)) {
         return false;
+    }
+    for (auto* pointer : localPointers) {
+        if (!overwrittenBeforeUse(function, pointer, exit)) return false;
     }
 
     plan.function = function;
