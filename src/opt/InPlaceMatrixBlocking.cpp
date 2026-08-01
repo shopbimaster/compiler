@@ -13,6 +13,7 @@ namespace {
 using Opc = IR::Instruction::Opcode;
 
 constexpr unsigned kBlockWidth = 4;
+constexpr unsigned kRowPrivateBlockWidth = 8;
 
 struct MatrixBlockingPlan {
     IR::Function* function = nullptr;
@@ -716,13 +717,14 @@ IR::Function* createRowPrivateKernel(
     kBody->pushBack(coefficient);
     kBody->pushBack(IR::Instruction::createBr(jFullHeader));
 
-    auto* four = IR::ConstantInt::get(i32, 4);
+    auto* blockWidth = IR::ConstantInt::get(
+        i32, kRowPrivateBlockWidth);
     auto* fullIndexNext = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rowprivate.j.full.next", nullptr, four);
+        Opc::ADD, i32, "rowprivate.j.full.next", nullptr, blockWidth);
     auto* fullInputNext = IR::Instruction::createGetElementPtr(
-        i32, nullptr, {four}, "rowprivate.input.full.next");
+        i32, nullptr, {blockWidth}, "rowprivate.input.full.next");
     auto* fullScratchNext = IR::Instruction::createGetElementPtr(
-        i32, nullptr, {four}, "rowprivate.scratch.full.next");
+        i32, nullptr, {blockWidth}, "rowprivate.scratch.full.next");
     auto* fullIndex = makePhi(
         i32, "rowprivate.j.full", zero, kBody,
         fullIndexNext, jFullBody);
@@ -739,7 +741,7 @@ IR::Function* createRowPrivateKernel(
     jFullHeader->pushBack(fullInput);
     jFullHeader->pushBack(fullScratch);
     auto* fullEnd = IR::Instruction::createBinOp(
-        Opc::ADD, i32, "rowprivate.j.full.end", fullIndex, four);
+        Opc::ADD, i32, "rowprivate.j.full.end", fullIndex, blockWidth);
     auto* hasFullBlock = IR::Instruction::createCmp(
         Opc::ICMP, fullEnd, function->getArg(0), "sle");
     jFullHeader->pushBack(fullEnd);
@@ -747,7 +749,7 @@ IR::Function* createRowPrivateKernel(
     jFullHeader->pushBack(IR::Instruction::createCondBr(
         hasFullBlock, jFullBody, jTailHeader));
 
-    for (unsigned lane = 0; lane < 4; ++lane) {
+    for (unsigned lane = 0; lane < kRowPrivateBlockWidth; ++lane) {
         IR::Value* inputAddress = fullInput;
         IR::Value* scratchAddress = fullScratch;
         if (lane != 0) {

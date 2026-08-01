@@ -90,6 +90,11 @@ int main() {
         std::cerr << "row-private helper is missing its leaf-register hint\n";
         return 1;
     }
+    if (inPlace.ir.find("rowprivate.input.7") == std::string::npos ||
+        inPlace.ir.find("rowprivate.input.8") != std::string::npos) {
+        std::cerr << "row-private helper does not use width 8\n";
+        return 1;
+    }
 
     const OptimizationResult renamedInPlace = optimizeToO2(
         "../test/optimization/inplace_matrix_row_private_variant.sy");
