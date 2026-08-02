@@ -93,6 +93,46 @@ bool sinkInBlock(IR::BasicBlock* bb) {
             }
 
             if (!earliestUser) continue;
+
+            // Sinking shortens the result lifetime but can lengthen one or
+            // more input lifetimes by the same (or a larger) distance. Only
+            // move when every non-constant input is already live through the
+            // destination because of another use.
+            bool extendsInputLifetime = false;
+            for (unsigned operandIndex = 0;
+                 operandIndex < inst->getNumOperands(); ++operandIndex) {
+                auto* operand = inst->getOperand(operandIndex);
+                if (!operand || dynamic_cast<IR::Constant*>(operand) ||
+                    dynamic_cast<IR::BasicBlock*>(operand) ||
+                    dynamic_cast<IR::Function*>(operand)) {
+                    continue;
+                }
+
+                bool alreadyLiveThroughDestination = false;
+                for (const auto& use : operand->getUses()) {
+                    if (use.user == inst) continue;
+                    auto* user = dynamic_cast<IR::Instruction*>(use.user);
+                    if (!user || user->getParent() != bb) {
+                        alreadyLiveThroughDestination = true;
+                        break;
+                    }
+
+                    int userPos = 0;
+                    for (auto it = bb->begin(); it != bb->end();
+                         ++it, ++userPos) {
+                        if (it->get() == user) break;
+                    }
+                    if (userPos >= earliestPos) {
+                        alreadyLiveThroughDestination = true;
+                        break;
+                    }
+                }
+                if (!alreadyLiveThroughDestination) {
+                    extendsInputLifetime = true;
+                    break;
+                }
+            }
+            if (extendsInputLifetime) continue;
             if (earliestPos <= instPos + 1) continue; // 已经紧挨着或在使用者之后
 
             // 检查 inst 和 earliestUser 之间是否有非操作数指令

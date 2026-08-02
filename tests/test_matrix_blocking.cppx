@@ -120,6 +120,14 @@ int main() {
         std::cerr << "conditional helper is missing its leaf-register hint\n";
         return 1;
     }
+    const auto firstProduct = conditional.ir.find("%block.product.0 =");
+    const auto firstMaskLoad = conditional.ir.find("%block.B.0 = load");
+    if (firstProduct == std::string::npos ||
+        firstMaskLoad == std::string::npos ||
+        firstProduct > firstMaskLoad) {
+        std::cerr << "conditional lane product was sunk across its mask chain\n";
+        return 1;
+    }
 
     const OptimizationResult negative = optimizeToO2(
         "../test/performance/conv2d-1.sy");

@@ -594,16 +594,16 @@ IR::Instruction* appendLaneUpdate(
     const std::string& prefix) {
     IR::Value* addressA = columnA;
     IR::Value* addressB = columnB;
+    IR::Instruction* laneA = nullptr;
+    IR::Instruction* laneB = nullptr;
     if (lane != 0) {
         auto* offset = IR::ConstantInt::get(i32, lane);
-        auto* laneA = IR::Instruction::createGetElementPtr(
+        laneA = IR::Instruction::createGetElementPtr(
             i32, columnA, {offset}, prefix + ".A.addr." +
                                       std::to_string(lane));
-        auto* laneB = IR::Instruction::createGetElementPtr(
+        laneB = IR::Instruction::createGetElementPtr(
             i32, columnB, {offset}, prefix + ".B.addr." +
                                       std::to_string(lane));
-        block->pushBack(laneA);
-        block->pushBack(laneB);
         addressA = laneA;
         addressB = laneB;
     }
@@ -629,12 +629,14 @@ IR::Instruction* appendLaneUpdate(
     auto* updated = IR::Instruction::createBinOp(
         Opc::ADD, i32, prefix + ".updated." + std::to_string(lane),
         accumulator, contribution);
+    if (laneA) block->pushBack(laneA);
     block->pushBack(valueA);
+    block->pushBack(product);
+    if (laneB) block->pushBack(laneB);
     block->pushBack(valueB);
     block->pushBack(parity);
     block->pushBack(odd);
     block->pushBack(enabled);
-    block->pushBack(product);
     block->pushBack(contribution);
     block->pushBack(updated);
     return updated;
