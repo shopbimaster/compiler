@@ -206,6 +206,62 @@ bool isRegDeadInBB(const std::vector<std::string>& lines, size_t start, const st
 }
 
 
+bool isPrivateStackSlot(const std::string& address, int64_t& offset) {
+    auto open = address.find('(');
+    auto close = address.find(')', open == std::string::npos ? 0 : open + 1);
+    if (open == std::string::npos || close == std::string::npos ||
+        close + 1 != address.size() ||
+        address.substr(open + 1, close - open - 1) != "sp") {
+        return false;
+    }
+
+    try {
+        offset = std::stoll(address.substr(0, open));
+    } catch (...) {
+        return false;
+    }
+    return offset >= -2048 && offset <= 2047;
+}
+
+bool isMemoryOp(const std::string& op) {
+    static const std::set<std::string> memoryOps = {
+        "lb", "lbu", "lh", "lhu", "lw", "ld", "flw", "fld",
+        "sb", "sh", "sw", "sd", "fsw", "fsd"
+    };
+    return memoryOps.count(op) != 0;
+}
+
+// The memory round trip is unobservable when the exact offset(sp) operand
+// belongs only to this store/load pair and its address is never materialized.
+bool stackSlotIsPrivateToPair(const std::vector<std::string>& lines,
+                              const std::string& address) {
+    int64_t offset = 0;
+    if (!isPrivateStackSlot(address, offset)) return false;
+
+    size_t memoryReferences = 0;
+    for (const auto& line : lines) {
+        const std::string op = extractOpName(line);
+        if (isMemoryOp(op)) {
+            std::string reg, memory, trailing;
+            if (tryMatch(line, op, reg, memory, trailing) &&
+                trailing.empty() && memory == address) {
+                ++memoryReferences;
+            }
+        }
+
+        if (op == "addi") {
+            std::string rd, base, immediate;
+            if (tryMatch(line, op, rd, base, immediate) && base == "sp") {
+                try {
+                    if (std::stoll(immediate) == offset) return false;
+                } catch (...) {
+                }
+            }
+        }
+    }
+    return memoryReferences == 2;
+}
+
 std::string peepholeOptimize(const std::string& asmCode) {
     auto lines = splitLines(asmCode);
 
@@ -910,7 +966,11 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     std::string lwReg, lwOff, lwImm;
                     if (tryMatch(lines[i + 1], "lw", lwReg, lwOff, lwImm) && lwImm.empty()) {
                         if (swOff == lwOff && !swOff.empty()) {
-                            result.push_back(lines[i]);  // 保留 sw（内存写副作用不能消除）
+                            const bool privateSlot =
+                                stackSlotIsPrivateToPair(lines, swOff);
+                            if (!privateSlot) {
+                                result.push_back(lines[i]);  // 保留 sw（内存写副作用不能消除）
+                            }
                             if (lwReg != swReg) {
                                 result.push_back("  mv      " + lwReg + ", " + swReg);
                             }
@@ -932,7 +992,11 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     std::string ldReg, ldOff, ldImm;
                     if (tryMatch(lines[i + 1], "ld", ldReg, ldOff, ldImm) && ldImm.empty()) {
                         if (sdOff == ldOff && !sdOff.empty()) {
-                            result.push_back(lines[i]);  // 保留 sd（内存写副作用不能消除）
+                            const bool privateSlot =
+                                stackSlotIsPrivateToPair(lines, sdOff);
+                            if (!privateSlot) {
+                                result.push_back(lines[i]);  // 保留 sd（内存写副作用不能消除）
+                            }
                             if (ldReg != sdReg) {
                                 result.push_back("  mv      " + ldReg + ", " + sdReg);
                             }

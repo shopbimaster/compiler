@@ -58,6 +58,54 @@ int main() {
     passed &= expectContains(integerResult, "global_int",
                              "folded lw lost its symbol");
 
+    const std::string privateIntegerSpill =
+        "entry:\n"
+        "  sw t0, 40(sp)\n"
+        "  lw t0, 40(sp)\n"
+        "  addw t1, t0, t2\n"
+        "  ret\n";
+    const std::string privateIntegerResult =
+        Opt::peepholeOptimize(privateIntegerSpill);
+    passed &= expectNotContains(privateIntegerResult, "40(sp)",
+                                "private integer spill round trip remained");
+
+    const std::string privatePointerSpill =
+        "entry:\n"
+        "  sd t0, 48(sp)\n"
+        "  ld t1, 48(sp)\n"
+        "  lw t2, 0(t1)\n"
+        "  ret\n";
+    const std::string privatePointerResult =
+        Opt::peepholeOptimize(privatePointerSpill);
+    passed &= expectNotContains(privatePointerResult, "48(sp)",
+                                "private pointer spill round trip remained");
+    passed &= expectContains(privatePointerResult, "mv      t1, t0",
+                             "private pointer reload was not forwarded");
+
+    const std::string sharedSpill =
+        "entry:\n"
+        "  sw t0, 56(sp)\n"
+        "  lw t0, 56(sp)\n"
+        "  addw t1, t0, t2\n"
+        "  li t0, 0\n"
+        "  lw t3, 56(sp)\n"
+        "  addw a0, t1, t3\n"
+        "  ret\n";
+    const std::string sharedSpillResult = Opt::peepholeOptimize(sharedSpill);
+    passed &= expectContains(sharedSpillResult, "sw t0, 56(sp)",
+                             "shared spill store was incorrectly removed");
+
+    const std::string escapedSlot =
+        "entry:\n"
+        "  sw t0, 64(sp)\n"
+        "  lw t0, 64(sp)\n"
+        "  addi a0, sp, 64\n"
+        "  call consume\n"
+        "  ret\n";
+    const std::string escapedSlotResult = Opt::peepholeOptimize(escapedSlot);
+    passed &= expectContains(escapedSlotResult, "sw t0, 64(sp)",
+                             "escaped stack slot store was incorrectly removed");
+
     if (passed) std::cout << "Peephole floating-load regression passed\n";
     return passed ? 0 : 1;
 }
