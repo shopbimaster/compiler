@@ -146,6 +146,35 @@ int main() {
     passed &= expectContains(liveDestinationResult, "sw t0, 88(sp)",
                              "live reload destination was overwritten early");
 
+    const std::string reservedScratchSpill =
+        "entry:\n"
+        "  sw t0, 120(sp)\n"
+        "  lw t1, 0(a0)\n"
+        "  addw t0, t1, t3\n"
+        "  lw t1, 120(sp)\n"
+        "  mulw t1, t0, t1\n"
+        "  ret\n";
+    const std::string reservedScratchResult =
+        Opt::peepholeOptimize(reservedScratchSpill);
+    passed &= expectNotContains(reservedScratchResult, "120(sp)",
+                                "reserved scratch did not carry private spill");
+    passed &= expectContains(reservedScratchResult, "mv      t2, t0",
+                             "private spill was not captured in t2");
+
+    const std::string busyScratchSpill =
+        "entry:\n"
+        "  sw t0, 128(sp)\n"
+        "  lw t1, 0(a0)\n"
+        "  addw t0, t1, t3\n"
+        "  addw t2, t2, t4\n"
+        "  lw t1, 128(sp)\n"
+        "  mulw t1, t0, t1\n"
+        "  ret\n";
+    const std::string busyScratchResult =
+        Opt::peepholeOptimize(busyScratchSpill);
+    passed &= expectContains(busyScratchResult, "sw t0, 128(sp)",
+                             "live t2 was overwritten by spill forwarding");
+
     const std::string crossBlockSpill =
         "entry:\n"
         "  sw t0, 96(sp)\n"

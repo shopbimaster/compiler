@@ -343,10 +343,12 @@ bool isControlFlowBoundary(const std::string& line) {
 }
 
 // Forward a private spill value across unrelated instructions in one basic
-// block. Two safe forms are supported:
+// block. Three safe forms are supported:
 //   1. the source register survives until the reload;
 //   2. the reload destination is untouched, so the value can be captured
-//      there before the source is overwritten.
+//      there before the source is overwritten;
+//   3. the backend-reserved t2 scratch register is unused throughout the
+//      interval, so it can carry the value without another memory round trip.
 bool forwardOnePrivateStackRoundTrip(std::vector<std::string>& lines) {
     for (size_t storeIndex = 0; storeIndex < lines.size(); ++storeIndex) {
         const std::string storeOp = extractOpName(lines[storeIndex]);
@@ -408,6 +410,37 @@ bool forwardOnePrivateStackRoundTrip(std::vector<std::string>& lines) {
         if (destination != source && destinationUntouched) {
             lines[storeIndex] = "  mv      " + destination + ", " + source;
             lines.erase(lines.begin() + static_cast<long>(loadIndex));
+            return true;
+        }
+
+        // t2 is excluded from the integer allocation pool and is used only as
+        // a short-lived code-generation scratch. If it is not mentioned from
+        // this store through the reload, and its first later mention is either
+        // a fresh definition or the end of the basic block, it can safely
+        // carry an otherwise unforwardable private spill value.
+        constexpr const char* scratch = "t2";
+        bool scratchAvailable = source != scratch && destination != scratch;
+        for (size_t i = storeIndex + 1;
+             scratchAvailable && i < loadIndex; ++i) {
+            if (!isEmptyOrComment(lines[i]) && regInStr(lines[i], scratch)) {
+                scratchAvailable = false;
+            }
+        }
+        for (size_t i = loadIndex + 1;
+             scratchAvailable && i < lines.size(); ++i) {
+            if (isControlFlowBoundary(lines[i])) break;
+            if (isEmptyOrComment(lines[i]) ||
+                !regInStr(lines[i], scratch)) {
+                continue;
+            }
+            if (!instructionDefinesRegister(lines[i], scratch)) {
+                scratchAvailable = false;
+            }
+            break;
+        }
+        if (scratchAvailable) {
+            lines[storeIndex] = "  mv      t2, " + source;
+            lines[loadIndex] = "  mv      " + destination + ", t2";
             return true;
         }
     }
