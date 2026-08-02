@@ -225,41 +225,198 @@ bool isPrivateStackSlot(const std::string& address, int64_t& offset) {
 
 bool isMemoryOp(const std::string& op) {
     static const std::set<std::string> memoryOps = {
-        "lb", "lbu", "lh", "lhu", "lw", "ld", "flw", "fld",
+        "lb", "lbu", "lh", "lhu", "lw", "lwu", "ld", "flw", "fld",
         "sb", "sh", "sw", "sd", "fsw", "fsd"
     };
     return memoryOps.count(op) != 0;
 }
 
+size_t memoryOpWidth(const std::string& op) {
+    if (op == "lb" || op == "lbu" || op == "sb") return 1;
+    if (op == "lh" || op == "lhu" || op == "sh") return 2;
+    if (op == "lw" || op == "lwu" || op == "flw" ||
+        op == "sw" || op == "fsw") return 4;
+    if (op == "ld" || op == "fld" || op == "sd" || op == "fsd") return 8;
+    return 0;
+}
+
 // The memory round trip is unobservable when the exact offset(sp) operand
 // belongs only to this store/load pair and its address is never materialized.
 bool stackSlotIsPrivateToPair(const std::vector<std::string>& lines,
-                              const std::string& address) {
+                              const std::string& address,
+                              size_t accessWidth,
+                              size_t referenceIndex) {
     int64_t offset = 0;
-    if (!isPrivateStackSlot(address, offset)) return false;
+    if (!isPrivateStackSlot(address, offset) || accessWidth == 0 ||
+        referenceIndex >= lines.size()) {
+        return false;
+    }
+
+    auto isFunctionLabel = [](const std::string& line) {
+        if (!isLabel(line)) return false;
+        const auto first = line.find_first_not_of(" \t");
+        return first != std::string::npos && line[first] != '.';
+    };
+    size_t functionBegin = 0;
+    for (size_t i = referenceIndex + 1; i-- > 0;) {
+        if (isFunctionLabel(lines[i])) {
+            functionBegin = i;
+            break;
+        }
+    }
+    size_t functionEnd = lines.size();
+    for (size_t i = referenceIndex + 1; i < lines.size(); ++i) {
+        if (isFunctionLabel(lines[i])) {
+            functionEnd = i;
+            break;
+        }
+    }
 
     size_t memoryReferences = 0;
-    for (const auto& line : lines) {
+    for (size_t lineIndex = functionBegin; lineIndex < functionEnd; ++lineIndex) {
+        const auto& line = lines[lineIndex];
         const std::string op = extractOpName(line);
         if (isMemoryOp(op)) {
             std::string reg, memory, trailing;
-            if (tryMatch(line, op, reg, memory, trailing) &&
-                trailing.empty() && memory == address) {
-                ++memoryReferences;
+            if (tryMatch(line, op, reg, memory, trailing) && trailing.empty()) {
+                if (reg == "sp") return false;
+                int64_t otherOffset = 0;
+                const size_t otherWidth = memoryOpWidth(op);
+                if (memory == address) {
+                    ++memoryReferences;
+                } else if (otherWidth != 0 &&
+                           isPrivateStackSlot(memory, otherOffset)) {
+                    const int64_t end = offset + static_cast<int64_t>(accessWidth);
+                    const int64_t otherEnd =
+                        otherOffset + static_cast<int64_t>(otherWidth);
+                    if (offset < otherEnd && otherOffset < end) return false;
+                }
             }
         }
 
         if (op == "addi") {
             std::string rd, base, immediate;
             if (tryMatch(line, op, rd, base, immediate) && base == "sp") {
-                try {
-                    if (std::stoll(immediate) == offset) return false;
-                } catch (...) {
-                }
+                if (rd != "sp") return false;
+                continue;
             }
+        }
+        if (op == "mv") {
+            std::string rd, source, trailing;
+            if (tryMatch(line, op, rd, source, trailing) && source == "sp") {
+                return false;
+            }
+        }
+        if (!isMemoryOp(op) && op != "addi" && regInStr(line, "sp")) {
+            return false;
         }
     }
     return memoryReferences == 2;
+}
+
+bool instructionDefinesRegister(const std::string& line,
+                                const std::string& reg) {
+    const std::string op = extractOpName(line);
+    if (op.empty()) return false;
+    static const std::set<std::string> noDestination = {
+        "sw", "sd", "sh", "sb", "fsw", "fsd", "fsh", "fsb",
+        "beq", "bne", "blt", "bge", "bltu", "bgeu",
+        "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+        "j", "jr", "ret", "tail", "call", "ecall", "ebreak",
+        "fence", "nop"
+    };
+    if (noDestination.count(op)) return false;
+
+    std::string rd, rs, trailing;
+    return tryMatch(line, op, rd, rs, trailing) && rd == reg;
+}
+
+bool isControlFlowBoundary(const std::string& line) {
+    if (isLabel(line)) return true;
+    static const std::set<std::string> controlOps = {
+        "beq", "bne", "blt", "bge", "bltu", "bgeu",
+        "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+        "j", "jr", "jal", "jalr", "ret", "tail", "call",
+        "ecall", "ebreak"
+    };
+    return controlOps.count(extractOpName(line)) != 0;
+}
+
+// Forward a private spill value across unrelated instructions in one basic
+// block. Two safe forms are supported:
+//   1. the source register survives until the reload;
+//   2. the reload destination is untouched, so the value can be captured
+//      there before the source is overwritten.
+bool forwardOnePrivateStackRoundTrip(std::vector<std::string>& lines) {
+    for (size_t storeIndex = 0; storeIndex < lines.size(); ++storeIndex) {
+        const std::string storeOp = extractOpName(lines[storeIndex]);
+        const std::string loadOp = storeOp == "sw" ? "lw" :
+                                   storeOp == "sd" ? "ld" : "";
+        if (loadOp.empty()) continue;
+
+        std::string source, address, trailing;
+        if (!tryMatch(lines[storeIndex], storeOp, source, address, trailing) ||
+            !trailing.empty() || source.empty() ||
+            !stackSlotIsPrivateToPair(lines, address,
+                                      storeOp == "sw" ? 4 : 8,
+                                      storeIndex)) {
+            continue;
+        }
+
+        size_t loadIndex = lines.size();
+        std::string destination;
+        for (size_t i = storeIndex + 1; i < lines.size(); ++i) {
+            if (isControlFlowBoundary(lines[i])) break;
+            if (isEmptyOrComment(lines[i])) continue;
+
+            std::string rd, memory, rest;
+            if (tryMatch(lines[i], loadOp, rd, memory, rest) &&
+                rest.empty() && memory == address) {
+                loadIndex = i;
+                destination = rd;
+                break;
+            }
+        }
+        if (loadIndex == lines.size() || destination.empty() ||
+            destination == "sp" || destination == "zero" ||
+            destination == "x0") {
+            continue;
+        }
+
+        bool sourceSurvives = true;
+        bool destinationUntouched = true;
+        for (size_t i = storeIndex + 1; i < loadIndex; ++i) {
+            if (isEmptyOrComment(lines[i])) continue;
+            if (instructionDefinesRegister(lines[i], source)) {
+                sourceSurvives = false;
+            }
+            if (regInStr(lines[i], destination)) {
+                destinationUntouched = false;
+            }
+        }
+
+        if (sourceSurvives) {
+            if (destination == source) {
+                lines.erase(lines.begin() + static_cast<long>(loadIndex));
+            } else {
+                lines[loadIndex] = "  mv      " + destination + ", " + source;
+            }
+            lines.erase(lines.begin() + static_cast<long>(storeIndex));
+            return true;
+        }
+
+        if (destination != source && destinationUntouched) {
+            lines[storeIndex] = "  mv      " + destination + ", " + source;
+            lines.erase(lines.begin() + static_cast<long>(loadIndex));
+            return true;
+        }
+    }
+    return false;
+}
+
+void forwardPrivateStackRoundTrips(std::vector<std::string>& lines) {
+    while (forwardOnePrivateStackRoundTrip(lines)) {
+    }
 }
 
 std::string peepholeOptimize(const std::string& asmCode) {
@@ -289,6 +446,8 @@ std::string peepholeOptimize(const std::string& asmCode) {
     int maxIter = maxIterEnv ? std::atoi(maxIterEnv) : 3;
     if (maxIter < 0) maxIter = 3;
     for (int iter = 0; iter < maxIter; ++iter) {
+        forwardPrivateStackRoundTrips(lines);
+
         // ★ 构建跳板映射：label → final_target
         // 跳板模式：label: 后紧跟一条 j target（无其他指令）
         // 将所有跳转到 label 的指令替换为直接跳转到 final_target
@@ -967,7 +1126,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     if (tryMatch(lines[i + 1], "lw", lwReg, lwOff, lwImm) && lwImm.empty()) {
                         if (swOff == lwOff && !swOff.empty()) {
                             const bool privateSlot =
-                                stackSlotIsPrivateToPair(lines, swOff);
+                                stackSlotIsPrivateToPair(lines, swOff, 4, i);
                             if (!privateSlot) {
                                 result.push_back(lines[i]);  // 保留 sw（内存写副作用不能消除）
                             }
@@ -993,7 +1152,7 @@ std::string peepholeOptimize(const std::string& asmCode) {
                     if (tryMatch(lines[i + 1], "ld", ldReg, ldOff, ldImm) && ldImm.empty()) {
                         if (sdOff == ldOff && !sdOff.empty()) {
                             const bool privateSlot =
-                                stackSlotIsPrivateToPair(lines, sdOff);
+                                stackSlotIsPrivateToPair(lines, sdOff, 8, i);
                             if (!privateSlot) {
                                 result.push_back(lines[i]);  // 保留 sd（内存写副作用不能消除）
                             }

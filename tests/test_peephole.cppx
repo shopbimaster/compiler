@@ -87,6 +87,7 @@ int main() {
         "  sw t0, 56(sp)\n"
         "  lw t0, 56(sp)\n"
         "  addw t1, t0, t2\n"
+        "  addw t4, t3, t5\n"
         "  li t0, 0\n"
         "  lw t3, 56(sp)\n"
         "  addw a0, t1, t3\n"
@@ -105,6 +106,80 @@ int main() {
     const std::string escapedSlotResult = Opt::peepholeOptimize(escapedSlot);
     passed &= expectContains(escapedSlotResult, "sw t0, 64(sp)",
                              "escaped stack slot store was incorrectly removed");
+
+    const std::string nonAdjacentSurvivingSource =
+        "entry:\n"
+        "  sw t0, 72(sp)\n"
+        "  addiw t2, t2, 1\n"
+        "  lw t0, 72(sp)\n"
+        "  ret\n";
+    const std::string nonAdjacentSurvivingResult =
+        Opt::peepholeOptimize(nonAdjacentSurvivingSource);
+    passed &= expectNotContains(nonAdjacentSurvivingResult, "72(sp)",
+                                "surviving spill source was not forwarded");
+
+    const std::string earlyCaptureSpill =
+        "entry:\n"
+        "  sw t0, 80(sp)\n"
+        "  lw t0, 0(a0)\n"
+        "  addw t2, t2, t3\n"
+        "  lw t1, 80(sp)\n"
+        "  addw a0, t1, t2\n"
+        "  ret\n";
+    const std::string earlyCaptureResult =
+        Opt::peepholeOptimize(earlyCaptureSpill);
+    passed &= expectNotContains(earlyCaptureResult, "80(sp)",
+                                "early-capture spill round trip remained");
+    passed &= expectContains(earlyCaptureResult, "mv      t1, t0",
+                             "spill value was not captured before clobber");
+
+    const std::string liveDestinationSpill =
+        "entry:\n"
+        "  sw t0, 88(sp)\n"
+        "  addw t2, t1, t3\n"
+        "  lw t0, 0(a0)\n"
+        "  lw t1, 88(sp)\n"
+        "  addw a0, t1, t2\n"
+        "  ret\n";
+    const std::string liveDestinationResult =
+        Opt::peepholeOptimize(liveDestinationSpill);
+    passed &= expectContains(liveDestinationResult, "sw t0, 88(sp)",
+                             "live reload destination was overwritten early");
+
+    const std::string crossBlockSpill =
+        "entry:\n"
+        "  sw t0, 96(sp)\n"
+        "next:\n"
+        "  lw t0, 96(sp)\n"
+        "  ret\n";
+    const std::string crossBlockResult =
+        Opt::peepholeOptimize(crossBlockSpill);
+    passed &= expectContains(crossBlockResult, "sw t0, 96(sp)",
+                             "spill was forwarded across a block boundary");
+
+    const std::string overlappingSlot =
+        "entry:\n"
+        "  sd t0, 104(sp)\n"
+        "  lw t1, 108(sp)\n"
+        "  ld t0, 104(sp)\n"
+        "  addw a0, t1, t2\n"
+        "  ret\n";
+    const std::string overlappingSlotResult =
+        Opt::peepholeOptimize(overlappingSlot);
+    passed &= expectContains(overlappingSlotResult, "sd t0, 104(sp)",
+                             "overlapping stack access lost its source store");
+
+    const std::string indirectlyEscapedSlot =
+        "entry:\n"
+        "  sw t0, 112(sp)\n"
+        "  mv a0, sp\n"
+        "  addi a0, a0, 112\n"
+        "  lw t0, 112(sp)\n"
+        "  ret\n";
+    const std::string indirectlyEscapedResult =
+        Opt::peepholeOptimize(indirectlyEscapedSlot);
+    passed &= expectContains(indirectlyEscapedResult, "sw t0, 112(sp)",
+                             "indirectly escaped stack slot lost its store");
 
     if (passed) std::cout << "Peephole floating-load regression passed\n";
     return passed ? 0 : 1;
