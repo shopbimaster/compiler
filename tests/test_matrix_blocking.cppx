@@ -181,6 +181,57 @@ int main() {
         return 1;
     }
 
+    IR::Module effectsModule;
+    auto* i32 = IR::IntegerType::I32;
+    auto* tracked = effectsModule.createGlobalVariable(
+        IR::PointerType::get(i32), "tracked", false,
+        IR::ConstantInt::get(i32, 0));
+    auto* observer = effectsModule.createFunction(
+        IR::FunctionType::get(
+            IR::VoidType::get(), {tracked->getType()}),
+        "observe", true);
+    auto* effectsFunction = effectsModule.createFunction(
+        IR::FunctionType::get(IR::VoidType::get(), {}),
+        "effects");
+    auto* effectsEntry = effectsFunction->createBlock("entry");
+    effectsEntry->pushBack(
+        IR::Instruction::createLoad(i32, tracked, "loaded"));
+    effectsEntry->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(i32, 1), tracked));
+    effectsEntry->pushBack(IR::Instruction::createCall(
+        observer->getFunctionType(), observer, {tracked}, ""));
+    effectsEntry->pushBack(IR::Instruction::createRet(nullptr));
+
+    Opt::GlobalMemoryEffects effects;
+    if (!Opt::analyzeGlobalMemoryEffects(tracked, effects) ||
+        effects.loads.size() != 1 ||
+        effects.stores.size() != 1 ||
+        effects.calls.size() != 1) {
+        std::cerr << "global memory effects were not classified precisely\n";
+        return 1;
+    }
+
+    IR::Module escapeModule;
+    auto* escaped = escapeModule.createGlobalVariable(
+        IR::PointerType::get(i32), "escaped", false,
+        IR::ConstantInt::get(i32, 0));
+    auto* escapeFunction = escapeModule.createFunction(
+        IR::FunctionType::get(IR::VoidType::get(), {}),
+        "escape");
+    auto* escapeEntry = escapeFunction->createBlock("entry");
+    auto* pointerSlot = IR::Instruction::createAlloca(
+        escaped->getType(), "pointer.slot");
+    escapeEntry->pushBack(pointerSlot);
+    escapeEntry->pushBack(
+        IR::Instruction::createStore(escaped, pointerSlot));
+    escapeEntry->pushBack(IR::Instruction::createRet(nullptr));
+    Opt::GlobalMemoryEffects escapedEffects;
+    if (Opt::analyzeGlobalMemoryEffects(
+            escaped, escapedEffects)) {
+        std::cerr << "stored global address was not treated as an escape\n";
+        return 1;
+    }
+
     std::cout << "Optimization trigger checks passed\n";
     return 0;
 }

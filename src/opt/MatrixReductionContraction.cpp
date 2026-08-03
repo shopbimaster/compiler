@@ -550,7 +550,6 @@ std::vector<IR::Instruction*> collectFunctionCalls(
 }
 
 bool findFinalReduction(
-    IR::Module* module,
     IR::Function* caller,
     IR::GlobalVariable* matrix,
     IR::Value* size,
@@ -563,36 +562,11 @@ bool findFinalReduction(
     IR::BasicBlock*& reductionPreheader,
     IR::BasicBlock*& reductionExit,
     IR::Instruction*& reductionInitialization) {
-    std::vector<IR::Instruction*> loads;
-    std::vector<IR::Instruction*> stores;
-    std::vector<IR::Instruction*> callsWithMatrix;
-
-    for (auto& function : module->getFunctions()) {
-        for (auto& block : function->getBlocks()) {
-            for (auto& instruction : block->getInstructions()) {
-                if (instruction->getOpcode() == Opc::LOAD &&
-                    instruction->getNumOperands() == 1 &&
-                    rootGlobal(instruction->getOperand(0)) == matrix) {
-                    loads.push_back(instruction.get());
-                }
-                if (instruction->getOpcode() == Opc::STORE &&
-                    instruction->getNumOperands() == 2 &&
-                    rootGlobal(instruction->getOperand(1)) == matrix) {
-                    stores.push_back(instruction.get());
-                }
-                if (instruction->getOpcode() == Opc::CALL) {
-                    for (unsigned index = 1;
-                         index < instruction->getNumOperands(); ++index) {
-                        if (rootGlobal(instruction->getOperand(index)) ==
-                            matrix) {
-                            callsWithMatrix.push_back(instruction.get());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    GlobalMemoryEffects effects;
+    if (!analyzeGlobalMemoryEffects(matrix, effects)) return false;
+    const auto& loads = effects.loads;
+    const auto& stores = effects.stores;
+    const auto& callsWithMatrix = effects.calls;
 
     if (loads.size() != 1 ||
         callsWithMatrix.empty() ||
@@ -788,75 +762,35 @@ bool findFinalReduction(
 }
 
 bool matrixHasUnexpectedAccess(
-    IR::Module* module, IR::GlobalVariable* matrix,
+    IR::GlobalVariable* matrix,
     const std::vector<IR::Instruction*>& allowedCalls) {
-    for (auto& function : module->getFunctions()) {
-        for (auto& block : function->getBlocks()) {
-            for (auto& instruction : block->getInstructions()) {
-                if ((instruction->getOpcode() == Opc::LOAD &&
-                     instruction->getNumOperands() == 1 &&
-                     rootGlobal(instruction->getOperand(0)) == matrix) ||
-                    (instruction->getOpcode() == Opc::STORE &&
-                     instruction->getNumOperands() == 2 &&
-                     rootGlobal(instruction->getOperand(1)) == matrix)) {
-                    return true;
-                }
-                if (instruction->getOpcode() != Opc::CALL ||
-                    std::find(
-                        allowedCalls.begin(), allowedCalls.end(),
-                        instruction.get()) != allowedCalls.end()) {
-                    continue;
-                }
-                for (unsigned index = 1;
-                     index < instruction->getNumOperands(); ++index) {
-                    if (rootGlobal(instruction->getOperand(index)) ==
-                        matrix) {
-                        return true;
-                    }
-                }
-            }
+    GlobalMemoryEffects effects;
+    if (!analyzeGlobalMemoryEffects(matrix, effects) ||
+        !effects.loads.empty() || !effects.stores.empty()) {
+        return true;
+    }
+    for (auto* call : effects.calls) {
+        if (std::find(
+                allowedCalls.begin(), allowedCalls.end(), call) ==
+            allowedCalls.end()) {
+            return true;
         }
     }
     return false;
 }
 
 bool matrixIsValidLiveIn(
-    IR::Module* module, IR::GlobalVariable* matrix,
+    IR::GlobalVariable* matrix,
     IR::Function* caller,
     const std::vector<IR::Instruction*>& allowedCalls,
     IR::BasicBlock* loopPreheader) {
-    std::vector<IR::Instruction*> loads;
-    std::vector<IR::Instruction*> stores;
-    for (auto& function : module->getFunctions()) {
-        for (auto& block : function->getBlocks()) {
-            for (auto& instruction : block->getInstructions()) {
-                if (instruction->getOpcode() == Opc::LOAD &&
-                    instruction->getNumOperands() == 1 &&
-                    rootGlobal(instruction->getOperand(0)) == matrix) {
-                    loads.push_back(instruction.get());
-                }
-                if (instruction->getOpcode() == Opc::STORE &&
-                    instruction->getNumOperands() == 2 &&
-                    rootGlobal(instruction->getOperand(1)) == matrix) {
-                    stores.push_back(instruction.get());
-                }
-                if (instruction->getOpcode() != Opc::CALL) continue;
-                bool referencesMatrix = false;
-                for (unsigned index = 1;
-                     index < instruction->getNumOperands(); ++index) {
-                    if (rootGlobal(instruction->getOperand(index)) ==
-                        matrix) {
-                        referencesMatrix = true;
-                        break;
-                    }
-                }
-                if (referencesMatrix &&
-                    std::find(
-                        allowedCalls.begin(), allowedCalls.end(),
-                        instruction.get()) == allowedCalls.end()) {
-                    return false;
-                }
-            }
+    GlobalMemoryEffects effects;
+    if (!analyzeGlobalMemoryEffects(matrix, effects)) return false;
+    for (auto* call : effects.calls) {
+        if (std::find(
+                allowedCalls.begin(), allowedCalls.end(), call) ==
+            allowedCalls.end()) {
+            return false;
         }
     }
 
@@ -872,9 +806,10 @@ bool matrixIsValidLiveIn(
             }
         }
     }
-    std::vector<IR::Instruction*> directAccesses = loads;
+    std::vector<IR::Instruction*> directAccesses = effects.loads;
     directAccesses.insert(
-        directAccesses.end(), stores.begin(), stores.end());
+        directAccesses.end(),
+        effects.stores.begin(), effects.stores.end());
     for (auto* access : directAccesses) {
         if (access->getParent()->getParent() != caller ||
             reachable.count(access->getParent())) {
@@ -882,6 +817,21 @@ bool matrixIsValidLiveIn(
         }
     }
     return true;
+}
+
+bool matrixHasUnexpectedCallUse(
+    IR::GlobalVariable* matrix,
+    const std::vector<IR::Instruction*>& allowedCalls) {
+    GlobalMemoryEffects effects;
+    if (!analyzeGlobalMemoryEffects(matrix, effects)) return true;
+    for (auto* call : effects.calls) {
+        if (std::find(
+                allowedCalls.begin(), allowedCalls.end(), call) ==
+            allowedCalls.end()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 IR::BasicBlock* findUniqueLoopPreheader(
@@ -919,7 +869,7 @@ IR::Value* callArgument(
 }
 
 bool matchCallChain(
-    IR::Module* module, const AffineKernelSummary& kernel,
+    const AffineKernelSummary& kernel,
     const std::vector<IR::Instruction*>& calls,
     MatrixReductionPlan& plan) {
     if (calls.empty()) return false;
@@ -993,7 +943,7 @@ bool matchCallChain(
     IR::Instruction* finalReductionInitialization = nullptr;
     if (!loopPreheader ||
         !findFinalReduction(
-            module, caller, resultMatrix, size,
+            caller, resultMatrix, size,
             kernel.indexStart,
             kernel.indexStep,
             kernel.inclusiveUpperBound,
@@ -1008,14 +958,18 @@ bool matchCallChain(
         if (matrix == resultMatrix) continue;
         if (matrix == seedMatrix) {
             if (!matrixIsValidLiveIn(
-                    module, matrix, caller,
+                    matrix, caller,
                     orderedCalls, loopPreheader)) {
                 return false;
             }
         } else if (matrixHasUnexpectedAccess(
-                       module, matrix, orderedCalls)) {
+                       matrix, orderedCalls)) {
             return false;
         }
+    }
+    if (matrixHasUnexpectedCallUse(
+            coefficientMatrix, orderedCalls)) {
+        return false;
     }
 
     auto dominators = computeDominators(caller);
@@ -1068,7 +1022,7 @@ bool buildMatrixReductionPlan(
             (void)block;
             MatrixReductionPlan candidate;
             if (matchCallChain(
-                    module, kernel, blockCalls, candidate)) {
+                    kernel, blockCalls, candidate)) {
                 plans.push_back(std::move(candidate));
             }
         }
