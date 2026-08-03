@@ -560,8 +560,9 @@ bool findFinalReduction(
     const std::vector<IR::Instruction*>& allowedCalls,
     IR::BasicBlock* loopPreheader,
     IR::Instruction*& finalLoad,
-    IR::Instruction*& innerCompare,
-    IR::Value*& innerInduction) {
+    IR::BasicBlock*& reductionPreheader,
+    IR::BasicBlock*& reductionExit,
+    IR::Instruction*& reductionInitialization) {
     std::vector<IR::Instruction*> loads;
     std::vector<IR::Instruction*> stores;
     std::vector<IR::Instruction*> callsWithMatrix;
@@ -715,9 +716,74 @@ bool findFinalReduction(
         return false;
     }
 
+    auto* outerTerminator = outer.header
+        ? outer.header->getTerminator()
+        : nullptr;
+    auto* outerBodyEntry =
+        outerTerminator &&
+                outerTerminator->getOpcode() == Opc::COND_BR
+            ? dynamic_cast<IR::BasicBlock*>(
+                  outerTerminator->getOperand(1))
+            : nullptr;
+    auto* outerExit =
+        outerTerminator &&
+                outerTerminator->getOpcode() == Opc::COND_BR
+            ? dynamic_cast<IR::BasicBlock*>(
+                  outerTerminator->getOperand(2))
+            : nullptr;
+    if (!outerTerminator || !outerBodyEntry || !outerExit ||
+        !outer.body.count(outerBodyEntry) ||
+        outer.body.count(outerExit)) {
+        return false;
+    }
+
+    auto predecessors = buildPredecessors(caller);
+    IR::BasicBlock* outerPreheader = nullptr;
+    for (auto* predecessor : predecessors[outer.header]) {
+        if (outer.body.count(predecessor)) continue;
+        if (outerPreheader) return false;
+        outerPreheader = predecessor;
+    }
+    auto* preheaderTerminator = outerPreheader
+        ? outerPreheader->getTerminator()
+        : nullptr;
+    if (!preheaderTerminator ||
+        preheaderTerminator->getOpcode() != Opc::BR ||
+        preheaderTerminator->getNumOperands() != 1 ||
+        preheaderTerminator->getOperand(0) != outer.header ||
+        reduction.initializationStore->getParent() !=
+            outerPreheader) {
+        return false;
+    }
+
+    // The complete outer loop is bypassed after its scalar result is replaced
+    // by an explicit summary reduction.  Reject any observable operation or
+    // SSA value escaping that loop rather than relying on its current shape.
+    for (auto* block : outer.body) {
+        for (auto& owned : block->getInstructions()) {
+            auto* instruction = owned.get();
+            if (instruction->getOpcode() == Opc::CALL ||
+                (instruction->getOpcode() == Opc::STORE &&
+                 instruction != reduction.updateStore)) {
+                return false;
+            }
+            for (const auto& use : instruction->getUses()) {
+                auto* user =
+                    dynamic_cast<IR::Instruction*>(use.user);
+                if (!user || !outer.body.count(user->getParent())) {
+                    return false;
+                }
+            }
+        }
+    }
+    for (auto& instruction : outerExit->getInstructions()) {
+        if (instruction->getOpcode() == Opc::PHI) return false;
+    }
+
     finalLoad = loads[0];
-    innerCompare = inner.compare;
-    innerInduction = inner.induction;
+    reductionPreheader = outerPreheader;
+    reductionExit = outerExit;
+    reductionInitialization = reduction.initializationStore;
     return true;
 }
 
@@ -922,8 +988,9 @@ bool matchCallChain(
     auto* loopPreheader =
         findUniqueLoopPreheader(caller, callBlock);
     IR::Instruction* finalLoad = nullptr;
-    IR::Instruction* finalInnerCompare = nullptr;
-    IR::Value* finalInnerInduction = nullptr;
+    IR::BasicBlock* finalReductionPreheader = nullptr;
+    IR::BasicBlock* finalReductionExit = nullptr;
+    IR::Instruction* finalReductionInitialization = nullptr;
     if (!loopPreheader ||
         !findFinalReduction(
             module, caller, resultMatrix, size,
@@ -931,8 +998,9 @@ bool matchCallChain(
             kernel.indexStep,
             kernel.inclusiveUpperBound,
             orderedCalls, loopPreheader,
-            finalLoad, finalInnerCompare,
-            finalInnerInduction)) {
+            finalLoad, finalReductionPreheader,
+            finalReductionExit,
+            finalReductionInitialization)) {
         return false;
     }
 
@@ -962,8 +1030,10 @@ bool matchCallChain(
     plan.kernel = kernel;
     plan.caller = caller;
     plan.loopPreheader = loopPreheader;
-    plan.finalInnerCompare = finalInnerCompare;
-    plan.finalInnerInduction = finalInnerInduction;
+    plan.finalReductionPreheader = finalReductionPreheader;
+    plan.finalReductionExit = finalReductionExit;
+    plan.finalReductionInitialization =
+        finalReductionInitialization;
     plan.calls = std::move(orderedCalls);
     plan.seedMatrix = seedMatrix;
     plan.resultMatrix = resultMatrix;
@@ -975,7 +1045,8 @@ bool buildMatrixReductionPlan(
     IR::Module* module, MatrixReductionPlan& plan) {
     for (auto& function : module->getFunctions()) {
         if (function->getName() == "__opt_contract_row_sum" ||
-            function->getName() == "__opt_affine_row_summary") {
+            function->getName() == "__opt_affine_row_summary" ||
+            function->getName() == "__opt_reduction_summary_total") {
             return false;
         }
     }
