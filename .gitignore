@@ -8,6 +8,10 @@ cmake-build-release/
 # IDE files
 .vscode/
 .idea/
+.claude/
+.trae/
+.tare/
+.agents/
 *.swp
 *.swo
 *~
