@@ -60,11 +60,6 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
-    if (PASS_CALL(radixSortLowering)) {
-        constantFolding(mod);
-        deadCodeElimination(mod);
-    }
-
     if (PASS_CALL(redundantIterationElimination)) {
         constantFolding(mod);
         deadCodeElimination(mod);
@@ -123,6 +118,13 @@ void runO2(IR::Module* mod) {
     // ★ 暂时禁用用于诊断 SEGFAULT
     if (PASS_CALL(mem2reg)) {
         constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // Clean up short-range address and memory redundancies exposed by
+    // inlining and SSA construction.  This is a local, alias-checked
+    // transformation and does not infer or replace a source-level algorithm.
+    if (PASS_CALL(localMemoryAccessOptimization)) {
         deadCodeElimination(mod);
     }
 

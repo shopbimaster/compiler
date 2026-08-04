@@ -156,7 +156,7 @@ bool conditionalMatrixBlocking(IR::Module* mod);
 bool triangularCopyOptimization(IR::Module* mod);
 bool hoistRecursiveCallGuards(IR::Module* mod);
 bool matrixReductionContraction(IR::Module* mod);
-bool radixSortLowering(IR::Module* mod);
+bool localMemoryAccessOptimization(IR::Module* mod);
 bool redundantIterationElimination(IR::Module* mod);
 bool dynamicIdempotentLoopElimination(IR::Module* mod);
 bool recursiveMemoization(IR::Module* mod);
