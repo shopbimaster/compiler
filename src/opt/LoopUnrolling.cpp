@@ -235,6 +235,17 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     // 推导或使用预设迭代次数
     int tc = loop.tripCount;
     if (tc < 0) tc = inferTripCount(loop.header);
+    if (tc < 0) {
+        NaturalLoop naturalLoop;
+        naturalLoop.header = loop.header;
+        naturalLoop.latch = loop.latch;
+        naturalLoop.body = loop.body;
+        auto induction = analyzeLoopInduction(naturalLoop, func);
+        if (induction.tripCount > 0 &&
+            induction.tripCount <= 64) {
+            tc = static_cast<int>(induction.tripCount);
+        }
+    }
     loop.tripCount = tc;
     if (tc < 2 || tc > 64) return false;
 

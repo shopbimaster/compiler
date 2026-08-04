@@ -15,6 +15,100 @@
 namespace Opt {
 namespace {
 
+bool isDirectScalarSlot(IR::Value* value) {
+    auto* alloca = dynamic_cast<IR::Instruction*>(value);
+    if (!alloca ||
+        alloca->getOpcode() != IR::Instruction::Opcode::ALLOCA) {
+        return false;
+    }
+
+    for (const auto& use : value->getUses()) {
+        auto* user = dynamic_cast<IR::Instruction*>(use.user);
+        if (!user) return false;
+        if (user->getOpcode() == IR::Instruction::Opcode::LOAD) {
+            if (use.operandNo != 0) return false;
+            continue;
+        }
+        if (user->getOpcode() == IR::Instruction::Opcode::STORE) {
+            if (use.operandNo != 1) return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+IR::Value* findPreheaderInitialValue(const NaturalLoop& loop,
+                                     IR::Function* func,
+                                     IR::Value* slot) {
+    if (!isDirectScalarSlot(slot)) return nullptr;
+
+    auto predecessors = buildPredecessors(func);
+    auto predIt = predecessors.find(loop.header);
+    if (predIt == predecessors.end()) return nullptr;
+
+    IR::BasicBlock* preheader = nullptr;
+    for (auto* predecessor : predIt->second) {
+        if (loop.body.count(predecessor)) continue;
+        if (preheader && preheader != predecessor) return nullptr;
+        preheader = predecessor;
+    }
+    if (!preheader) return nullptr;
+
+    // The last direct store in the unique preheader is the value observed on
+    // every entry into the loop. Direct-only uses rule out hidden aliases.
+    IR::Value* initialValue = nullptr;
+    for (auto& owned : preheader->getInstructions()) {
+        auto* instruction = owned.get();
+        if (instruction->getOpcode() == IR::Instruction::Opcode::STORE &&
+            instruction->getOperand(1) == slot) {
+            initialValue = instruction->getOperand(0);
+        }
+    }
+    return initialValue;
+}
+
+IR::Value* matchLoopStep(const NaturalLoop& loop, IR::Value* slot) {
+    IR::Instruction* updateStore = nullptr;
+    for (auto* block : loop.body) {
+        for (auto& owned : block->getInstructions()) {
+            auto* instruction = owned.get();
+            if (instruction->getOpcode() != IR::Instruction::Opcode::STORE ||
+                instruction->getOperand(1) != slot) {
+                continue;
+            }
+            if (updateStore) return nullptr;
+            updateStore = instruction;
+        }
+    }
+    if (!updateStore) return nullptr;
+
+    auto* arithmetic = dynamic_cast<IR::Instruction*>(
+        updateStore->getOperand(0));
+    if (!arithmetic) return nullptr;
+
+    auto isSlotLoad = [slot](IR::Value* value) {
+        auto* load = dynamic_cast<IR::Instruction*>(value);
+        return load &&
+               load->getOpcode() == IR::Instruction::Opcode::LOAD &&
+               load->getOperand(0) == slot;
+    };
+
+    auto* op0 = arithmetic->getOperand(0);
+    auto* op1 = arithmetic->getOperand(1);
+    if (arithmetic->getOpcode() == IR::Instruction::Opcode::ADD) {
+        if (isSlotLoad(op0)) return op1;
+        if (isSlotLoad(op1)) return op0;
+    } else if (arithmetic->getOpcode() == IR::Instruction::Opcode::SUB &&
+               isSlotLoad(op0)) {
+        if (auto* constant = dynamic_cast<IR::ConstantInt*>(op1)) {
+            return IR::ConstantInt::get(IR::IntegerType::I32,
+                                        -constant->getValue());
+        }
+    }
+    return nullptr;
+}
+
 // ================================================================
 // 查找循环的归纳变量
 // 模式：循环头处的 LOAD → ADD → ICMP
@@ -76,43 +170,8 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
         // LOAD 模式：循环变量存储在 ALLOCA 中
         info.var = ivInst->getOperand(0);  // ALLOCA 指针
 
-        // 在循环体中找 STORE 到同一 ALLOCA 的 ADD/SUB 指令
-        for (auto* bb : loop.body) {
-            for (auto& inst : bb->getInstructions()) {
-                if (inst->getOpcode() == IR::Instruction::Opcode::STORE) {
-                    auto* storePtr = inst->getOperand(1);
-                    if (storePtr == info.var) {
-                        auto* storeVal = inst->getOperand(0);
-                        if (auto* arithInst = dynamic_cast<IR::Instruction*>(storeVal)) {
-                            if (arithInst->getOpcode() == IR::Instruction::Opcode::ADD) {
-                                auto* op0 = arithInst->getOperand(0);
-                                auto* op1 = arithInst->getOperand(1);
-                                if (op0 == ivVal) info.step = op1;
-                                else if (op1 == ivVal) info.step = op0;
-                            } else if (arithInst->getOpcode() == IR::Instruction::Opcode::SUB) {
-                                auto* op0 = arithInst->getOperand(0);
-                                auto* op1 = arithInst->getOperand(1);
-                                if (op0 == ivVal) {
-                                    if (auto* ci = dynamic_cast<IR::ConstantInt*>(op1)) {
-                                        info.step = IR::ConstantInt::get(
-                                            IR::IntegerType::I32, -ci->getValue());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // 也在 entry block 中找初始 STORE
-                if (bb == func->getEntryBlock()) {
-                    if (inst->getOpcode() == IR::Instruction::Opcode::STORE) {
-                        auto* storePtr = inst->getOperand(1);
-                        if (storePtr == info.var) {
-                            info.start = inst->getOperand(0);
-                        }
-                    }
-                }
-            }
-        }
+        info.step = matchLoopStep(loop, info.var);
+        info.start = findPreheaderInitialValue(loop, func, info.var);
     } else if (ivInst->getOpcode() == IR::Instruction::Opcode::ADD
                || ivInst->getOpcode() == IR::Instruction::Opcode::SUB) {
         // ADD/SUB 模式：循环变量是 ADD/SUB 的结果
@@ -148,14 +207,7 @@ InductionInfo analyzeInduction(const NaturalLoop& loop, IR::Function* func) {
         }
         if (!info.var) return info;
 
-        // 找初始值
-        for (auto& inst : func->getEntryBlock()->getInstructions()) {
-            if (inst->getOpcode() == IR::Instruction::Opcode::STORE) {
-                if (inst->getOperand(1) == info.var) {
-                    info.start = inst->getOperand(0);
-                }
-            }
-        }
+        info.start = findPreheaderInitialValue(loop, func, info.var);
     } else if (ivInst->getOpcode() == IR::Instruction::Opcode::PHI) {
         // PHI 模式：循环变量是 PHI 节点（Mem2Reg 后的形式）
         auto* phi = ivInst;
