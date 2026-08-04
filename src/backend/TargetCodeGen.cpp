@@ -228,6 +228,38 @@ void TargetCodeGen::detectLoopHeaders(IR::Function& func) {
     }
 }
 
+void TargetCodeGen::detectColdBlocks(IR::Function& func) {
+    // A1 冷热分离：保守起步，仅标记 RET 终止的非 entry 块为冷块。
+    // 这类块典型为早返回（if (err) return -1;）或错误路径，执行频率低。
+    // 将它们剥离到 .text.unlikely 段，让热路径在 .text 段内连续，改善 I-cache 局部性。
+    //
+    // 排除小函数（blocks.size() < 3）：小函数整体性强，分离反而增加跨段 j 开销。
+    // entry 块（i==0）不冷：它是函数入口，必然热。
+    coldBlocks.clear();
+
+    const char* off = std::getenv("COLD_SPLIT_OFF");
+    if (off && std::string(off) == "1") return;
+
+    const auto& blocks = func.getBlocks();
+    if (blocks.size() < 3) return;
+
+    using Opc = IR::Instruction::Opcode;
+    for (size_t i = 1; i < blocks.size(); ++i) {  // 跳过 entry（i==0）
+        auto* term = blocks[i]->getTerminator();
+        if (!term) continue;
+        if (term->getOpcode() == Opc::RET) {
+            coldBlocks.insert(blocks[i].get());
+        }
+    }
+
+    const char* dbg = std::getenv("DBG_COLD");
+    if (dbg && std::string(dbg) == "1" && !coldBlocks.empty()) {
+        std::cerr << "[DBG_COLD] " << func.getName() << ": ";
+        for (auto* bb : coldBlocks) std::cerr << bb->getName() << " ";
+        std::cerr << "\n";
+    }
+}
+
 void TargetCodeGen::emitFunction(IR::Function& func) {
     currentFunc = &func;
     promotedAllocas.clear();
@@ -235,6 +267,8 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
 
     // 检测循环头（用于后续对齐）
     detectLoopHeaders(func);
+    // 检测冷块（A1 冷热分离，用于两遍发射）
+    detectColdBlocks(func);
 
     // 先收集全局变量地址并分配 callee-saved 寄存器缓存（优先级高于 ALLOCA 提升）
     globalAddrCache.clear();
@@ -326,29 +360,58 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
 
     emitPrologue(func);
 
-    // Fall-through 优化：发射每个块前记录其物理下一个块，供 emitBr/emitCondBr
-    // 判断是否可省掉冗余 j。最后一个块之后紧接 func_exit 标签。
+    // ================================================================
+    // A1 冷热分离 + Fall-through 优化：两遍发射
+    // ================================================================
+    // 第一遍：热块到 .text（函数头 .p2align + .globl 已进入 .text 段）
+    // 第二遍：冷块到 .section .text.unlikely（若有冷块）
+    // .Lfunc_exit + epilogue 固定在热段末尾：热路径 `j .Lfunc_exit` 短距离；
+    // 冷块（早返回/错误路径）的 RET 也 `j .Lfunc_exit`（同函数内 j 寻址范围足够）。
+    //
+    // Fall-through：nextBB 只在当前段序列内有效。跨段时 nextBB=nullptr，
+    // emitBr/emitCondBr 自然发显式 j，正确性由 RISC-V j 同函数内寻址保证。
+    // 冷块内 PHI moves 在前驱（热块）末尾发射，写入寄存器不依赖段位置，安全。
     {
         auto& blocks = func.getBlocks();
-        for (size_t i = 0; i < blocks.size(); ++i) {
-            nextBB = (i + 1 < blocks.size()) ? blocks[i + 1].get() : nullptr;
-            nextIsExit = (i + 1 == blocks.size());
-            emitBasicBlock(*blocks[i]);
+        std::vector<IR::BasicBlock*> hotBlocks;
+        std::vector<IR::BasicBlock*> coldBlkList;
+        hotBlocks.reserve(blocks.size());
+        for (auto& bb : blocks) {
+            if (coldBlocks.count(bb.get())) coldBlkList.push_back(bb.get());
+            else hotBlocks.push_back(bb.get());
+        }
+
+        // 第一遍：热块
+        for (size_t i = 0; i < hotBlocks.size(); ++i) {
+            nextBB = (i + 1 < hotBlocks.size()) ? hotBlocks[i + 1] : nullptr;
+            // 最后热块后紧接 .Lfunc_exit（无论有无冷块，func_exit 始终在热段末尾）
+            nextIsExit = (i + 1 == hotBlocks.size());
+            emitBasicBlock(*hotBlocks[i]);
         }
         nextBB = nullptr;
         nextIsExit = false;
-    }
 
-    for (auto& bb : func.getBlocks()) {
-        (void)bb;
-    }
+        // ★ 使用 .L 前缀：func_exit 标签仅作本地跳转目标，不进入符号表。
+        // 若不带 .L（如 main_exit:），FPGA 链接器可能将其解析为全局符号，
+        // 与 sylib 运行时的 main_exit 函数冲突，导致程序退出时绕过 sylib
+        // 的输出处理（01_multiple_returns / 02_ret_in_block 回归根因）。
+        emitter.emitText(".L" + func.getName() + "_exit:");
+        emitEpilogue(func);
 
-    // ★ 使用 .L 前缀：func_exit 标签仅作本地跳转目标，不进入符号表。
-    // 若不带 .L（如 main_exit:），FPGA 链接器可能将其解析为全局符号，
-    // 与 sylib 运行时的 main_exit 函数冲突，导致程序退出时绕过 sylib
-    // 的输出处理（01_multiple_returns / 02_ret_in_block 回归根因）。
-    emitter.emitText(".L" + func.getName() + "_exit:");
-    emitEpilogue(func);
+        // 第二遍：冷块到 .text.unlikely
+        if (!coldBlkList.empty()) {
+            emitter.emitText("  .section .text.unlikely, \"ax\", @progbits");
+            for (size_t i = 0; i < coldBlkList.size(); ++i) {
+                nextBB = (i + 1 < coldBlkList.size()) ? coldBlkList[i + 1] : nullptr;
+                nextIsExit = false;  // 冷块后不接 func_exit（已在热段末尾）
+                emitBasicBlock(*coldBlkList[i]);
+            }
+            nextBB = nullptr;
+            nextIsExit = false;
+            // 切回 .text 段，保证后续函数的 .p2align/.globl 落在 .text
+            emitter.emitText("  .text");
+        }
+    }
 
     currentFunc = nullptr;
     vregStackOffset.clear();

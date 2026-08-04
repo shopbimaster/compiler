@@ -82,6 +82,12 @@ private:
     std::unordered_set<IR::BasicBlock*> loopHeaders;
     void detectLoopHeaders(IR::Function& func);
 
+    // A1 冷热分离：将冷块（RET 终止的非 entry 块，如早返回/错误路径）
+    // 剥离到 .text.unlikely 段，让热路径聚集在 .text 段改善 I-cache 局部性。
+    // 开关：COLD_SPLIT_OFF=1 回退单段；DBG_COLD=1 打印冷块列表
+    std::unordered_set<IR::BasicBlock*> coldBlocks;
+    void detectColdBlocks(IR::Function& func);
+
     // PHI 消除：直接在前驱块中插入寄存器拷贝，避免通过内存传递
     // 使用 (前驱, 后继) 边作为键，确保 COND_BR 的不同分支只发射各自的 PHI moves
     struct PhiMove {

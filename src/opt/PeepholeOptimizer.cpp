@@ -658,6 +658,17 @@ std::string peepholeOptimize(const std::string& asmCode) {
                 while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
                 if (p >= line.size() || line[p] == '#' || line[p] == '.') {
                     compact.push_back(line);
+                    // ★ A1 冷热分离：段切换行（.section）是物理边界，跨段寄存器值
+                    //   不可复用——不同段在最终二进制中可能相距很远（中间有其他函数），
+                    //   寄存器值在段切换后必然失效。clear LVN 跟踪避免跨段误消除。
+                    //   典型：热段末尾 ld t0; .section .text.unlikely; 冷段用 t0 → 不可复用。
+                    if (p < line.size() && line[p] == '.') {
+                        std::string rest = line.substr(p);
+                        if (rest.size() >= 8 && rest.substr(0, 8) == ".section") {
+                            lastSeen.clear();
+                            regLastWritten.clear();
+                        }
+                    }
                     continue;
                 }
                 std::string opName = extractOpName(line);
