@@ -1,4 +1,5 @@
 #include "opt/MemoryAccessAnalysis.h"
+#include "opt/Optimizer.h"
 
 #include <unordered_set>
 
@@ -10,6 +11,18 @@ using Opc = IR::Instruction::Opcode;
 bool isConstant(IR::Value* value, int64_t expected) {
     auto* constant = dynamic_cast<IR::ConstantInt*>(value);
     return constant && constant->getValue() == expected;
+}
+
+bool instructionPrecedes(
+    IR::Instruction* first, IR::Instruction* second) {
+    if (!first || !second || first->getParent() != second->getParent()) {
+        return false;
+    }
+    for (auto& owned : first->getParent()->getInstructions()) {
+        if (owned.get() == first) return true;
+        if (owned.get() == second) return false;
+    }
+    return false;
 }
 
 bool collectPointerAccessImpl(
@@ -72,18 +85,63 @@ bool collectPointerAccessImpl(
 
 AllocaArgumentMap buildAllocaArgumentMap(IR::Function* function) {
     AllocaArgumentMap result;
+    if (!function || function->isExternal()) return result;
+    auto dominators = computeDominators(function);
+
     for (auto& block : function->getBlocks()) {
-        for (auto& instruction : block->getInstructions()) {
-            if (instruction->getOpcode() != Opc::STORE ||
-                instruction->getNumOperands() != 2) {
-                continue;
+        for (auto& owned : block->getInstructions()) {
+            auto* alloca = owned.get();
+            if (alloca->getOpcode() != Opc::ALLOCA) continue;
+
+            IR::Argument* argument = nullptr;
+            IR::Instruction* initialization = nullptr;
+            std::vector<IR::Instruction*> loads;
+            bool valid = true;
+            for (const auto& use : alloca->getUses()) {
+                auto* instruction =
+                    dynamic_cast<IR::Instruction*>(use.user);
+                if (!instruction) {
+                    valid = false;
+                    break;
+                }
+                if (instruction->getOpcode() == Opc::STORE &&
+                    instruction->getNumOperands() == 2 &&
+                    use.operandNo == 1) {
+                    auto* storedArgument =
+                        dynamic_cast<IR::Argument*>(
+                            instruction->getOperand(0));
+                    if (initialization || !storedArgument) {
+                        valid = false;
+                        break;
+                    }
+                    initialization = instruction;
+                    argument = storedArgument;
+                    continue;
+                }
+                if (instruction->getOpcode() == Opc::LOAD &&
+                    instruction->getNumOperands() == 1 &&
+                    use.operandNo == 0) {
+                    loads.push_back(instruction);
+                    continue;
+                }
+                valid = false;
+                break;
             }
-            auto* argument =
-                dynamic_cast<IR::Argument*>(instruction->getOperand(0));
-            auto* alloca =
-                dynamic_cast<IR::Instruction*>(instruction->getOperand(1));
-            if (argument && alloca &&
-                alloca->getOpcode() == Opc::ALLOCA) {
+            if (!valid || !initialization || !argument) continue;
+
+            for (auto* load : loads) {
+                if (load->getParent() == initialization->getParent()) {
+                    if (!instructionPrecedes(initialization, load)) {
+                        valid = false;
+                        break;
+                    }
+                } else if (!dominators[load->getParent()].count(
+                               initialization->getParent())) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid) {
                 result[alloca] = argument;
             }
         }
