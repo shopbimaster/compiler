@@ -180,6 +180,31 @@ int latencyOf(const AsmInst& a) {
     return 1;
 }
 
+// ================================================================
+// C1-a: PostRA 寄存器压力感知调度
+// ----------------------------------------------------------------
+// 在列表调度优先级中加入"杀死优先"启发式：预计算每个寄存器在块内的最后出现位置
+// （regLastSeen），调度时跟踪当前活跃寄存器集合（live）。当 live.size ≥ 阈值
+// （高压力）时，用"调度该指令能释放的寄存器数"打破 height 平局——优先调度其
+// def/use 是某寄存器最后出现的指令，缩短活跃窗口，减小 BOOM ROB=16 的占用。
+//
+// 安全：post-RA 仅重排已分配寄存器的指令，不改分配结果。spill 槽访问含 sp 已被
+// parseInst 标 schedulable=false 保护。tie-break 链 (height, highP? release : 0,
+// origIdx) 为全序，origIdx（指令原始下标）保决定性。
+//
+// 开关：SCHED_PRESSURE_OFF=1 回退原 scheduleBlock；SCHED_PRESSURE_THRESH=N（默认 10）
+// ================================================================
+static const bool pressureOff = [] {
+    const char* v = std::getenv("SCHED_PRESSURE_OFF");
+    return v && std::string(v) == "1";
+}();
+
+static const int pressureThresh = [] {
+    const char* v = std::getenv("SCHED_PRESSURE_THRESH");
+    if (v) { int t = std::atoi(v); if (t > 0) return t; }
+    return 10;  // BOOM INT_REGS 16 个，10 算高压力
+}();
+
 // 对一个"可调度块"（全部 schedulable 的连续指令）做延迟感知列表调度。
 // 返回新顺序的下标；若不变返回空表示无需重排。
 std::vector<int> scheduleBlock(const std::vector<AsmInst>& blk) {
@@ -233,19 +258,63 @@ std::vector<int> scheduleBlock(const std::vector<AsmInst>& blk) {
     };
     for (int i = 0; i < n; ++i) H(i);
 
+    // C1-a: 预计算每个寄存器在块内的最后出现位置 + 每条指令的释放分（压力感知用）
+    // regLastSeen[r] = 寄存器 r 在块内最后一次出现（def 或 use）的指令下标
+    // release[i] = 调度指令 i 能"杀死"的寄存器数（i 的 def/use 中 regLastSeen==i 的个数）
+    std::unordered_map<std::string, int> regLastSeen;
+    std::vector<int> release(n, 0);
+    if (!pressureOff) {
+        for (int i = 0; i < n; ++i) {
+            for (auto& d : blk[i].defs) regLastSeen[d] = i;
+            for (auto& u : blk[i].uses) regLastSeen[u] = i;
+        }
+        for (int i = 0; i < n; ++i) {
+            for (auto& d : blk[i].defs) if (regLastSeen[d] == i) ++release[i];
+            for (auto& u : blk[i].uses) if (regLastSeen[u] == i) ++release[i];
+        }
+    }
+
     // 列表调度
+    // 优先级链（全序，保决定性）：
+    //   (height, highP ? release : 0, origIdx)
+    //   - height：关键路径高度（延迟感知，原逻辑）
+    //   - release：高压力时打破 height 平局，优先释放寄存器（C1-a 新增）
+    //   - origIdx：指令原始下标，最终 tie-break 保决定性
     std::vector<int> deg = indeg, ready, out;
     for (int i = 0; i < n; ++i) if (deg[i] == 0) ready.push_back(i);
     out.reserve(n);
+    std::unordered_set<std::string> live;  // C1-a: 当前活跃寄存器集合
     while (!ready.empty()) {
         int best = 0;
+        bool highP = !pressureOff && (int)live.size() >= pressureThresh;
         for (int i = 1; i < (int)ready.size(); ++i) {
             int a = ready[i], b = ready[best];
-            if (height[a] > height[b] || (height[a] == height[b] && a < b)) best = i;
+            bool better;
+            if (height[a] != height[b]) {
+                better = height[a] > height[b];
+            } else if (highP) {
+                // 高压力：用释放分打破平局，再 origIdx
+                if (release[a] != release[b]) better = release[a] > release[b];
+                else better = a < b;
+            } else {
+                better = a < b;  // origIdx 全序 tie-break（pressureOff 时等价原逻辑）
+            }
+            if (better) best = i;
         }
         int u = ready[best];
         ready.erase(ready.begin() + best);
         out.push_back(u);
+        // C1-a: 更新 live 集合——def 入 live（若该 def 是最后出现则立即移除），
+        //       use 若是最后出现则移除（寄存器死亡）
+        if (!pressureOff) {
+            for (auto& d : blk[u].defs) {
+                live.insert(d);
+                if (regLastSeen[d] == u) live.erase(d);
+            }
+            for (auto& use : blk[u].uses) {
+                if (regLastSeen[use] == u) live.erase(use);
+            }
+        }
         for (int w : succ[u]) if (--deg[w] == 0) ready.push_back(w);
     }
     if ((int)out.size() != n) return {};   // 兜底
