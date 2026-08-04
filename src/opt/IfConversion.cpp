@@ -16,6 +16,8 @@
 #include "opt/Optimizer.h"
 #include <vector>
 #include <unordered_set>
+#include <cstdlib>
+#include <iostream>
 
 namespace Opt {
 namespace {
@@ -33,6 +35,168 @@ bool isSafeToSpeculate(IR::Instruction* inst) {
     return true;
 }
 
+// ================================================================
+// D2: 双路菱形 IfConversion 辅助
+// ================================================================
+
+// 把 src 块的非 terminator/非 PHI 指令移动到 dst 块的 terminator 之前。
+// 所有权转移：unique_ptr.release() 交出裸指针，src.erase 销毁空 unique_ptr，
+// dst.insert 重新接管所有权（参考 InlineExpansion 的 release 模式）。
+void moveInstsBefore(IR::BasicBlock* src, IR::BasicBlock* dst) {
+    using Opc = IR::Instruction::Opcode;
+    std::vector<IR::Instruction*> toMove;
+    for (auto& inst : src->getInstructions()) {
+        auto op = inst->getOpcode();
+        if (op == Opc::BR || op == Opc::COND_BR || op == Opc::PHI) continue;
+        toMove.push_back(inst.get());
+    }
+    for (auto* inst : toMove) {
+        for (auto it = src->begin(); it != src->end(); ++it) {
+            if (it->get() == inst) {
+                it->release();          // 释放所有权给裸指针 inst
+                src->erase(it);         // 销毁 null unique_ptr（无害）
+                break;
+            }
+        }
+        // 插入到 dst 的 terminator 之前（重新接管所有权）
+        auto termIt = dst->end();
+        --termIt;
+        dst->insert(termIt, inst);
+    }
+}
+
+// D2: 双路菱形 IfConversion
+//   pred: cond ? thenBB : elseBB
+//   thenBB/elseBB 均单前驱(pred)单后继，且汇合到同一 mergeBB
+//   mergeBB 前驱恰好 {thenBB, elseBB}
+// 转换：上提两路算术到 pred，每个 PHI → select(cond, vThen, vElse)，
+//       pred 的 COND_BR 改为 BR(mergeBB)，then/else 失去前驱变不可达（SimplifyCFG 清理）。
+// 返回 true 表示完成一次转换（调用方应循环直到不动点）。
+bool convertDualPathDiamond(IR::Function* fn) {
+    using Opc = IR::Instruction::Opcode;
+    auto preds = buildPredecessors(fn);
+    auto succs = buildSuccessors(fn);
+
+    for (auto& bb : fn->getBlocks()) {
+        auto* pred = bb.get();
+        auto* predBr = pred->getTerminator();
+        if (!predBr || predBr->getOpcode() != Opc::COND_BR) continue;
+
+        auto* thenBB = dynamic_cast<IR::BasicBlock*>(predBr->getOperand(1));
+        auto* elseBB = dynamic_cast<IR::BasicBlock*>(predBr->getOperand(2));
+        if (!thenBB || !elseBB || thenBB == elseBB) continue;
+
+        // 两路均单前驱(pred)单后继，且后继相同(mergeBB)
+        if (preds[thenBB].size() != 1 || preds[thenBB][0] != pred) continue;
+        if (preds[elseBB].size() != 1 || preds[elseBB][0] != pred) continue;
+        if (succs[thenBB].size() != 1 || succs[elseBB].size() != 1) continue;
+        auto* mergeBB = succs[thenBB][0];
+        if (succs[elseBB][0] != mergeBB) continue;
+        if (mergeBB == pred || mergeBB == thenBB || mergeBB == elseBB) continue;
+
+        // mergeBB 前驱恰好 {thenBB, elseBB}（无其他前驱，PHI 才能健全替换）
+        auto& mergePreds = preds[mergeBB];
+        if (mergePreds.size() != 2) continue;
+        bool mergeOk = (mergePreds[0] == thenBB && mergePreds[1] == elseBB) ||
+                       (mergePreds[0] == elseBB && mergePreds[1] == thenBB);
+        if (!mergeOk) continue;
+
+        // cond 单 use（仅在 COND_BR 中）
+        auto* cond = predBr->getOperand(0);
+        if (cond->getNumUses() != 1) continue;
+
+        // thenBB/elseBB 各 ≤2 条 safe-to-speculate 算术，且不含浮点 def
+        auto checkBlock = [](IR::BasicBlock* b, int& cnt, bool& hasFloat) -> bool {
+            cnt = 0; hasFloat = false;
+            for (auto& inst : b->getInstructions()) {
+                auto op = inst->getOpcode();
+                if (op == Opc::BR || op == Opc::COND_BR || op == Opc::PHI) continue;
+                if (!isSafeToSpeculate(inst.get())) return false;
+                if (inst->getType() && inst->getType()->isFloat()) hasFloat = true;
+                cnt++;
+            }
+            return true;
+        };
+        int thenN = 0, elseN = 0;
+        bool thenFloat = false, elseFloat = false;
+        if (!checkBlock(thenBB, thenN, thenFloat) || thenN > 2) continue;
+        if (!checkBlock(elseBB, elseN, elseFloat) || elseN > 2) continue;
+        if (thenFloat || elseFloat) continue;  // 第一版排除浮点（emitSelect 浮点 fallback 风险）
+
+        // mergeBB 所有 PHI 必须可转换：有 then+else 条目且非浮点。
+        // 若有任一浮点 PHI 或缺前驱条目的 PHI，跳过整个菱形（避免悬空 PHI 条目）。
+        std::vector<IR::Instruction*> targetPhis;
+        bool allConvertible = true;
+        for (auto& inst : mergeBB->getInstructions()) {
+            if (inst->getOpcode() != Opc::PHI) continue;  // PHI 不必在块首，扫描全部
+            if (inst->getType() && inst->getType()->isFloat()) { allConvertible = false; break; }
+            IR::Value* vThen = nullptr;
+            IR::Value* vElse = nullptr;
+            for (unsigned i = 0; i + 1 < inst->getNumOperands(); i += 2) {
+                auto* b = dynamic_cast<IR::BasicBlock*>(inst->getOperand(i + 1));
+                if (b == thenBB) vThen = inst->getOperand(i);
+                if (b == elseBB) vElse = inst->getOperand(i);
+            }
+            if (!vThen || !vElse) { allConvertible = false; break; }
+            targetPhis.push_back(inst.get());
+        }
+        if (!allConvertible || targetPhis.empty()) continue;
+
+        // ★ 执行转换
+        // 1. 上提 thenBB/elseBB 的算术指令到 pred 的 COND_BR 之前
+        //    SSA 保证两路 def 互不冲突（互斥路径），且不 def cond（cond 在 pred 之前 def）
+        moveInstsBefore(thenBB, pred);
+        moveInstsBefore(elseBB, pred);
+
+        // 2. 为每个目标 PHI 创建 select(cond, vThen, vElse)，替换 PHI
+        for (auto* phi : targetPhis) {
+            IR::Value* vThen = nullptr;
+            IR::Value* vElse = nullptr;
+            for (unsigned i = 0; i + 1 < phi->getNumOperands(); i += 2) {
+                auto* b = dynamic_cast<IR::BasicBlock*>(phi->getOperand(i + 1));
+                if (b == thenBB) vThen = phi->getOperand(i);
+                if (b == elseBB) vElse = phi->getOperand(i);
+            }
+            static int selCnt = 0;
+            std::string selName = "%ifconv.d" + std::to_string(selCnt++);
+            auto* select = IR::Instruction::createSelect(cond, vThen, vElse, selName);
+            auto termIt = pred->end();
+            --termIt;
+            pred->insert(termIt, select);
+            phi->replaceAllUsesWith(select);
+        }
+
+        // 3. 删除被替换的 PHI（use 已为 0，erase 触发 ~User::dropAllUses 清理 use-list）
+        for (auto* phi : targetPhis) {
+            for (auto it = mergeBB->begin(); it != mergeBB->end(); ++it) {
+                if (it->get() == phi) {
+                    mergeBB->erase(it);  // unique_ptr 析构 delete PHI
+                    break;
+                }
+            }
+        }
+
+        // 4. CFG 重写：pred 的 COND_BR → BR(mergeBB)
+        //    直接 erase（unique_ptr delete COND_BR，dropAllUses 移除对 cond/then/else 的 use）
+        for (auto it = pred->begin(); it != pred->end(); ++it) {
+            if (it->get() == predBr) {
+                pred->erase(it);
+                break;
+            }
+        }
+        pred->pushBack(IR::Instruction::createBr(mergeBB));
+
+        const char* dbg = std::getenv("DBG_IFCONV");
+        if (dbg && std::string(dbg) == "1") {
+            std::cerr << "[DBG_IFCONV] dual-path diamond at " << pred->getName()
+                      << " (then=" << thenBB->getName() << ", else=" << elseBB->getName()
+                      << ", merge=" << mergeBB->getName() << ")\n";
+        }
+        return true;  // 完成一次转换，调用方重新扫描到不动点
+    }
+    return false;
+}
+
 } // anonymous namespace
 
 bool ifConversion(IR::Module* mod) {
@@ -40,6 +204,19 @@ bool ifConversion(IR::Module* mod) {
 
     for (auto& fn : mod->getFunctions()) {
         if (fn->isExternal()) continue;
+
+        // D2: 双路菱形 IfConversion（先于单路执行——单路只处理三角形 pred→curr→succ+pred→succ，
+        // 无法处理菱形 pred→then→merge + pred→else→merge）。循环到不动点处理级联。
+        // 开关 IFCONV_EXT_OFF=1 禁用双路（保留单路）；DBG_IFCONV=1 打印生效点。
+        {
+            const char* extOff = std::getenv("IFCONV_EXT_OFF");
+            bool extDisabled = extOff && std::string(extOff) == "1";
+            if (!extDisabled) {
+                while (convertDualPathDiamond(fn.get())) {
+                    changed = true;
+                }
+            }
+        }
 
         auto preds = buildPredecessors(fn.get());
         auto succs = buildSuccessors(fn.get());
