@@ -1,14 +1,8 @@
-// ================================================================
-// src/opt/RadixSortLowering.cpp — 基数排序模式 → 原生位提取 lowering
-// ----------------------------------------------------------------
-// 所属模块：opt（O2 结构化变换）
-// 关键依赖：opt/Optimizer.h
-// ================================================================
-
 #include "opt/Optimizer.h"
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -21,37 +15,35 @@ namespace {
 using Opc = IR::Instruction::Opcode;
 using ArgumentSlots = std::unordered_map<IR::Value*, IR::Argument*>;
 
-constexpr int kRadixBits = 10;
-constexpr int kRadixSize = 1 << kRadixBits;
-constexpr int kRadixMask = kRadixSize - 1;
+constexpr int kImplementationRadixBits = 10;
+constexpr int kImplementationRadixSize = 1 << kImplementationRadixBits;
+constexpr int kImplementationRadixMask = kImplementationRadixSize - 1;
 
-struct DigitMatch {
+struct DigitProof {
+    IR::Function* function = nullptr;
     int radix = 0;
     unsigned bitsPerDigit = 0;
+    IR::Instruction* numberSlot = nullptr;
+    IR::Instruction* roundSlot = nullptr;
+    IR::Instruction* inductionSlot = nullptr;
 };
 
-struct RadixMatch {
+struct RadixProof {
     IR::Function* sortFunction = nullptr;
     IR::Function* digitFunction = nullptr;
     std::vector<IR::Instruction*> externalCalls;
     IR::ArrayType* dataType = nullptr;
+    IR::Instruction* countArray = nullptr;
+    IR::Instruction* headArray = nullptr;
+    IR::Instruction* tailArray = nullptr;
+    int sourceRadix = 0;
     unsigned bitsPerDigit = 0;
+    unsigned minimumFullRound = 0;
 };
 
 bool isConstant(IR::Value* value, int64_t expected) {
     auto* constant = dynamic_cast<IR::ConstantInt*>(value);
     return constant && constant->getValue() == expected;
-}
-
-bool hasConstantOperand(IR::Instruction* instruction, int64_t expected) {
-    if (!instruction) return false;
-    for (unsigned index = 0;
-         index < instruction->getNumOperands(); ++index) {
-        if (isConstant(instruction->getOperand(index), expected)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool isPowerOfTwo(int64_t value) {
@@ -65,6 +57,102 @@ unsigned exactLog2(int64_t value) {
         ++bits;
     }
     return bits;
+}
+
+// 前置声明，定义见后
+IR::Argument* rootArgument(
+    IR::Value* value, const ArgumentSlots& slots);
+
+IR::Instruction* loadedSlot(IR::Value* value) {
+    auto* load = dynamic_cast<IR::Instruction*>(value);
+    if (!load || load->getOpcode() != Opc::LOAD ||
+        load->getNumOperands() != 1) {
+        return nullptr;
+    }
+    auto* slot = dynamic_cast<IR::Instruction*>(load->getOperand(0));
+    return slot && slot->getOpcode() == Opc::ALLOCA ? slot : nullptr;
+}
+
+bool sameValueOrSlotLoad(IR::Value* left, IR::Value* right) {
+    if (left == right) return true;
+    auto* leftSlot = loadedSlot(left);
+    auto* rightSlot = loadedSlot(right);
+    return leftSlot && leftSlot == rightSlot;
+}
+
+// Prove that the guard terminates only after the least-significant digit.
+bool provesExhaustedRoundGuard(
+    IR::Instruction* icmp, IR::Function* function,
+    const ArgumentSlots& slots) {
+    if (icmp->getOpcode() != Opc::ICMP || icmp->getNumOperands() != 2)
+        return false;
+    const auto& name = icmp->getName();
+    auto* leftArg = rootArgument(icmp->getOperand(0), slots);
+    auto* rightArg = rootArgument(icmp->getOperand(1), slots);
+    auto* round = function->getArg(0);
+    if (name == "eq") {
+        return (leftArg == round && isConstant(icmp->getOperand(1), -1)) ||
+               (rightArg == round && isConstant(icmp->getOperand(0), -1));
+    }
+    if (name == "slt")
+        return leftArg == round && isConstant(icmp->getOperand(1), 0);
+    if (name == "sgt")
+        return rightArg == round && isConstant(icmp->getOperand(0), 0);
+    if (name == "sle")
+        return leftArg == round && isConstant(icmp->getOperand(1), -1);
+    if (name == "sge")
+        return rightArg == round && isConstant(icmp->getOperand(0), -1);
+    return false;
+}
+
+// Prove the trivial-range condition left + 1 >= right.
+bool provesTrivialRangeGuard(
+    IR::Instruction* icmp, IR::Function* function,
+    const ArgumentSlots& slots) {
+    if (icmp->getOpcode() != Opc::ICMP || icmp->getNumOperands() != 2)
+        return false;
+    auto* left = function->getArg(2);
+    auto* right = function->getArg(3);
+    auto* lhs = icmp->getOperand(0);
+    auto* rhs = icmp->getOperand(1);
+    auto isLeftPlusOne = [&](IR::Value* value) {
+        auto* add = dynamic_cast<IR::Instruction*>(value);
+        if (!add || add->getOpcode() != Opc::ADD ||
+            add->getNumOperands() != 2) {
+            return false;
+        }
+        return (rootArgument(add->getOperand(0), slots) == left &&
+                isConstant(add->getOperand(1), 1)) ||
+               (rootArgument(add->getOperand(1), slots) == left &&
+                isConstant(add->getOperand(0), 1));
+    };
+    if (icmp->getName() == "sge" &&
+        rootArgument(rhs, slots) == right) {
+        return isLeftPlusOne(lhs);
+    }
+    if (icmp->getName() == "sle" &&
+        rootArgument(lhs, slots) == right) {
+        return isLeftPlusOne(rhs);
+    }
+    return false;
+}
+
+// A recursive digit step must move to the immediately preceding digit.
+bool provesPreviousRound(
+    IR::Instruction* instruction, IR::Argument* roundArg,
+    const ArgumentSlots& slots) {
+    if (!instruction || instruction->getNumOperands() != 2) return false;
+    if (rootArgument(instruction->getOperand(0), slots) != roundArg)
+        return false;
+
+    auto* constOp =
+        dynamic_cast<IR::ConstantInt*>(instruction->getOperand(1));
+    if (!constOp) return false;
+
+    return (instruction->getOpcode() == Opc::SUB &&
+            constOp->getValue() == 1) ||
+           (instruction->getOpcode() == Opc::ADD &&
+            constOp->getValue() == -1);
 }
 
 IR::Function* calledFunction(IR::Instruction* instruction) {
@@ -168,6 +256,128 @@ IR::Instruction* rootAlloca(IR::Value* value) {
     return rootAllocaImpl(value, visiting);
 }
 
+struct ArrayElementAccess {
+    IR::Instruction* array = nullptr;
+    IR::Value* index = nullptr;
+    IR::Instruction* gep = nullptr;
+};
+
+std::optional<ArrayElementAccess> arrayElementPointer(IR::Value* value) {
+    auto* gep = dynamic_cast<IR::Instruction*>(value);
+    if (!gep || gep->getOpcode() != Opc::GETELEMENTPTR ||
+        gep->getNumOperands() < 2) {
+        return std::nullopt;
+    }
+    auto* array = rootAlloca(gep->getOperand(0));
+    if (!array) return std::nullopt;
+    return ArrayElementAccess{
+        array, gep->getOperand(gep->getNumOperands() - 1), gep};
+}
+
+std::optional<ArrayElementAccess> loadedArrayElement(IR::Value* value) {
+    auto* load = dynamic_cast<IR::Instruction*>(value);
+    if (!load || load->getOpcode() != Opc::LOAD ||
+        load->getNumOperands() != 1) {
+        return std::nullopt;
+    }
+    return arrayElementPointer(load->getOperand(0));
+}
+
+bool isDigitCall(
+    IR::Value* value, IR::Function* digitFunction,
+    IR::Argument* roundArgument, IR::Argument* dataArgument,
+    const ArgumentSlots& slots, IR::Instruction** indexSlot = nullptr) {
+    auto* call = dynamic_cast<IR::Instruction*>(value);
+    if (!call || calledFunction(call) != digitFunction ||
+        call->getNumOperands() != 3 ||
+        rootArgument(call->getOperand(2), slots) != roundArgument) {
+        return false;
+    }
+
+    auto* number = dynamic_cast<IR::Instruction*>(call->getOperand(1));
+    if (!number || number->getOpcode() != Opc::LOAD ||
+        number->getNumOperands() != 1) {
+        return false;
+    }
+    auto* address = dynamic_cast<IR::Instruction*>(number->getOperand(0));
+    if (!address || address->getOpcode() != Opc::GETELEMENTPTR ||
+        address->getNumOperands() < 2 ||
+        rootArgument(address->getOperand(0), slots) != dataArgument) {
+        return false;
+    }
+    auto* slot = loadedSlot(
+        address->getOperand(address->getNumOperands() - 1));
+    if (!slot) return false;
+    if (indexSlot) *indexSlot = slot;
+    return true;
+}
+
+bool hasSlotInitialization(
+    IR::Function* function, IR::Instruction* slot,
+    IR::Value* expected, const ArgumentSlots& slots) {
+    for (auto& block : function->getBlocks()) {
+        for (auto& owned : block->getInstructions()) {
+            auto* instruction = owned.get();
+            if (instruction->getOpcode() != Opc::STORE ||
+                instruction->getNumOperands() != 2 ||
+                instruction->getOperand(1) != slot) {
+                continue;
+            }
+            if (instruction->getOperand(0) == expected ||
+                (dynamic_cast<IR::Argument*>(expected) &&
+                 rootArgument(instruction->getOperand(0), slots) == expected)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool provesSlotIncrementInBlock(
+    IR::BasicBlock* block, IR::Instruction* slot) {
+    if (!block || !slot) return false;
+    for (auto& owned : block->getInstructions()) {
+        auto* instruction = owned.get();
+        if (instruction->getOpcode() != Opc::STORE ||
+            instruction->getNumOperands() != 2 ||
+            instruction->getOperand(1) != slot) {
+            continue;
+        }
+        auto* add = dynamic_cast<IR::Instruction*>(instruction->getOperand(0));
+        if (!add || add->getOpcode() != Opc::ADD ||
+            add->getNumOperands() != 2) {
+            continue;
+        }
+        if ((loadedSlot(add->getOperand(0)) == slot &&
+             isConstant(add->getOperand(1), 1)) ||
+            (loadedSlot(add->getOperand(1)) == slot &&
+             isConstant(add->getOperand(0), 1))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool provesSlotUpperBound(
+    IR::Function* function, IR::Instruction* slot,
+    IR::Value* bound, const ArgumentSlots& slots) {
+    for (auto& block : function->getBlocks()) {
+        for (auto& owned : block->getInstructions()) {
+            auto* compare = owned.get();
+            if (compare->getOpcode() != Opc::ICMP ||
+                compare->getName() != "slt" ||
+                compare->getNumOperands() != 2) {
+                continue;
+            }
+            bool leftIsSlot = loadedSlot(compare->getOperand(0)) == slot;
+            bool rightIsBound = compare->getOperand(1) == bound ||
+                rootArgument(compare->getOperand(1), slots) == bound;
+            if (leftIsSlot && rightIsBound) return true;
+        }
+    }
+    return false;
+}
+
 IR::GlobalVariable* exactGlobalArrayBase(IR::Value* value) {
     auto* gep = dynamic_cast<IR::Instruction*>(value);
     if (!gep || gep->getOpcode() != Opc::GETELEMENTPTR ||
@@ -201,8 +411,21 @@ std::vector<IR::Instruction*> collectCalls(
     return calls;
 }
 
-bool matchDigitFunction(
-    IR::Function* function, DigitMatch& match) {
+bool branchTargets(IR::Instruction* terminator, IR::BasicBlock* target) {
+    if (!terminator || !target) return false;
+    if (terminator->getOpcode() != Opc::BR &&
+        terminator->getOpcode() != Opc::COND_BR) {
+        return false;
+    }
+    for (unsigned index = 0;
+         index < terminator->getNumOperands(); ++index) {
+        if (terminator->getOperand(index) == target) return true;
+    }
+    return false;
+}
+
+bool proveDigitFunction(
+    IR::Function* function, DigitProof& proof) {
     if (!function || function->isExternal() ||
         function->getNumArgs() != 2) {
         return false;
@@ -220,6 +443,8 @@ bool matchDigitFunction(
     IR::Instruction* division = nullptr;
     IR::Instruction* remainder = nullptr;
     IR::Instruction* returned = nullptr;
+    IR::Instruction* inductionSlot = nullptr;
+    IR::Instruction* loopCompare = nullptr;
     unsigned loopCompares = 0;
     unsigned calls = 0;
 
@@ -237,12 +462,17 @@ bool matchDigitFunction(
                 break;
             case Opc::ICMP:
                 if (instruction->getName() == "slt") {
-                    auto* left = rootArgument(
-                        instruction->getOperand(0), slots);
-                    auto* right = rootArgument(
-                        instruction->getOperand(1), slots);
-                    if ((left == function->getArg(1)) ||
-                        (right == function->getArg(1))) {
+                    auto* leftSlot = loadedSlot(instruction->getOperand(0));
+                    auto* rightSlot = loadedSlot(instruction->getOperand(1));
+                    auto* left = rootArgument(instruction->getOperand(0), slots);
+                    auto* right = rootArgument(instruction->getOperand(1), slots);
+                    if (leftSlot && right == function->getArg(1)) {
+                        inductionSlot = leftSlot;
+                        loopCompare = instruction;
+                        ++loopCompares;
+                    } else if (rightSlot && left == function->getArg(1)) {
+                        inductionSlot = rightSlot;
+                        loopCompare = instruction;
                         ++loopCompares;
                     }
                 }
@@ -314,16 +544,290 @@ bool matchDigitFunction(
         }
     }
     if (divisionStores != 1) return false;
-    match.radix = static_cast<int>(divisor->getValue());
-    match.bitsPerDigit = exactLog2(divisor->getValue());
-    return match.bitsPerDigit > 0 &&
-           match.bitsPerDigit < 31;
+    IR::Instruction* roundSlot = nullptr;
+    for (const auto& [slot, argument] : slots) {
+        if (argument == function->getArg(1))
+            roundSlot = dynamic_cast<IR::Instruction*>(slot);
+    }
+    if (!roundSlot || !inductionSlot || !loopCompare ||
+        !hasSlotInitialization(
+            function, inductionSlot,
+            IR::ConstantInt::get(IR::IntegerType::I32, 0), slots) ||
+        !provesSlotIncrementInBlock(division->getParent(), inductionSlot) ||
+        !branchTargets(division->getParent()->getTerminator(),
+                       loopCompare->getParent()) ||
+        !branchTargets(loopCompare->getParent()->getTerminator(),
+                       division->getParent())) {
+        return false;
+    }
+
+    proof.function = function;
+    proof.radix = static_cast<int>(divisor->getValue());
+    proof.bitsPerDigit = exactLog2(divisor->getValue());
+    proof.numberSlot = dynamic_cast<IR::Instruction*>(numberSlot);
+    proof.roundSlot = roundSlot;
+    proof.inductionSlot = inductionSlot;
+    bool proven = proof.numberSlot && proof.bitsPerDigit > 0 &&
+                  proof.bitsPerDigit < 31;
+    return proven;
 }
 
-bool matchRecursiveSort(
+bool extractArrayIncrement(
+    IR::Instruction* store, ArrayElementAccess& destination,
+    ArrayElementAccess& source) {
+    if (!store || store->getOpcode() != Opc::STORE ||
+        store->getNumOperands() != 2) {
+        return false;
+    }
+    auto destinationAccess = arrayElementPointer(store->getOperand(1));
+    auto* add = dynamic_cast<IR::Instruction*>(store->getOperand(0));
+    if (!destinationAccess || !add || add->getOpcode() != Opc::ADD ||
+        add->getNumOperands() != 2) {
+        return false;
+    }
+    IR::Value* oldValue = nullptr;
+    if (isConstant(add->getOperand(0), 1)) oldValue = add->getOperand(1);
+    if (isConstant(add->getOperand(1), 1)) oldValue = add->getOperand(0);
+    auto sourceAccess = loadedArrayElement(oldValue);
+    if (!sourceAccess || sourceAccess->array != destinationAccess->array)
+        return false;
+    destination = *destinationAccess;
+    source = *sourceAccess;
+    return true;
+}
+
+bool sameDigitApplication(
+    IR::Value* left, IR::Value* right,
+    IR::Function* digitFunction, IR::Argument* roundArgument,
+    const ArgumentSlots& slots) {
+    if (sameValueOrSlotLoad(left, right)) return true;
+    auto* leftCall = dynamic_cast<IR::Instruction*>(left);
+    auto* rightCall = dynamic_cast<IR::Instruction*>(right);
+    if (!leftCall || !rightCall ||
+        calledFunction(leftCall) != digitFunction ||
+        calledFunction(rightCall) != digitFunction ||
+        leftCall->getNumOperands() != 3 ||
+        rightCall->getNumOperands() != 3 ||
+        rootArgument(leftCall->getOperand(2), slots) != roundArgument ||
+        rootArgument(rightCall->getOperand(2), slots) != roundArgument) {
+        return false;
+    }
+    if (sameValueOrSlotLoad(
+            leftCall->getOperand(1), rightCall->getOperand(1))) {
+        return true;
+    }
+    auto* leftValue = dynamic_cast<IR::Instruction*>(leftCall->getOperand(1));
+    auto* rightValue = dynamic_cast<IR::Instruction*>(rightCall->getOperand(1));
+    if (!leftValue || !rightValue ||
+        leftValue->getOpcode() != Opc::LOAD ||
+        rightValue->getOpcode() != Opc::LOAD) {
+        return false;
+    }
+    auto* leftAddress = dynamic_cast<IR::Instruction*>(leftValue->getOperand(0));
+    auto* rightAddress = dynamic_cast<IR::Instruction*>(rightValue->getOperand(0));
+    if (!leftAddress || !rightAddress ||
+        leftAddress->getOpcode() != Opc::GETELEMENTPTR ||
+        rightAddress->getOpcode() != Opc::GETELEMENTPTR ||
+        rootArgument(leftAddress->getOperand(0), slots) !=
+            rootArgument(rightAddress->getOperand(0), slots)) {
+        return false;
+    }
+    return sameValueOrSlotLoad(
+        leftAddress->getOperand(leftAddress->getNumOperands() - 1),
+        rightAddress->getOperand(rightAddress->getNumOperands() - 1));
+}
+
+IR::Instruction* proveHistogramArray(
+    IR::Function* function, IR::Function* digitFunction,
+    const std::vector<IR::Instruction*>& bucketArrays,
+    const ArgumentSlots& slots) {
+    IR::Instruction* provenArray = nullptr;
+    auto* round = function->getArg(0);
+    auto* data = function->getArg(1);
+    auto* left = function->getArg(2);
+    auto* right = function->getArg(3);
+
+    for (auto& block : function->getBlocks()) {
+        for (auto& owned : block->getInstructions()) {
+            ArrayElementAccess destination;
+            ArrayElementAccess source;
+            if (!extractArrayIncrement(
+                    owned.get(), destination, source) ||
+                std::find(bucketArrays.begin(), bucketArrays.end(),
+                          destination.array) == bucketArrays.end()) {
+                continue;
+            }
+            IR::Instruction* destinationIndexSlot = nullptr;
+            IR::Instruction* sourceIndexSlot = nullptr;
+            if (!isDigitCall(destination.index, digitFunction, round,
+                             data, slots, &destinationIndexSlot) ||
+                !isDigitCall(source.index, digitFunction, round,
+                             data, slots, &sourceIndexSlot) ||
+                destinationIndexSlot != sourceIndexSlot ||
+                !hasSlotInitialization(
+                    function, destinationIndexSlot, left, slots) ||
+                !provesSlotUpperBound(
+                    function, destinationIndexSlot, right, slots) ||
+                !provesSlotIncrementInBlock(
+                    owned->getParent(), destinationIndexSlot)) {
+                continue;
+            }
+            if (provenArray && provenArray != destination.array)
+                return nullptr;
+            provenArray = destination.array;
+        }
+    }
+    return provenArray;
+}
+
+bool provesPrefixPartition(
+    IR::Function* function, IR::Instruction* countArray,
+    IR::Instruction* headArray, IR::Instruction* tailArray,
+    int radix, const ArgumentSlots& slots) {
+    bool headZero = false;
+    bool tailZero = false;
+    std::unordered_set<IR::Instruction*> headRecurrenceSlots;
+    std::unordered_set<IR::Instruction*> tailRecurrenceSlots;
+    auto* left = function->getArg(2);
+
+    for (auto& block : function->getBlocks()) {
+        for (auto& owned : block->getInstructions()) {
+            auto* store = owned.get();
+            if (store->getOpcode() != Opc::STORE ||
+                store->getNumOperands() != 2) {
+                continue;
+            }
+            auto destination = arrayElementPointer(store->getOperand(1));
+            if (!destination) continue;
+
+            if (destination->array == headArray &&
+                isConstant(destination->index, 0) &&
+                rootArgument(store->getOperand(0), slots) == left) {
+                headZero = true;
+            }
+
+            if (destination->array == tailArray &&
+                isConstant(destination->index, 0)) {
+                auto* add = dynamic_cast<IR::Instruction*>(store->getOperand(0));
+                if (add && add->getOpcode() == Opc::ADD &&
+                    add->getNumOperands() == 2) {
+                    auto first = loadedArrayElement(add->getOperand(0));
+                    auto second = loadedArrayElement(add->getOperand(1));
+                    bool hasLeft = rootArgument(add->getOperand(0), slots) == left ||
+                                   rootArgument(add->getOperand(1), slots) == left;
+                    bool hasCountZero =
+                        (first && first->array == countArray &&
+                         isConstant(first->index, 0)) ||
+                        (second && second->array == countArray &&
+                         isConstant(second->index, 0));
+                    tailZero |= hasLeft && hasCountZero;
+                }
+            }
+
+            auto* slot = loadedSlot(destination->index);
+            if (!slot) continue;
+            if (destination->array == headArray) {
+                auto source = loadedArrayElement(store->getOperand(0));
+                auto* previous = source
+                    ? dynamic_cast<IR::Instruction*>(source->index)
+                    : nullptr;
+                if (source && source->array == tailArray && previous &&
+                    previous->getOpcode() == Opc::SUB &&
+                    previous->getNumOperands() == 2 &&
+                    loadedSlot(previous->getOperand(0)) == slot &&
+                    isConstant(previous->getOperand(1), 1)) {
+                    headRecurrenceSlots.insert(slot);
+                }
+            }
+            if (destination->array == tailArray) {
+                auto* add = dynamic_cast<IR::Instruction*>(store->getOperand(0));
+                if (!add || add->getOpcode() != Opc::ADD ||
+                    add->getNumOperands() != 2) {
+                    continue;
+                }
+                auto first = loadedArrayElement(add->getOperand(0));
+                auto second = loadedArrayElement(add->getOperand(1));
+                bool headAtIndex =
+                    (first && first->array == headArray &&
+                     sameValueOrSlotLoad(first->index, destination->index)) ||
+                    (second && second->array == headArray &&
+                     sameValueOrSlotLoad(second->index, destination->index));
+                bool countAtIndex =
+                    (first && first->array == countArray &&
+                     sameValueOrSlotLoad(first->index, destination->index)) ||
+                    (second && second->array == countArray &&
+                     sameValueOrSlotLoad(second->index, destination->index));
+                if (headAtIndex && countAtIndex) {
+                    tailRecurrenceSlots.insert(slot);
+                }
+            }
+        }
+    }
+
+    auto* one = IR::ConstantInt::get(IR::IntegerType::I32, 1);
+    auto* radixValue = IR::ConstantInt::get(IR::IntegerType::I32, radix);
+    if (!headZero || !tailZero) return false;
+    for (auto* slot : headRecurrenceSlots) {
+        if (tailRecurrenceSlots.count(slot) &&
+            hasSlotInitialization(function, slot, one, slots) &&
+            provesSlotUpperBound(function, slot, radixValue, slots)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool provesPermutationWrites(
+    IR::Function* function, IR::Function* digitFunction,
+    IR::Instruction* headArray, const ArgumentSlots& slots) {
+    unsigned dataStores = 0;
+    auto* data = function->getArg(1);
+    auto* round = function->getArg(0);
+    for (auto& block : function->getBlocks()) {
+        for (auto& owned : block->getInstructions()) {
+            auto* store = owned.get();
+            if (store->getOpcode() != Opc::STORE ||
+                store->getNumOperands() != 2 ||
+                rootArgument(store->getOperand(1), slots) != data) {
+                continue;
+            }
+            auto* pointer = dynamic_cast<IR::Instruction*>(store->getOperand(1));
+            if (!pointer || pointer->getOpcode() != Opc::GETELEMENTPTR)
+                return false;
+            auto headPosition = loadedArrayElement(
+                pointer->getOperand(pointer->getNumOperands() - 1));
+            if (!headPosition || headPosition->array != headArray)
+                return false;
+
+            bool advancesSameHead = false;
+            for (auto& peer : block->getInstructions()) {
+                ArrayElementAccess destination;
+                ArrayElementAccess source;
+                if (!extractArrayIncrement(
+                        peer.get(), destination, source) ||
+                    destination.array != headArray) {
+                    continue;
+                }
+                if (sameValueOrSlotLoad(
+                        headPosition->index, destination.index) ||
+                    sameDigitApplication(
+                        headPosition->index, destination.index,
+                        digitFunction, round, slots)) {
+                    advancesSameHead = true;
+                    break;
+                }
+            }
+            if (!advancesSameHead) return false;
+            ++dataStores;
+        }
+    }
+    return dataStores == 2;
+}
+
+bool proveRecursiveSort(
     IR::Module* module, IR::Function* function,
     IR::Function* digitFunction,
-    const DigitMatch& digitMatch, RadixMatch& match) {
+    const DigitProof& digitProof, RadixProof& proof) {
     if (!function || function->isExternal() ||
         function->getNumArgs() != 4) {
         return false;
@@ -349,10 +853,9 @@ bool matchRecursiveSort(
     std::vector<IR::Instruction*> recursiveCalls;
     unsigned digitCalls = 0;
     unsigned otherCalls = 0;
-    unsigned bucketLoopBounds = 0;
-    unsigned dataStores = 0;
     bool hasRoundGuard = false;
     bool hasRangeGuard = false;
+    bool hasUnknownWrite = false;
 
     for (auto& block : function->getBlocks()) {
         for (auto& owned : block->getInstructions()) {
@@ -367,7 +870,7 @@ bool matchRecursiveSort(
                 if (array &&
                     array->getElementType() == IR::IntegerType::I32 &&
                     array->getNumElements() ==
-                        static_cast<unsigned>(digitMatch.radix)) {
+                        static_cast<unsigned>(digitProof.radix)) {
                     bucketArrays.push_back(instruction);
                 }
             }
@@ -384,43 +887,46 @@ bool matchRecursiveSort(
             }
 
             if (instruction->getOpcode() == Opc::ICMP) {
-                if (hasConstantOperand(
-                        instruction, digitMatch.radix) &&
-                    instruction->getName() == "slt") {
-                    ++bucketLoopBounds;
-                }
-                if (hasConstantOperand(instruction, -1) &&
-                    instruction->getName() == "eq") {
+                if (provesExhaustedRoundGuard(
+                        instruction, function, slots)) {
                     hasRoundGuard = true;
                 }
-                if (instruction->getName() == "sge") {
+                if (provesTrivialRangeGuard(
+                        instruction, function, slots)) {
                     hasRangeGuard = true;
                 }
             }
 
             if (instruction->getOpcode() == Opc::STORE &&
                 instruction->getNumOperands() == 2 &&
-                rootArgument(instruction->getOperand(1), slots) ==
-                    function->getArg(1)) {
-                ++dataStores;
+                rootArgument(instruction->getOperand(1), slots) !=
+                    function->getArg(1) &&
+                !rootAlloca(instruction->getOperand(1))) {
+                hasUnknownWrite = true;
             }
+
         }
     }
 
+    // 硬约束：合并所有结构条件
     if (bucketArrays.size() != 3 ||
         recursiveCalls.size() != 1 ||
-        digitCalls < 5 || otherCalls != 0 ||
-        bucketLoopBounds < 2 || dataStores < 2 ||
-        !hasRoundGuard || !hasRangeGuard) {
+        digitCalls == 0 ||
+        otherCalls != 0 ||
+        !hasRoundGuard || !hasRangeGuard || hasUnknownWrite) {
         return false;
     }
+
+    auto* countArray = proveHistogramArray(
+        function, digitFunction, bucketArrays, slots);
+    if (!countArray) return false;
 
     auto* recursive = recursiveCalls.front();
     if (recursive->getNumOperands() != 5) return false;
     auto* nextRound =
         dynamic_cast<IR::Instruction*>(recursive->getOperand(1));
-    if (!nextRound || nextRound->getOpcode() != Opc::SUB ||
-        !hasConstantOperand(nextRound, 1) ||
+    if (!nextRound ||
+        !provesPreviousRound(nextRound, function->getArg(0), slots) ||
         rootArgument(recursive->getOperand(2), slots) !=
             function->getArg(1)) {
         return false;
@@ -428,10 +934,34 @@ bool matchRecursiveSort(
     auto* leftArray = rootAlloca(recursive->getOperand(3));
     auto* rightArray = rootAlloca(recursive->getOperand(4));
     if (!leftArray || !rightArray || leftArray == rightArray ||
+        leftArray == countArray || rightArray == countArray ||
         std::find(bucketArrays.begin(), bucketArrays.end(), leftArray) ==
             bucketArrays.end() ||
         std::find(bucketArrays.begin(), bucketArrays.end(), rightArray) ==
             bucketArrays.end()) {
+        return false;
+    }
+
+    auto leftElement = loadedArrayElement(recursive->getOperand(3));
+    auto rightElement = loadedArrayElement(recursive->getOperand(4));
+    auto* bucketSlot = leftElement ? loadedSlot(leftElement->index) : nullptr;
+    auto* zero = IR::ConstantInt::get(IR::IntegerType::I32, 0);
+    auto* radixValue = IR::ConstantInt::get(
+        IR::IntegerType::I32, digitProof.radix);
+    bool prefixProven = provesPrefixPartition(
+        function, countArray, leftArray, rightArray,
+        digitProof.radix, slots);
+    bool permutationProven = provesPermutationWrites(
+        function, digitFunction, leftArray, slots);
+    if (!leftElement || !rightElement ||
+        leftElement->array != leftArray ||
+        rightElement->array != rightArray ||
+        !sameValueOrSlotLoad(leftElement->index, rightElement->index) ||
+        !bucketSlot ||
+        !hasSlotInitialization(function, bucketSlot, zero, slots) ||
+        !provesSlotUpperBound(function, bucketSlot, radixValue, slots) ||
+        !provesSlotIncrementInBlock(recursive->getParent(), bucketSlot) ||
+        !prefixProven || !permutationProven) {
         return false;
     }
 
@@ -472,15 +1002,22 @@ bool matchRecursiveSort(
         if (call->getParent()->getParent() != function) return false;
     }
 
-    match.sortFunction = function;
-    match.digitFunction = digitFunction;
-    match.externalCalls = std::move(externalCalls);
-    match.dataType = array;
-    match.bitsPerDigit = digitMatch.bitsPerDigit;
+    proof.sortFunction = function;
+    proof.digitFunction = digitFunction;
+    proof.externalCalls = std::move(externalCalls);
+    proof.dataType = array;
+    proof.countArray = countArray;
+    proof.headArray = leftArray;
+    proof.tailArray = rightArray;
+    proof.sourceRadix = digitProof.radix;
+    proof.bitsPerDigit = digitProof.bitsPerDigit;
+    proof.minimumFullRound =
+        (31u + digitProof.bitsPerDigit - 1u) /
+        digitProof.bitsPerDigit - 1u;
     return true;
 }
 
-bool findMatch(IR::Module* module, RadixMatch& match) {
+bool findProof(IR::Module* module, RadixProof& proof) {
     for (auto& global : module->getGlobals()) {
         if (global->getName() == "__opt_radix_scratch" ||
             global->getName() == "__opt_radix_counts") {
@@ -490,14 +1027,14 @@ bool findMatch(IR::Module* module, RadixMatch& match) {
 
     struct DigitCandidate {
         IR::Function* function = nullptr;
-        DigitMatch match;
+        DigitProof proof;
     };
     std::vector<DigitCandidate> digitFunctions;
     for (auto& function : module->getFunctions()) {
-        DigitMatch digitMatch;
-        if (matchDigitFunction(function.get(), digitMatch)) {
+        DigitProof digitProof;
+        if (proveDigitFunction(function.get(), digitProof)) {
             digitFunctions.push_back(
-                {function.get(), digitMatch});
+                {function.get(), digitProof});
         }
     }
     for (auto& function : module->getFunctions()) {
@@ -506,19 +1043,19 @@ bool findMatch(IR::Module* module, RadixMatch& match) {
         }
     }
 
-    std::vector<RadixMatch> matches;
+    std::vector<RadixProof> proofs;
     for (const auto& digit : digitFunctions) {
         for (auto& function : module->getFunctions()) {
-            RadixMatch candidate;
-            if (matchRecursiveSort(
+            RadixProof candidate;
+            if (proveRecursiveSort(
                     module, function.get(), digit.function,
-                    digit.match, candidate)) {
-                matches.push_back(candidate);
+                    digit.proof, candidate)) {
+                proofs.push_back(candidate);
             }
         }
     }
-    if (matches.size() != 1) return false;
-    match = matches.front();
+    if (proofs.size() != 1) return false;
+    proof = proofs.front();
     return true;
 }
 
@@ -543,7 +1080,7 @@ IR::Instruction* elementAddress(
 void buildIterativeRadix(
     IR::Function* function,
     IR::Function* slowFunction,
-    const RadixMatch& match,
+    const RadixProof& proof,
     IR::GlobalVariable* scratchGlobal,
     IR::GlobalVariable* countsGlobal,
     IR::ArrayType* countsType) {
@@ -552,9 +1089,12 @@ void buildIterativeRadix(
     auto* zero = IR::ConstantInt::get(i32, 0);
     auto* one = IR::ConstantInt::get(i32, 1);
     auto* trueValue = IR::ConstantInt::get(i1, 1);
-    auto* radixSize = IR::ConstantInt::get(i32, kRadixSize);
-    auto* radixMask = IR::ConstantInt::get(i32, kRadixMask);
-    auto* radixBits = IR::ConstantInt::get(i32, kRadixBits);
+    auto* radixSize = IR::ConstantInt::get(
+        i32, kImplementationRadixSize);
+    auto* radixMask = IR::ConstantInt::get(
+        i32, kImplementationRadixMask);
+    auto* radixBits = IR::ConstantInt::get(
+        i32, kImplementationRadixBits);
 
     auto* entry = function->createBlock("entry");
     auto* maxHeader = function->createBlock("radix.max.cond");
@@ -583,7 +1123,7 @@ void buildIterativeRadix(
         function->getArg(1), function->getArg(2),
         "radix.data.base");
     auto* scratchBase = IR::Instruction::createGetElementPtr(
-        match.dataType, scratchGlobal,
+        proof.dataType, scratchGlobal,
         {zero, zero}, "radix.scratch.base");
     auto* countsBase = IR::Instruction::createGetElementPtr(
         countsType, countsGlobal,
@@ -601,7 +1141,7 @@ void buildIterativeRadix(
         Opc::ICMP, function->getArg(3),
         IR::ConstantInt::get(
             i32, static_cast<int32_t>(
-                match.dataType->getNumElements())),
+                proof.dataType->getNumElements())),
         "sle");
     auto* lowerBoundsSafe = IR::Instruction::createBinOp(
         Opc::AND, i1, "radix.bounds.lower",
@@ -609,13 +1149,23 @@ void buildIterativeRadix(
     auto* boundsSafe = IR::Instruction::createBinOp(
         Opc::AND, i1, "radix.bounds.safe",
         lowerBoundsSafe, withinArray);
+    auto* roundCoversAllDigits = IR::Instruction::createCmp(
+        Opc::ICMP, function->getArg(0),
+        IR::ConstantInt::get(
+            i32, static_cast<int32_t>(proof.minimumFullRound)),
+        "sge");
+    auto* fastPathSafe = IR::Instruction::createBinOp(
+        Opc::AND, i1, "radix.fast.safe",
+        boundsSafe, roundCoversAllDigits);
     entry->pushBack(leftNonnegative);
     entry->pushBack(rangeOrdered);
     entry->pushBack(withinArray);
     entry->pushBack(lowerBoundsSafe);
     entry->pushBack(boundsSafe);
+    entry->pushBack(roundCoversAllDigits);
+    entry->pushBack(fastPathSafe);
     entry->pushBack(IR::Instruction::createCondBr(
-        boundsSafe, maxHeader, slow));
+        fastPathSafe, maxHeader, slow));
 
     auto* maxIndexNext = IR::Instruction::createBinOp(
         Opc::ADD, i32, "radix.max.i.next", nullptr, one);
@@ -691,7 +1241,7 @@ void buildIterativeRadix(
 
     IR::Value* requiredRound = zero;
     int requiredDigit = 1;
-    int64_t threshold = 1LL << match.bitsPerDigit;
+    int64_t threshold = 1LL << proof.bitsPerDigit;
     while (threshold <= std::numeric_limits<int32_t>::max()) {
         auto* reachesThreshold = IR::Instruction::createCmp(
             Opc::ICMP, maximum,
@@ -707,10 +1257,10 @@ void buildIterativeRadix(
 
         if (threshold >
             std::numeric_limits<int32_t>::max() /
-                (1LL << match.bitsPerDigit)) {
+                (1LL << proof.bitsPerDigit)) {
             break;
         }
-        threshold <<= match.bitsPerDigit;
+        threshold <<= proof.bitsPerDigit;
         ++requiredDigit;
     }
     auto* roundEnough = IR::Instruction::createCmp(
@@ -941,29 +1491,29 @@ void buildIterativeRadix(
 } // namespace
 
 bool radixSortLowering(IR::Module* module) {
-    RadixMatch match;
-    if (!findMatch(module, match)) return false;
+    RadixProof proof;
+    if (!findProof(module, proof)) return false;
 
     auto* scratch = module->createGlobalVariable(
-        IR::PointerType::get(match.dataType),
+        IR::PointerType::get(proof.dataType),
         "__opt_radix_scratch", false);
     auto* countsType = IR::ArrayType::get(
-        IR::IntegerType::I32, kRadixSize);
+        IR::IntegerType::I32, kImplementationRadixSize);
     auto* counts = module->createGlobalVariable(
         IR::PointerType::get(countsType),
         "__opt_radix_counts", false);
 
-    auto* slowFunction = match.sortFunction;
+    auto* slowFunction = proof.sortFunction;
     auto* functionType = slowFunction->getFunctionType();
     auto originalName = slowFunction->getName();
     slowFunction->setName("__opt_radix_slow");
     auto* fastFunction = module->createFunction(
         functionType, originalName, false);
-    for (auto* call : match.externalCalls) {
+    for (auto* call : proof.externalCalls) {
         call->setOperand(0, fastFunction);
     }
     buildIterativeRadix(
-        fastFunction, slowFunction, match,
+        fastFunction, slowFunction, proof,
         scratch, counts, countsType);
     return true;
 }
