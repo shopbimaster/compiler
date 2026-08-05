@@ -586,6 +586,14 @@ void runO3(IR::Module* mod) {
             deadCodeElimination(mod);
         }
     }
+
+    // Inlining and loop cloning expose new short-range address and memory
+    // redundancies after the early O2 invocation of this pass. Re-run the
+    // same alias-checked local optimization on the final O3 form.
+    if (Opt::passEnabled("lateLocalMemoryAccessOptimization") &&
+        localMemoryAccessOptimization(mod)) {
+        deadCodeElimination(mod);
+    }
 }
 
 // ================================================================
