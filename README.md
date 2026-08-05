@@ -141,26 +141,26 @@ flowchart TD
 
 **阶段 1 — 结构化变换：**
 
-| 入口函数                           | 文件                                   | 职责                                               |
-| ---------------------------------- | -------------------------------------- | -------------------------------------------------- |
-| `treeShaking`                      | `TreeShaking.cpp`                      | 死函数消除（useCount=0 函数删除）                  |
-| `modAddRecurrenceStrengthReduce`   | `NativeLowering.cpp`                   | 模加递推循环 → 原生加法+模运算                     |
-| `radixSortLowering`                | `RadixSortLowering.cpp`                | 基数排序模式 → 原生位提取                          |
-| `redundantIterationElimination`    | `RedundantIterationElimination.cpp`    | 可证冗余的循环迭代消除                             |
-| `dynamicIdempotentLoopElimination` | `DynamicIdempotentLoopElimination.cpp` | 动态幂等循环迭代消除                               |
-| `recursiveMemoization`             | `RecursiveOpt.cpp`                     | 纯自递归函数 → 记忆化查表                          |
-| `repeatedDivRemToNative`           | `NativeLowering.cpp`                   | 重复除余提取 → 原生位运算                          |
-| `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 递归模乘 → WIDE_SMOD_MUL 指令                      |
-| `bitOpPatternRecognition`          | `BitOpPatternRecognition.cpp`          | 位运算函数调用 → 原生位指令                        |
-| `powerOfTwoDispatchSimplification` | `PowerOfTwoDispatch.cpp`               | 2 的幂次 switch 分派化简                           |
-| `tailRecursionElimination`         | `TailRecursionElimination.cpp`         | 尾递归 → 循环                                      |
-| `earlyReturnToSelect`              | `EarlyReturnToSelect.cpp`              | if-else-RET → SELECT+RET（单 BB 化）               |
-| `inlineExpansion`                  | `InlineExpansion.cpp`                  | 函数内联（热点循环内联 + 多 BB 克隆）              |
-| `mem2reg` / `mem2regLocal`         | `Mem2Reg.cpp`                          | SSA 构造（alloca/load/store → PHI）/ 局部 SSA 提升 |
-| `globalVariablePromotion`          | `GlobalVariablePromotion.cpp`          | 标量全局变量 → 局部 ALLOCA                         |
-| `globalConstantPropagation`        | `GlobalConstantPropagation.cpp`        | 只读全局常量 → 常量替换                            |
-| `deadGlobalStoreElimination`       | `DeadGlobalStoreElimination.cpp`       | 无读/无逃逸全局的 STORE 消除                       |
-| `inplaceMatrixBlocking`            | `InPlaceMatrixBlocking.cpp`            | 原地矩阵乘缓存局部性分块                           |
+| 入口函数                           | 文件                                   | 职责                                                          |
+| ---------------------------------- | -------------------------------------- | ------------------------------------------------------------- |
+| `treeShaking`                      | `TreeShaking.cpp`                      | 死函数消除（useCount=0 函数删除）                             |
+| `modAddRecurrenceStrengthReduce`   | `NativeLowering.cpp`                   | 模加递推循环 → 原生加法+模运算                                |
+| `radixSortLowering`                | `RadixSortLowering.cpp`                | 递归基数排序模式识别 → 迭代式基数排序实现（计数/前缀和/散列） |
+| `redundantIterationElimination`    | `RedundantIterationElimination.cpp`    | 可证冗余的循环迭代消除                                        |
+| `dynamicIdempotentLoopElimination` | `DynamicIdempotentLoopElimination.cpp` | 动态幂等循环迭代消除                                          |
+| `recursiveMemoization`             | `RecursiveOpt.cpp`                     | 纯自递归函数 → 记忆化查表                                     |
+| `repeatedDivRemToNative`           | `NativeLowering.cpp`                   | 重复除余提取 → 原生位运算                                     |
+| `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 递归模乘 → WIDE_SMOD_MUL 指令                                 |
+| `bitOpPatternRecognition`          | `BitOpPatternRecognition.cpp`          | 位运算函数调用 → 原生位指令                                   |
+| `powerOfTwoDispatchSimplification` | `PowerOfTwoDispatch.cpp`               | 2 的幂次 switch 分派化简                                      |
+| `tailRecursionElimination`         | `TailRecursionElimination.cpp`         | 尾递归 → 循环                                                 |
+| `earlyReturnToSelect`              | `EarlyReturnToSelect.cpp`              | if-else-RET → SELECT+RET（单 BB 化）                          |
+| `inlineExpansion`                  | `InlineExpansion.cpp`                  | 函数内联（热点循环内联 + 多 BB 克隆）                         |
+| `mem2reg` / `mem2regLocal`         | `Mem2Reg.cpp`                          | SSA 构造（alloca/load/store → PHI）/ 局部 SSA 提升            |
+| `globalVariablePromotion`          | `GlobalVariablePromotion.cpp`          | 标量全局变量 → 局部 ALLOCA                                    |
+| `globalConstantPropagation`        | `GlobalConstantPropagation.cpp`        | 只读全局常量 → 常量替换                                       |
+| `deadGlobalStoreElimination`       | `DeadGlobalStoreElimination.cpp`       | 无读/无逃逸全局的 STORE 消除                                  |
+| `inplaceMatrixBlocking`            | `InPlaceMatrixBlocking.cpp`            | 原地矩阵乘缓存局部性分块                                      |
 
 **阶段 2 — 指令级化简 + CFG 简化（迭代 2 次收敛）：**
 
@@ -236,17 +236,17 @@ flowchart TD
 
 ### 优化基础设施（供其他 Pass 调用）
 
-| 入口函数                                                                                                                                  | 文件                    | 职责                                                              |
-| ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------- |
-| `buildPredecessors`/`buildSuccessors`/`computeDominators`/`computePostDominators`/`computeImmediateDominators`/`computeDominanceFrontier` | `DominatorAnalysis.cpp` | 支配者分析基础设施                                                |
-| `computeDomTreeLR`/`dominatesLR`                                                                                                          | `DominatorAnalysis.cpp` | 支配树 DFS L/R 区间编码（O(1) 支配查询）                          |
-| `findNaturalLoops`/`getLoopsInnermostFirst`                                                                                               | `LoopFind.cpp`          | 自然循环森林检测                                                  |
-| `analyzeLoopInduction`                                                                                                                    | `SCEVAnalysis.cpp`      | 标量演化分析（归纳变量 CR 链）                                    |
-| `passEnabled`                                                                                                                             | `PassManager.cpp`       | 参数化 Pass 开关（黑/白名单）                                     |
-| `detectPureFunctions`/`isPureFunction`                                                                                                    | `PureFuncDetection.cpp` | 纯函数识别（迭代至不动点）                                        |
-| `readOnlyGlobalAnalysis`                                                                                                                  | `ReadOnlyGlobal.cpp`    | 只读全局变量分析                                                  |
-| `phiLowering`                                                                                                                             | `PhiLowering.cpp`       | PHI 降级（PHI → ALLOCA + STORE + LOAD）                           |
-| `buildAllocaArgumentMap`/`collectPointerAccess`/`analyzeAffineRecurrence`/`analyzeAllocaScalarReduction`/`analyzeCanonicalCountedLoop`    | `LoopAnalysis.cpp`      | 循环分析合并模块（访存分解 + 仿射递推 + 标量归约 + 计数循环模式） |
+| 入口函数                                                                                                                                  | 文件                       | 职责                                                              |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------- |
+| `buildPredecessors`/`buildSuccessors`/`computeDominators`/`computePostDominators`/`computeImmediateDominators`/`computeDominanceFrontier` | `DominatorAnalysis.cpp`    | 支配者分析基础设施                                                |
+| `computeDomTreeLR`/`dominatesLR`                                                                                                          | `DominatorAnalysis.cpp`    | 支配树 DFS L/R 区间编码（O(1) 支配查询）                          |
+| `findNaturalLoops`/`getLoopsInnermostFirst`                                                                                               | `LoopFind.cpp`             | 自然循环森林检测                                                  |
+| `analyzeLoopInduction`                                                                                                                    | `SCEVAnalysis.cpp`         | 标量演化分析（归纳变量 CR 链）                                    |
+| `passEnabled`                                                                                                                             | `PassManager.cpp`          | 参数化 Pass 开关（黑/白名单）                                     |
+| `detectPureFunctions`/`isPureFunction`                                                                                                    | `PureFuncDetection.cpp`    | 纯函数识别（迭代至不动点）                                        |
+| `readOnlyGlobalAnalysis`                                                                                                                  | `ReadOnlyGlobal.cpp`       | 只读全局变量分析                                                  |
+| `phiLowering`                                                                                                                             | `PhiLowering.cpp`          | PHI 降级（PHI → ALLOCA + STORE + LOAD）                           |
+| `buildAllocaArgumentMap`/`collectPointerAccess`/`analyzeAffineRecurrence`/`analyzeAllocaScalarReduction`/`analyzeCanonicalCountedLoop`    | `LoopAnalysis.cpp`         | 循环分析合并模块（访存分解 + 仿射递推 + 标量归约 + 计数循环模式） |
 | `analyzeGlobalMemoryEffects`                                                                                                              | `MemoryAccessAnalysis.cpp` | 全局对象内存效应分析（地址逃逸检测）                              |
 
 ---
@@ -276,12 +276,12 @@ flowchart TD
 
 ### 后端组件
 
-| 文件                                | 入口函数/类                       | 职责                                                                                                                         |
-| ----------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| 文件                                | 入口函数/类                       | 职责                                                                                                                                       |
+| ----------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `src/backend/TargetCodeGen.cpp`     | `TargetCodeGen::generate(module)` | IR → RV64GC 汇编（ALLOCA 寄存器提升 + GEP 融合 + ICMP-CondBr 融合 + PHI 边拷贝 + 全局地址缓存 + 循环头对齐 + WIDE_SMOD_MUL + G2 指令预取） |
-| `src/backend/RegisterAllocator.cpp` | `RegisterAllocator`               | 图着色寄存器分配（callee-saved 管理 + 溢出决策 + PHI 合并）                                                                  |
-| `src/backend/PostRAScheduler.cpp`   | `PostRAScheduler`                 | 寄存器分配后指令调度（mul 单周期延迟建模）                                                                                   |
-| `src/opt/PeepholeOptimizer.cpp`     | `peepholeOptimize(asmCode)`       | 窥孔优化（mv+branch copy propagation + 压缩指令生成 + 死 trampoline 清理）                                                   |
+| `src/backend/RegisterAllocator.cpp` | `RegisterAllocator`               | 图着色寄存器分配（callee-saved 管理 + 溢出决策 + PHI 合并）                                                                                |
+| `src/backend/PostRAScheduler.cpp`   | `PostRAScheduler`                 | 寄存器分配后指令调度（mul 单周期延迟建模）                                                                                                 |
+| `src/opt/PeepholeOptimizer.cpp`     | `peepholeOptimize(asmCode)`       | 窥孔优化（mv+branch copy propagation + 压缩指令生成 + 死 trampoline 清理）                                                                 |
 
 ### 寄存器分配策略
 
@@ -313,23 +313,22 @@ INT 寄存器池排除 a0-a7（避免调用点大量保存/恢复开销），FLO
 
 ## 关键变换图解
 
-### If-Conversion（empty-else 菱形 → select）
+### If-Conversion（菱形分支 → select）
 
-将 `if(cond){acc+=expr;}` 形式的条件归约通过 IfConversion 形态2 + Pattern E 转为无分支 select，消除条件跳转（huffman-01 的 `_and/_or/_xor` 主循环变单 BB 无分支）。
+将菱形控制流（cond → then/else → merge PHI）转换为 SELECT 指令，消除条件跳转。仅当 then/else 块中的指令可安全投机执行（无 STORE/LOAD/CALL/SDIV 等副作用）时触发。
 
 ```mermaid
 flowchart LR
     subgraph 变换前
-        B0a["bb0<br/>if.cond"] -->|true| B1a["bb1<br/>if.then<br/>acc += expr"]
-        B0a -->|false| B3a["bb3<br/>if.end"]
-        B1a --> B3a
+        B0a["bb0<br/>cond = icmp"] -->|true| B1a["bb1<br/>then: v1 = ..."]
+        B0a -->|false| B2a["bb2<br/>else: v0 = ..."]
+        B1a --> B3a["bb3<br/>val = phi [v0,bb0],[v1,bb1]"]
+        B2a --> B3a
     end
     subgraph 变换后
-        B0b["bb0<br/>if.cond"] --> B3b["bb3<br/>select<br/>acc = acc + (expr - acc) * cond"]
+        B0b["bb0<br/>cond = icmp"] --> B3b["bb3<br/>s = select cond, v1, v0"]
     end
 ```
-
-Pattern E 仅限整数（在 `if(!isFloat)` 守卫内）；float SELECT 走 fallback 分支路径，spilled tv/fv 必须用 ft0/ft1 加载（fmv.s 两操作数均需浮点寄存器）。
 
 ### LoopRotation（while → guard + do-while）
 
@@ -405,7 +404,7 @@ flowchart LR
     end
 ```
 
-隐藏 BOOM 4 周期 load-use 延迟。使用 step-aware 迭代计数计算（`inferTripCount` + `traceAddChain`/`computeAllocaStep`，要求 `(bound-init) % step == 0`）。开关 `P9_OFF=1` 禁用。
+隐藏 BOOM 4 周期 load-use 延迟。使用 step-aware 迭代计数计算（`inferTripCount` + `traceAddChain`/`computeAllocaStep`，要求 `(bound-init) % step == 0`）。开关 `SWP_OFF=1` 禁用。
 
 ---
 
@@ -564,24 +563,25 @@ make -j$(nproc)
 
 ### Pass 开关（环境变量）
 
-| 环境变量               | 作用                                    | 示例                                                               |
-| ---------------------- | --------------------------------------- | ------------------------------------------------------------------ |
-| `OPT_DISABLE`          | 黑名单：禁用指定 Pass                   | `OPT_DISABLE="gvn,licm" ./build/compiler -S -o out.s in.sy -O1`    |
-| `OPT_ENABLE`           | 白名单：只运行指定 Pass                 | `OPT_ENABLE="mem2reg,sccp" ./build/compiler -S -o out.s in.sy -O1` |
-| `G2_OFF=1`             | 禁用指令预取                            | —                                                                  |
-| `G2_MINLOOP=N`         | 指令预取最小循环体门限（默认 4）        | —                                                                  |
-| `P6_OFF=1`             | 禁用宏指令融合                          | `P6_OFF=1 ./build/compiler ...`                                    |
-| `P8_OFF=1`             | 禁用软件流水（旧）                      | —                                                                  |
-| `P9_OFF=1`             | 禁用跨迭代 LOAD 预取（软件流水）        | —                                                                  |
-| `LAYOUT_PROB_OFF=1`    | 禁用分支概率引导布局                    | —                                                                  |
-| `SCHED_PRESSURE_OFF=1` | 禁用 PostRA 寄存器压力感知调度          | —                                                                  |
-| `COLD_SPLIT_OFF=1`     | 禁用冷热分离优化                        | —                                                                  |
-| `IFCONV_EXT_OFF=1`     | 禁用 If-Conversion 双路菱形扩展         | —                                                                  |
-| `ROT_ALLOCA_OFF=1`     | 禁用 alloca-IV 循环旋转路径             | —                                                                  |
-| `NO_PEEPHOLE=1`        | 禁用窥孔优化                            | —                                                                  |
-| `DEBUG_LOWER_PHI=1`    | 启用 PHI 降级（调试）                   | —                                                                  |
-| `DUMP_PEEPHOLE_PRE=1`  | 输出窥孔优化前汇编到 `/tmp/peep_pre.S`  | —                                                                  |
-| `DUMP_PEEPHOLE_POST=1` | 输出窥孔优化后汇编到 `/tmp/peep_post.S` | —                                                                  |
+| 环境变量               | 作用                                                               | 示例                                                               |
+| ---------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| `OPT_DISABLE`          | 黑名单：禁用指定 Pass                                              | `OPT_DISABLE="gvn,licm" ./build/compiler -S -o out.s in.sy -O1`    |
+| `OPT_ENABLE`           | 白名单：只运行指定 Pass（非空时优先于一切）                        | `OPT_ENABLE="mem2reg,sccp" ./build/compiler -S -o out.s in.sy -O1` |
+| `OPT_FORCE_ENABLE`     | 强制启用被 builtinDisable 禁用的 Pass（不覆盖 OPT_DISABLE 黑名单） | —                                                                  |
+| `OPT_DISABLE_GVN=1`    | 兼容旧开关：禁用 GVN                                               | —                                                                  |
+| `G2_OFF=1`             | 禁用指令预取                                                       | —                                                                  |
+| `G2_MINLOOP=N`         | 指令预取最小循环体门限（默认 4）                                   | —                                                                  |
+| `P6_OFF=1`             | 禁用宏指令融合                                                     | `P6_OFF=1 ./build/compiler ...`                                    |
+| `P8_OFF=1`             | 禁用软件流水（旧）                                                 | —                                                                  |
+| `SWP_OFF=1`            | 禁用跨迭代 LOAD 预取（软件流水）                                   | —                                                                  |
+| `LAYOUT_PROB_OFF=1`    | 禁用分支概率引导布局                                               | —                                                                  |
+| `SCHED_OFF=1`          | 禁用 PostRA 指令调度                                               | —                                                                  |
+| `LOOP_ROTATE_OFF=1`    | 禁用循环旋转                                                       | —                                                                  |
+| `ROT_ALLOCA_OFF=1`     | 禁用 alloca-IV 循环旋转路径                                        | —                                                                  |
+| `NO_PEEPHOLE=1`        | 禁用窥孔优化                                                       | —                                                                  |
+| `DEBUG_LOWER_PHI=1`    | 启用 PHI 降级（调试）                                              | —                                                                  |
+| `DUMP_PEEPHOLE_PRE=1`  | 输出窥孔优化前汇编到 `/tmp/peep_pre.S`                             | —                                                                  |
+| `DUMP_PEEPHOLE_POST=1` | 输出窥孔优化后汇编到 `/tmp/peep_post.S`                            | —                                                                  |
 
 ### 调试脚本
 
