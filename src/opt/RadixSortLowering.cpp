@@ -60,6 +60,74 @@ unsigned exactLog2(int64_t value) {
     return bits;
 }
 
+bool isConstantLE(IR::Value* value, int64_t n) {
+    auto* constant = dynamic_cast<IR::ConstantInt*>(value);
+    return constant && constant->getValue() <= n;
+}
+
+// 前置声明，定义见后
+IR::Argument* rootArgument(
+    IR::Value* value, const ArgumentSlots& slots);
+
+// 检查 ICMP 是否比较 arg(0) 与一个 ≤0 的常量（eq/sle/slt）
+bool terminatesOnRoundParam(
+    IR::Instruction* icmp, IR::Function* function,
+    const ArgumentSlots& slots) {
+    if (icmp->getOpcode() != Opc::ICMP || icmp->getNumOperands() != 2)
+        return false;
+    const auto& name = icmp->getName();
+    if (name != "eq" && name != "sle" && name != "slt") return false;
+
+    auto* leftArg = rootArgument(icmp->getOperand(0), slots);
+    auto* rightArg = rootArgument(icmp->getOperand(1), slots);
+    if (leftArg == function->getArg(0) &&
+        isConstantLE(icmp->getOperand(1), 0)) return true;
+    if (rightArg == function->getArg(0) &&
+        isConstantLE(icmp->getOperand(0), 0)) return true;
+    return false;
+}
+
+// 检查 ICMP 是否涉及 arg(2) 或 arg(3) 的有序比较（sge/sgt/sle/slt）
+bool guardsRangeParam(
+    IR::Instruction* icmp, IR::Function* function,
+    const ArgumentSlots& slots) {
+    if (icmp->getOpcode() != Opc::ICMP || icmp->getNumOperands() != 2)
+        return false;
+    const auto& name = icmp->getName();
+    if (name != "sge" && name != "sgt" && name != "sle" && name != "slt")
+        return false;
+
+    auto* leftArg = rootArgument(icmp->getOperand(0), slots);
+    auto* rightArg = rootArgument(icmp->getOperand(1), slots);
+    if (leftArg == function->getArg(2) || leftArg == function->getArg(3) ||
+        rightArg == function->getArg(2) || rightArg == function->getArg(3))
+        return true;
+    return false;
+}
+
+// 检查指令是否为 arg(0) - step 或 arg(0) + (-step)，step ∈ [1, maxStep]
+bool decrementsRoundParam(
+    IR::Instruction* instruction, IR::Argument* roundArg,
+    const ArgumentSlots& slots, unsigned maxStep) {
+    if (!instruction || instruction->getNumOperands() != 2) return false;
+    if (rootArgument(instruction->getOperand(0), slots) != roundArg)
+        return false;
+
+    auto* constOp =
+        dynamic_cast<IR::ConstantInt*>(instruction->getOperand(1));
+    if (!constOp) return false;
+
+    int64_t step;
+    if (instruction->getOpcode() == Opc::SUB) {
+        step = constOp->getValue();
+    } else if (instruction->getOpcode() == Opc::ADD) {
+        step = -constOp->getValue(); // ADD(x, -1) → step = 1
+    } else {
+        return false;
+    }
+    return step > 0 && step <= static_cast<int64_t>(maxStep);
+}
+
 IR::Function* calledFunction(IR::Instruction* instruction) {
     if (!instruction ||
         instruction->getOpcode() != Opc::CALL ||
@@ -343,7 +411,6 @@ bool matchRecursiveSort(
     unsigned digitCalls = 0;
     unsigned otherCalls = 0;
     unsigned bucketLoopBounds = 0;
-    unsigned dataStores = 0;
     bool hasRoundGuard = false;
     bool hasRangeGuard = false;
 
@@ -382,28 +449,24 @@ bool matchRecursiveSort(
                     instruction->getName() == "slt") {
                     ++bucketLoopBounds;
                 }
-                if (hasConstantOperand(instruction, -1) &&
-                    instruction->getName() == "eq") {
+                if (terminatesOnRoundParam(instruction, function, slots)) {
                     hasRoundGuard = true;
                 }
-                if (instruction->getName() == "sge") {
+                if (guardsRangeParam(instruction, function, slots)) {
                     hasRangeGuard = true;
                 }
             }
 
-            if (instruction->getOpcode() == Opc::STORE &&
-                instruction->getNumOperands() == 2 &&
-                rootArgument(instruction->getOperand(1), slots) ==
-                    function->getArg(1)) {
-                ++dataStores;
-            }
         }
     }
 
-    if (bucketArrays.size() != 3 ||
+    // 硬约束：合并所有结构条件
+    if (bucketArrays.size() < 2 || bucketArrays.size() > 4 ||
         recursiveCalls.size() != 1 ||
-        digitCalls < 5 || otherCalls != 0 ||
-        bucketLoopBounds < 2 || dataStores < 2 ||
+        digitCalls < std::max(2u,
+            static_cast<unsigned>(digitMatch.radix) / 4) ||
+        otherCalls != 0 ||
+        bucketLoopBounds < 1 ||
         !hasRoundGuard || !hasRangeGuard) {
         return false;
     }
@@ -412,15 +475,16 @@ bool matchRecursiveSort(
     if (recursive->getNumOperands() != 5) return false;
     auto* nextRound =
         dynamic_cast<IR::Instruction*>(recursive->getOperand(1));
-    if (!nextRound || nextRound->getOpcode() != Opc::SUB ||
-        !hasConstantOperand(nextRound, 1) ||
+    if (!nextRound ||
+        !decrementsRoundParam(nextRound, function->getArg(0),
+                              slots, digitMatch.bitsPerDigit) ||
         rootArgument(recursive->getOperand(2), slots) !=
             function->getArg(1)) {
         return false;
     }
     auto* leftArray = rootAlloca(recursive->getOperand(3));
     auto* rightArray = rootAlloca(recursive->getOperand(4));
-    if (!leftArray || !rightArray || leftArray == rightArray ||
+    if (!leftArray || !rightArray ||
         std::find(bucketArrays.begin(), bucketArrays.end(), leftArray) ==
             bucketArrays.end() ||
         std::find(bucketArrays.begin(), bucketArrays.end(), rightArray) ==
