@@ -6,44 +6,38 @@ AI 辅助说明：项目开发使用 OpenAI Codex 辅助合规审计、通用优
 
 ## 目录
 
-- [宏观架构](#宏观架构)
+- [总体架构](#总体架构)
 - [模块依赖链](#模块依赖链)
+- [优化管线](#优化管线)
+- [后端代码生成](#后端代码生成)
+- [关键变换图解](#关键变换图解)
 - [函数功能列表](#函数功能列表)
-  - [前端（Frontend）](#前端frontend)
-  - [中间表示（IR）](#中间表示ir)
-  - [优化器（Optimizer）](#优化器optimizer)
-  - [后端（Backend）](#后端backend)
 - [测试体系](#测试体系)
 - [注释规范](#注释规范)
 - [构建与测试命令](#构建与测试命令)
 
 ---
 
-## 宏观架构
+## 总体架构
 
-```
-输入 (.sy)
-   ↓
-[ANTLR4 词法/语法分析]  ← grammar/SysY2022Lexer.g4 + SysY2022Parser.g4
-   ↓
-[IRBuilder — Visitor 模式直接从 ParseTree 生成 IR]  ← src/ir/IRBuilder.cpp
-   ↓
-[IR Module]  ← include/ir/IR.h (Value/BasicBlock/Function/Module/Instruction/Type)
-   ↓
-[优化管线]  ← src/opt/Optimizer.cpp 调度
-   ├─ O1 基础安全优化（CF/DCE/CSE）
-   ├─ O2 中层优化（内联/SSA/SCCP/LICM/CFG/算术/矩阵分块）
-   ├─ O3 循环变换（交换/强度削减/旋转/展开/软件流水/归约分裂）
-   ├─ P0 特殊模式识别（递归→原生/位运算模式）
-   └─ P3 指令调度
-   ↓
-[后端代码生成]  ← src/backend/TargetCodeGen.cpp
-   ├─ RegisterAllocator（图着色寄存器分配）
-   ├─ TargetCodeGen（IR → RV64GC 汇编 + ALLOCA 提升 + PHI 边拷贝）
-   ├─ PostRAScheduler（寄存器分配后指令调度）
-   └─ PeepholeOptimizer（窥孔优化 + 压缩指令生成）
-   ↓
-输出 (.s)
+编译器采用 **ParseTree → IR → Assembly** 的精简三段式架构，跳过独立 AST 层与语义分析阶段：ANTLR4 Visitor 直接从 ParseTree 生成 IR，IR 经分层优化管线后由后端生成 RV64GC 汇编。
+
+```mermaid
+graph TD
+    Src["SysY 源码 (.sy)"]
+    Lexer["ANTLR4 词法/语法分析<br/>grammar/SysY2022Lexer.g4<br/>SysY2022Parser.g4"]
+    ParseTree["ParseTree"]
+    IRBuilder["IRBuilder<br/>Visitor 模式直生 IR<br/>src/ir/IRBuilder.cpp"]
+    IRModule["IR Module<br/>include/ir/IR.h<br/>Value/BB/Func/Module/Type"]
+    Opt["优化管线<br/>src/opt/Optimizer.cpp"]
+    Backend["后端代码生成<br/>src/backend/TargetCodeGen.cpp"]
+    Peephole["窥孔优化<br/>src/opt/PeepholeOptimizer.cpp"]
+    Asm["RV64GC 汇编 (.s)"]
+
+    Src --> Lexer --> ParseTree --> IRBuilder --> IRModule
+    IRModule --> Opt
+    Opt --> Backend
+    Backend --> Peephole --> Asm
 ```
 
 ### 设计原则
@@ -51,28 +45,51 @@ AI 辅助说明：项目开发使用 OpenAI Codex 辅助合规审计、通用优
 - **无独立 AST 层**：直接使用 ANTLR4 Visitor 模式从 ParseTree 生成 IR，简化编译流程（ParseTree → IR → Assembly）。
 - **无 SemanticAnalyzer**：假设输入程序无语法/语义错误。
 - **分层优化管线**：O1→O2→O3→P0→P3 分阶段调度，每阶段后运行 CF/DCE 清理；阶段间迭代收敛（最多 2 次）。
-- **目标导向优化**：针对 BOOM 微架构（16 项 ROB、14 周期分支误预测、单周期全流水 mul、4 周期 load-use）定制软件流水、分支概率布局、归约分裂等硬件协同优化。
+- **目标导向优化**：针对 BOOM 微架构（16 项 ROB、14 周期分支误预测、单周期全流水 mul、4 周期 load-use）定制软件流水、分支概率布局、归约分裂、指令预取等硬件协同优化。
+
+### BOOM 微架构约束
+
+```mermaid
+graph LR
+    subgraph BOOM 微架构特性
+        ROB["16 项 ROB"]
+        Mispred["14 周期分支误预测"]
+        Mul["单周期全流水 mul"]
+        LoadUse["4 周期 load-use"]
+    end
+    subgraph 协同优化策略
+        SWP["软件流水<br/>隐藏 load-use"]
+        Layout["分支概率布局<br/>回边 fall-through"]
+        RedSplit["归约分裂<br/>消除长依赖链"]
+        G2["指令预取<br/>改善 I-cache"]
+        NoLSR["不做 mul→add<br/>强度削减"]
+    end
+    LoadUse --> SWP
+    Mispred --> Layout
+    Mul --> NoLSR
+    ROB --> G2
+```
 
 ---
 
 ## 模块依赖链
 
-```
-include/ir/IR.h  ← 类型系统与 IR 数据结构（无外部依赖）
-       ↑
-include/ir/IRBuilder.h  ← 依赖 ANTLR4 运行时
-       ↑
-include/Compiler.h  ← 编译器门面，调度 IRBuilder + Opt + Backend
-       ↑
-include/opt/Optimizer.h  ← 所有优化 Pass 声明（依赖 ir/IR.h）
-include/opt/LoopAnalysis.h  ← 循环分析合并头（依赖 ir/IR.h）
-       ↑
-include/backend/TargetCodeGen.h  ← 依赖 ir/IR.h + RegisterAllocator.h
-include/backend/RegisterAllocator.h
-include/backend/PostRAScheduler.h
-include/backend/PeepholeOptimizer.h
-       ↑
-include/utils/Error.h, Logger.h  ← 通用工具
+```mermaid
+graph TD
+    IRCore["sysy_ir_core<br/>include/ir/IR.h<br/>src/ir/IR.cpp<br/>类型系统与 IR 数据结构"]
+    IRBuilder["sysy_ir_builder<br/>src/ir/IRBuilder.cpp<br/>依赖 ANTLR4 运行时"]
+    Compiler["sysy_compiler<br/>src/Compiler.cpp + src/main.cpp<br/>编译器门面"]
+    Opt["sysy_opt<br/>src/opt/*.cpp<br/>64 个 Pass + 基础设施"]
+    Backend["sysy_backend<br/>src/backend/*.cpp<br/>TargetCodeGen + RegisterAllocator + PostRAScheduler"]
+    Utils["utils<br/>include/utils/Error.h, Logger.h"]
+
+    IRBuilder --> IRCore
+    Compiler --> IRBuilder
+    Compiler --> Opt
+    Compiler --> Backend
+    Opt --> IRCore
+    Backend --> IRCore
+    IRCore -.-> Utils
 ```
 
 **库依赖关系**（CMakeLists.txt 定义）：
@@ -89,135 +106,135 @@ include/utils/Error.h, Logger.h  ← 通用工具
 
 ---
 
-## 函数功能列表
+## 优化管线
 
-### 前端（Frontend）
+优化 Pass 按管线阶段分组调度。每个 Pass 返回 `bool`（是否修改 IR），管线在每步后运行 `constantFolding` + `deadCodeElimination` 清理。开关机制：`OPT_DISABLE`/`OPT_ENABLE` 环境变量控制（见 [构建与测试命令](#构建与测试命令)）。
 
-| 文件                        | 入口函数                         | 职责                                                        | 单元测试           | 系统测试                   |
-| --------------------------- | -------------------------------- | ----------------------------------------------------------- | ------------------ | -------------------------- |
-| `grammar/SysY2022Lexer.g4`  | —（ANTLR4 生成）                 | SysY2022 词法规则                                           | —                  | functional/hfunc/perf 全集 |
-| `grammar/SysY2022Parser.g4` | —（ANTLR4 生成）                 | SysY2022 语法规则                                           | —                  | functional/hfunc/perf 全集 |
-| `src/ir/IRBuilder.cpp`      | `IRBuilder::compile(sourcePath)` | Visitor 模式从 ParseTree 直接生成 IR Module                 | `test_ir`          | functional 全集            |
-| `src/main.cpp`              | `main()`                         | 命令行解析 + 调度编译流程                                   | —                  | 手动验证                   |
-| `src/Compiler.cpp`          | `Compiler::emitAsmToFile()`      | 编译门面：compile → runOptPasses → TargetCodeGen → peephole | `test_integration` | functional 全集            |
+```mermaid
+flowchart TD
+    Entry["进入优化管线"]
+    O1["O1 基础安全优化<br/>CF + DCE + CSE"]
+    O2S1["O2 阶段1<br/>结构化变换<br/>内联/SSA/全局变量/矩阵分块"]
+    O2S2["O2 阶段2<br/>指令化简 + CFG 简化<br/>迭代×2"]
+    O2S3["O2 阶段3<br/>算术优化<br/>MagicDiv/代数化简/Reassociate"]
+    O2S4["O2 阶段4<br/>值传播<br/>SCCP + CopyProp 迭代×2"]
+    O2S5["O2 阶段5<br/>循环优化<br/>LICM"]
+    O2S6["O2 阶段6<br/>全局清理<br/>IfConv/ADCE/GVN/布局"]
+    O3["O3 循环变换<br/>交换/强度削减/旋转/展开/软件流水/归约分裂"]
+    P0["P0 特殊模式识别<br/>递归→原生/位运算模式"]
+    P3["P3 指令调度<br/>暴露 ILP + 分支友好布局"]
+    Done["优化完成"]
 
-### 中间表示（IR）
+    Entry --> O1 --> O2S1 --> O2S2 --> O2S3 --> O2S4 --> O2S5 --> O2S6
+    O2S6 --> O3 --> P0 --> P3 --> Done
+```
 
-| 文件                                | 核心类型/函数                                                                                                                                                                                   | 职责                         | 单元测试  | 系统测试 |
-| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- | --------- | -------- |
-| `include/ir/IR.h` / `src/ir/IR.cpp` | `Value`, `Instruction`, `BasicBlock`, `Function`, `Module`, `Type`/`IntegerType`/`FloatType`/`ArrayType`/`FunctionType`, `Constant`/`ConstantInt`/`ConstantFloat`, `Argument`, `GlobalVariable` | IR 类型系统与数据结构        | `test_ir` | 全集     |
-| `include/ir/IRBuilder.h`            | `IRBuilder`                                                                                                                                                                                     | IR 构造器（Visitor 直生 IR） | `test_ir` | 全集     |
+### O1 基础安全优化（`runO1`，总是有益、无依赖）
 
-### 优化器（Optimizer）
+| 入口函数                         | 文件                      | 职责                          |
+| -------------------------------- | ------------------------- | ----------------------------- |
+| `constantFolding`                | `ConstantFolding.cpp`     | 常量折叠（编译期计算）        |
+| `deadCodeElimination`            | `DeadCodeElimination.cpp` | 死代码消除（无 use 指令删除） |
+| `commonSubexpressionElimination` | `CSE.cpp`                 | 公共子表达式消除（局部 CSE）  |
 
-优化 Pass 按管线阶段分组。每个 Pass 返回 `bool`（是否修改 IR），管线在每步后运行 `constantFolding` + `deadCodeElimination` 清理。开关机制：`OPT_DISABLE`/`OPT_ENABLE` 环境变量控制（见 [构建与测试命令](#构建与测试命令)）。
-
-#### O1 基础安全优化（`runO1`，总是有益、无依赖）
-
-| 入口函数                         | 文件                      | 职责                          | 单元测试  | 系统测试       |
-| -------------------------------- | ------------------------- | ----------------------------- | --------- | -------------- |
-| `constantFolding`                | `ConstantFolding.cpp`     | 常量折叠（编译期计算）        | `test_ir` | functional O0+ |
-| `deadCodeElimination`            | `DeadCodeElimination.cpp` | 死代码消除（无 use 指令删除） | `test_ir` | functional O0+ |
-| `commonSubexpressionElimination` | `CSE.cpp`                 | 公共子表达式消除（局部 CSE）  | `test_ir` | functional O1+ |
-
-#### O2 中层优化（`runO2`，分阶段调度）
+### O2 中层优化（`runO2`，分 6 阶段调度）
 
 **阶段 1 — 结构化变换：**
 
-| 入口函数                           | 文件                                   | 职责                                               | 单元测试               | 系统测试      |
-| ---------------------------------- | -------------------------------------- | -------------------------------------------------- | ---------------------- | ------------- |
-| `treeShaking`                      | `TreeShaking.cpp`                      | 死函数消除（useCount=0 函数删除）                  | —                      | functional    |
-| `modAddRecurrenceStrengthReduce`   | `NativeLowering.cpp`                   | 模加递推循环 → 原生加法+模运算                     | —                      | perf          |
-| `radixSortLowering`                | `RadixSortLowering.cpp`                | 基数排序模式 → 原生位提取                          | —                      | perf          |
-| `redundantIterationElimination`    | `RedundantIterationElimination.cpp`    | 可证冗余的循环迭代消除                             | —                      | perf          |
-| `dynamicIdempotentLoopElimination` | `DynamicIdempotentLoopElimination.cpp` | 动态幂等循环迭代消除                               | —                      | perf          |
-| `recursiveMemoization`             | `RecursiveOpt.cpp`                     | 纯自递归函数 → 记忆化查表                          | —                      | perf          |
-| `repeatedDivRemToNative`           | `NativeLowering.cpp`                   | 重复除余提取 → 原生位运算                          | —                      | perf          |
-| `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 递归模乘 → WIDE_SMOD_MUL 指令                      | —                      | perf (crypto) |
-| `bitOpPatternRecognition`          | `BitOpPatternRecognition.cpp`          | 位运算函数调用 → 原生位指令                        | —                      | perf          |
-| `powerOfTwoDispatchSimplification` | `PowerOfTwoDispatch.cpp`               | 2 的幂次 switch 分派化简                           | —                      | perf          |
-| `tailRecursionElimination`         | `TailRecursionElimination.cpp`         | 尾递归 → 循环                                      | —                      | functional    |
-| `earlyReturnToSelect`              | `EarlyReturnToSelect.cpp`              | if-else-RET → SELECT+RET（单 BB 化）               | —                      | perf          |
-| `inlineExpansion`                  | `InlineExpansion.cpp`                  | 函数内联（热点循环内联 + 多 BB 克隆）              | `test_integration`     | functional    |
-| `mem2reg` / `mem2regLocal`         | `Mem2Reg.cpp`                          | SSA 构造（alloca/load/store → PHI）/ 局部 SSA 提升 | `test_ir`              | functional    |
-| `globalVariablePromotion`          | `GlobalVariablePromotion.cpp`          | 标量全局变量 → 局部 ALLOCA                         | —                      | perf          |
-| `globalConstantPropagation`        | `GlobalConstantPropagation.cpp`        | 只读全局常量 → 常量替换                            | —                      | perf          |
-| `deadGlobalStoreElimination`       | `DeadGlobalStoreElimination.cpp`       | 无读/无逃逸全局的 STORE 消除                       | —                      | perf          |
-| `inplaceMatrixBlocking`            | `InPlaceMatrixBlocking.cpp`            | 原地矩阵乘缓存局部性分块                           | `test_matrix_blocking` | perf          |
+| 入口函数                           | 文件                                   | 职责                                               |
+| ---------------------------------- | -------------------------------------- | -------------------------------------------------- |
+| `treeShaking`                      | `TreeShaking.cpp`                      | 死函数消除（useCount=0 函数删除）                  |
+| `modAddRecurrenceStrengthReduce`   | `NativeLowering.cpp`                   | 模加递推循环 → 原生加法+模运算                     |
+| `radixSortLowering`                | `RadixSortLowering.cpp`                | 基数排序模式 → 原生位提取                          |
+| `redundantIterationElimination`    | `RedundantIterationElimination.cpp`    | 可证冗余的循环迭代消除                             |
+| `dynamicIdempotentLoopElimination` | `DynamicIdempotentLoopElimination.cpp` | 动态幂等循环迭代消除                               |
+| `recursiveMemoization`             | `RecursiveOpt.cpp`                     | 纯自递归函数 → 记忆化查表                          |
+| `repeatedDivRemToNative`           | `NativeLowering.cpp`                   | 重复除余提取 → 原生位运算                          |
+| `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 递归模乘 → WIDE_SMOD_MUL 指令                      |
+| `bitOpPatternRecognition`          | `BitOpPatternRecognition.cpp`          | 位运算函数调用 → 原生位指令                        |
+| `powerOfTwoDispatchSimplification` | `PowerOfTwoDispatch.cpp`               | 2 的幂次 switch 分派化简                           |
+| `tailRecursionElimination`         | `TailRecursionElimination.cpp`         | 尾递归 → 循环                                      |
+| `earlyReturnToSelect`              | `EarlyReturnToSelect.cpp`              | if-else-RET → SELECT+RET（单 BB 化）               |
+| `inlineExpansion`                  | `InlineExpansion.cpp`                  | 函数内联（热点循环内联 + 多 BB 克隆）              |
+| `mem2reg` / `mem2regLocal`         | `Mem2Reg.cpp`                          | SSA 构造（alloca/load/store → PHI）/ 局部 SSA 提升 |
+| `globalVariablePromotion`          | `GlobalVariablePromotion.cpp`          | 标量全局变量 → 局部 ALLOCA                         |
+| `globalConstantPropagation`        | `GlobalConstantPropagation.cpp`        | 只读全局常量 → 常量替换                            |
+| `deadGlobalStoreElimination`       | `DeadGlobalStoreElimination.cpp`       | 无读/无逃逸全局的 STORE 消除                       |
+| `inplaceMatrixBlocking`            | `InPlaceMatrixBlocking.cpp`            | 原地矩阵乘缓存局部性分块                           |
 
 **阶段 2 — 指令级化简 + CFG 简化（迭代 2 次收敛）：**
 
-| 入口函数                     | 文件                             | 职责                                               | 单元测试               | 系统测试   |
-| ---------------------------- | -------------------------------- | -------------------------------------------------- | ---------------------- | ---------- |
-| `instCombine`                | `InstCombine.cpp`                | 指令合并（代数恒等式 + Store-to-Load 前推）        | —                      | functional |
-| `deadStoreElimination`       | `DeadStoreElimination.cpp`       | 死存储消除                                         | —                      | functional |
-| `simplifyCFG`                | `SimplifyCFG.cpp`                | CFG 简化（常量分支折叠 + 不可达块删除 + 空块消除） | —                      | functional |
-| `jumpThreading`              | `JumpThreading.cpp`              | 跳转线程化（冗余跳转链消除）                       | —                      | functional |
-| `triangularCopyOptimization` | `TriangularCopyOptimization.cpp` | 下三角拷贝范围裁剪                                 | —                      | perf       |
-| `conditionalMatrixBlocking`  | `ConditionalMatrixBlocking.cpp`  | 条件矩阵归约列融合                                 | `test_matrix_blocking` | perf       |
+| 入口函数                     | 文件                             | 职责                                               |
+| ---------------------------- | -------------------------------- | -------------------------------------------------- |
+| `instCombine`                | `InstCombine.cpp`                | 指令合并（代数恒等式 + Store-to-Load 前推）        |
+| `deadStoreElimination`       | `DeadStoreElimination.cpp`       | 死存储消除                                         |
+| `simplifyCFG`                | `SimplifyCFG.cpp`                | CFG 简化（常量分支折叠 + 不可达块删除 + 空块消除） |
+| `jumpThreading`              | `JumpThreading.cpp`              | 跳转线程化（冗余跳转链消除）                       |
+| `triangularCopyOptimization` | `TriangularCopyOptimization.cpp` | 下三角拷贝范围裁剪                                 |
+| `conditionalMatrixBlocking`  | `ConditionalMatrixBlocking.cpp`  | 条件矩阵归约列融合                                 |
 
 **阶段 3 — 算术优化（在值传播之前，产生新常量）：**
 
-| 入口函数                  | 文件                          | 职责                                        | 单元测试 | 系统测试   |
-| ------------------------- | ----------------------------- | ------------------------------------------- | -------- | ---------- |
-| `magicDivision`           | `MagicDivision.cpp`           | 常量除法 → 乘法 + 移位序列                  | —        | perf       |
-| `algebraicSimplification` | `AlgebraicSimplification.cpp` | 代数化简（强度削减 sdiv→ashr + 恒等式消除） | —        | functional |
-| `reassociate`             | `Reassociate.cpp`             | 表达式重结合（优化常量折叠机会）            | —        | perf       |
-| `loadElimination`         | `LoadElimination.cpp`         | 冗余 LOAD 消除                              | —        | functional |
+| 入口函数                  | 文件                          | 职责                                        |
+| ------------------------- | ----------------------------- | ------------------------------------------- |
+| `magicDivision`           | `MagicDivision.cpp`           | 常量除法 → 乘法 + 移位序列                  |
+| `algebraicSimplification` | `AlgebraicSimplification.cpp` | 代数化简（强度削减 sdiv→ashr + 恒等式消除） |
+| `reassociate`             | `Reassociate.cpp`             | 表达式重结合（优化常量折叠机会）            |
+| `loadElimination`         | `LoadElimination.cpp`         | 冗余 LOAD 消除                              |
 
 **阶段 4 — 值级别分析 + 传播（迭代 2 次收敛）：**
 
-| 入口函数                               | 文件                  | 职责                             | 单元测试 | 系统测试   |
-| -------------------------------------- | --------------------- | -------------------------------- | -------- | ---------- |
-| `sparseConditionalConstantPropagation` | `SCCP.cpp`            | 稀疏条件常量传播（结合分支条件） | —        | functional |
-| `copyPropagation`                      | `CopyPropagation.cpp` | 复制传播                         | —        | functional |
+| 入口函数                               | 文件                  | 职责                             |
+| -------------------------------------- | --------------------- | -------------------------------- |
+| `sparseConditionalConstantPropagation` | `SCCP.cpp`            | 稀疏条件常量传播（结合分支条件） |
+| `copyPropagation`                      | `CopyPropagation.cpp` | 复制传播                         |
 
 **阶段 5 — 循环优化：**
 
-| 入口函数                  | 文件       | 职责                                            | 单元测试 | 系统测试 |
-| ------------------------- | ---------- | ----------------------------------------------- | -------- | -------- |
-| `loopInvariantCodeMotion` | `LICM.cpp` | 循环不变量外提（NaturalLoop + innermost-first） | —        | perf     |
+| 入口函数                  | 文件       | 职责                                            |
+| ------------------------- | ---------- | ----------------------------------------------- |
+| `loopInvariantCodeMotion` | `LICM.cpp` | 循环不变量外提（NaturalLoop + innermost-first） |
 
 **阶段 6 — 全局清理与最终优化：**
 
-| 入口函数                        | 文件                                | 职责                                        | 单元测试 | 系统测试   |
-| ------------------------------- | ----------------------------------- | ------------------------------------------- | -------- | ---------- |
-| `ifConversion`                  | `IfConversion.cpp`                  | 条件转换（empty-else 菱形 → select）        | —        | functional |
-| `adce`                          | `ADCE.cpp`                          | 激进死代码消除（基于后支配者）              | —        | functional |
-| `codeSink`                      | `CodeSink.cpp`                      | 代码下沉（减少寄存器压力）                  | —        | perf       |
-| `basicBlockReordering`          | `BasicBlockReordering.cpp`          | 基本块重排（支配树 DFS + 分支概率引导布局） | —        | perf       |
-| `globalValueNumbering`          | `GVN.cpp`                           | 全局值编号（支配树跨 BB CSE）               | —        | perf       |
-| `stencilInteriorSpecialization` | `StencilInteriorSpecialization.cpp` | 模板内部边界特化                            | —        | perf       |
-| `matrixReductionContraction`    | `MatrixReductionContraction.cpp`    | 矩阵归约收缩                                | —        | perf       |
+| 入口函数                        | 文件                                | 职责                                        |
+| ------------------------------- | ----------------------------------- | ------------------------------------------- |
+| `ifConversion`                  | `IfConversion.cpp`                  | 条件转换（empty-else 菱形 → select）        |
+| `adce`                          | `ADCE.cpp`                          | 激进死代码消除（基于后支配者）              |
+| `codeSink`                      | `CodeSink.cpp`                      | 代码下沉（减少寄存器压力）                  |
+| `basicBlockReordering`          | `BasicBlockReordering.cpp`          | 基本块重排（支配树 DFS + 分支概率引导布局） |
+| `globalValueNumbering`          | `GVN.cpp`                           | 全局值编号（支配树跨 BB CSE）               |
+| `stencilInteriorSpecialization` | `StencilInteriorSpecialization.cpp` | 模板内部边界特化                            |
+| `matrixReductionContraction`    | `MatrixReductionContraction.cpp`    | 矩阵归约收缩                                |
 
-#### O3 循环特定变换（`runO3`，在 O2 通用优化之后）
+### O3 循环特定变换（`runO3`，在 O2 通用优化之后）
 
-| 入口函数             | 文件                     | 职责                                                       | 单元测试 | 系统测试   |
-| -------------------- | ------------------------ | ---------------------------------------------------------- | -------- | ---------- |
-| `loopInterchange`    | `LoopInterchange.cpp`    | 循环交换（优化访存局部性）                                 | —        | perf       |
-| `loopStrengthReduce` | `LoopStrengthReduce.cpp` | 循环强度削弱（MUL → 累加）                                 | —        | perf       |
-| `loopRotation`       | `LoopRotation.cpp`       | 循环旋转（while → guard + do-while，回边 fall-through 化） | —        | perf       |
-| `loopFullUnroll`     | `LoopFullUnroll.cpp`     | 循环完全展开（tc ≤ 64）                                    | —        | functional |
-| `softwarePipelining` | `SoftwarePipelining.cpp` | 软件流水（跨迭代 LOAD 预取，隐藏 load-use 延迟）           | —        | perf       |
-| `reductionSplitting` | `ReductionSplitting.cpp` | 归约分裂（多累加器，消除长依赖链）                         | —        | perf       |
-| `loopUnrolling`      | `LoopUnrolling.cpp`      | 循环部分展开（最大 16×，tc ≤ 256）                         | —        | perf       |
-| `gepStrengthReduce`  | `GEPStrengthReduce.cpp`  | GEP 地址计算强度削弱                                       | —        | perf       |
+| 入口函数             | 文件                     | 职责                                                       |
+| -------------------- | ------------------------ | ---------------------------------------------------------- |
+| `loopInterchange`    | `LoopInterchange.cpp`    | 循环交换（优化访存局部性）                                 |
+| `loopStrengthReduce` | `LoopStrengthReduce.cpp` | 循环强度削弱（MUL → 累加，BOOM mul 单周期默认禁用）        |
+| `loopRotation`       | `LoopRotation.cpp`       | 循环旋转（while → guard + do-while，回边 fall-through 化） |
+| `loopFullUnroll`     | `LoopFullUnroll.cpp`     | 循环完全展开（tc ≤ 64）                                    |
+| `softwarePipelining` | `SoftwarePipelining.cpp` | 软件流水（跨迭代 LOAD 预取，隐藏 load-use 延迟）           |
+| `reductionSplitting` | `ReductionSplitting.cpp` | 归约分裂（多累加器，消除长依赖链）                         |
+| `loopUnrolling`      | `LoopUnrolling.cpp`      | 循环部分展开（最大 16×，tc ≤ 256）                         |
+| `gepStrengthReduce`  | `GEPStrengthReduce.cpp`  | GEP 地址计算强度削弱                                       |
 
-#### P0 特殊模式识别（`runP0`，语义级优化）
+### P0 特殊模式识别（`runP0`，语义级优化）
 
-| 入口函数                   | 文件                          | 职责                               | 单元测试 | 系统测试 |
-| -------------------------- | ----------------------------- | ---------------------------------- | -------- | -------- |
-| `recursiveMulToNative`     | `NativeLowering.cpp`          | 递归乘法 → 原生 MUL                | —        | perf     |
-| `bitOpPatternRecognition`  | `BitOpPatternRecognition.cpp` | 位运算模式识别                     | —        | perf     |
-| `hoistRecursiveCallGuards` | `RecursiveOpt.cpp`            | 递归调用守卫提升（base-case 短路） | —        | perf     |
+| 入口函数                   | 文件                          | 职责                               |
+| -------------------------- | ----------------------------- | ---------------------------------- |
+| `recursiveMulToNative`     | `NativeLowering.cpp`          | 递归乘法 → 原生 MUL                |
+| `bitOpPatternRecognition`  | `BitOpPatternRecognition.cpp` | 位运算模式识别                     |
+| `hoistRecursiveCallGuards` | `RecursiveOpt.cpp`            | 递归调用守卫提升（base-case 短路） |
 
-#### P3 指令调度（`runP3`）
+### P3 指令调度（`runP3`）
 
-| 入口函数                | 文件                        | 职责                                | 单元测试 | 系统测试 |
-| ----------------------- | --------------------------- | ----------------------------------- | -------- | -------- |
-| `instructionScheduling` | `InstructionScheduling.cpp` | 指令调度（暴露 ILP + 分支友好布局） | —        | perf     |
+| 入口函数                | 文件                        | 职责                                |
+| ----------------------- | --------------------------- | ----------------------------------- |
+| `instructionScheduling` | `InstructionScheduling.cpp` | 指令调度（暴露 ILP + 分支友好布局） |
 
-#### 优化基础设施（供其他 Pass 调用）
+### 优化基础设施（供其他 Pass 调用）
 
 | 入口函数                                                                                                                                  | 文件                    | 职责                                                              |
 | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------- |
@@ -230,19 +247,206 @@ include/utils/Error.h, Logger.h  ← 通用工具
 | `readOnlyGlobalAnalysis`                                                                                                                  | `ReadOnlyGlobal.cpp`    | 只读全局变量分析                                                  |
 | `phiLowering`                                                                                                                             | `PhiLowering.cpp`       | PHI 降级（PHI → ALLOCA + STORE + LOAD）                           |
 | `buildAllocaArgumentMap`/`collectPointerAccess`/`analyzeAffineRecurrence`/`analyzeAllocaScalarReduction`/`analyzeCanonicalCountedLoop`    | `LoopAnalysis.cpp`      | 循环分析合并模块（访存分解 + 仿射递推 + 标量归约 + 计数循环模式） |
+| `analyzeGlobalMemoryEffects`                                                                                                              | `MemoryAccessAnalysis.cpp` | 全局对象内存效应分析（地址逃逸检测）                              |
 
-### 后端（Backend）
+---
 
-| 文件                                | 入口函数/类                       | 职责                                                                                                                         | 单元测试                          | 系统测试        |
-| ----------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | --------------- |
-| `src/backend/TargetCodeGen.cpp`     | `TargetCodeGen::generate(module)` | IR → RV64GC 汇编（ALLOCA 寄存器提升 + GEP 融合 + ICMP-CondBr 融合 + PHI 边拷贝 + 全局地址缓存 + 循环头对齐 + WIDE_SMOD_MUL） | `test_peephole`                   | functional 全集 |
-| `src/backend/RegisterAllocator.cpp` | `RegisterAllocator`               | 图着色寄存器分配（callee-saved 管理 + 溢出决策）                                                                             | `test_register_allocator`（可选） | functional 全集 |
-| `src/backend/PostRAScheduler.cpp`   | `PostRAScheduler`                 | 寄存器分配后指令调度（mul 单周期延迟建模）                                                                                   | —                                 | perf            |
-| `src/opt/PeepholeOptimizer.cpp`     | `peepholeOptimize(asmCode)`       | 窥孔优化（mv+branch copy propagation + 压缩指令生成 c.li/c.addi/c.mv/c.ld/c.sd/c.j/c.beqz）                                  | `test_peephole`                   | functional 全集 |
+## 后端代码生成
+
+后端将优化后的 IR 转换为 RV64GC 汇编，经寄存器分配、PostRA 调度与窥孔优化后输出。主编译流程为 `compile → runOptPasses → TargetCodeGen::generate → peepholeOptimize`。
+
+```mermaid
+flowchart TD
+    Mod["IR Module"]
+    Gen["TargetCodeGen::generate"]
+    EmitFn["emitFunction (逐函数)"]
+    CollAddr["collectGlobalAddresses<br/>全局地址缓存到 s0/s1"]
+    Promote["promoteAllocasInFunction<br/>ALLOCA 寄存器提升"]
+    RegAlloc["RegisterAllocator::allocate<br/>图着色寄存器分配"]
+    EmitBB["emitBasicBlock (逐块)<br/>GEP 融合 + ICMP-CondBr 融合<br/>PHI 边拷贝 + 循环头对齐 + G2 预取"]
+    PostRA["postRASchedule<br/>寄存器分配后指令调度<br/>mul 单周期延迟建模"]
+    Peep["peepholeOptimize<br/>mv+branch copy prop<br/>压缩指令生成 c.li/c.addi/c.mv/c.ld/c.sd/c.j/c.beqz"]
+    Out["汇编文本"]
+
+    Mod --> Gen --> EmitFn
+    EmitFn --> CollAddr --> Promote --> RegAlloc --> EmitBB
+    EmitFn --> PostRA
+    PostRA --> Peep --> Out
+```
+
+### 后端组件
+
+| 文件                                | 入口函数/类                       | 职责                                                                                                                         |
+| ----------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `src/backend/TargetCodeGen.cpp`     | `TargetCodeGen::generate(module)` | IR → RV64GC 汇编（ALLOCA 寄存器提升 + GEP 融合 + ICMP-CondBr 融合 + PHI 边拷贝 + 全局地址缓存 + 循环头对齐 + WIDE_SMOD_MUL + G2 指令预取） |
+| `src/backend/RegisterAllocator.cpp` | `RegisterAllocator`               | 图着色寄存器分配（callee-saved 管理 + 溢出决策 + PHI 合并）                                                                  |
+| `src/backend/PostRAScheduler.cpp`   | `PostRAScheduler`                 | 寄存器分配后指令调度（mul 单周期延迟建模）                                                                                   |
+| `src/opt/PeepholeOptimizer.cpp`     | `peepholeOptimize(asmCode)`       | 窥孔优化（mv+branch copy propagation + 压缩指令生成 + 死 trampoline 清理）                                                   |
+
+### 寄存器分配策略
+
+```mermaid
+graph TD
+    Start["进入 allocate(func)"]
+    Leaf{"叶函数且<br/>prefersExpandedLeafRegisters?"}
+    Pressure{"峰值活跃值<br/>超出基池容量?"}
+    AddArg["加入未用 a2-a7/fa2-fa7<br/>扩充调用者保存池"]
+    Base["使用基池<br/>INT: s0-s11,t3-t6<br/>FLOAT: fs0-fs11,ft2-ft11"]
+    Graph{"图着色?"}
+    Color["colorAllocate<br/>图着色分配（默认）"]
+    Linear["linearScan<br/>线性扫描"]
+    Coalesce["coalescePhis<br/>PHI 合并"]
+    Done["分配完成"]
+
+    Start --> Leaf
+    Leaf -->|是| Pressure
+    Pressure -->|是| AddArg --> Graph
+    Pressure -->|否| Graph
+    Leaf -->|否| Graph
+    Graph -->|默认| Color --> Coalesce --> Done
+    Graph -->|RA_ALLOCATOR=linear| Linear --> Coalesce
+```
+
+INT 寄存器池排除 a0-a7（避免调用点大量保存/恢复开销），FLOAT 排除 fa0-fa7；ft0/ft1 保留为浮点 scratch。G2 指令预取使用 t0(x5)，不在 RA 的 INT_REGS 池（s0-s11,t3-t6）中，确保不干扰跨块活跃值。
+
+---
+
+## 关键变换图解
+
+### If-Conversion（empty-else 菱形 → select）
+
+将 `if(cond){acc+=expr;}` 形式的条件归约通过 IfConversion 形态2 + Pattern E 转为无分支 select，消除条件跳转（huffman-01 的 `_and/_or/_xor` 主循环变单 BB 无分支）。
+
+```mermaid
+flowchart LR
+    subgraph 变换前
+        B0a["bb0<br/>if.cond"] -->|true| B1a["bb1<br/>if.then<br/>acc += expr"]
+        B0a -->|false| B3a["bb3<br/>if.end"]
+        B1a --> B3a
+    end
+    subgraph 变换后
+        B0b["bb0<br/>if.cond"] --> B3b["bb3<br/>select<br/>acc = acc + (expr - acc) * cond"]
+    end
+```
+
+Pattern E 仅限整数（在 `if(!isFloat)` 守卫内）；float SELECT 走 fallback 分支路径，spilled tv/fv 必须用 ft0/ft1 加载（fmv.s 两操作数均需浮点寄存器）。
+
+### LoopRotation（while → guard + do-while）
+
+将 Header 退出循环旋转为 Latch 退出循环，使回边 fall-through，减少分支误预测。
+
+```mermaid
+flowchart LR
+    subgraph 变换前
+        PHa["PreHeader"] --> HDa["Header<br/>(退出循环)"]
+        HDa --> BDa["Body"] --> LTa["Latch"]
+        LTa -->|回边| HDa
+        HDa --> EXa["Exit"]
+    end
+    subgraph 变换后
+        PHb["PreHeader+Header"] --> BDb["Body"] --> LTb["Latch"]
+        LTb -->|回边 fall-through| HDb["Header"]
+        HDb -->|退出| EXb["Exit"]
+    end
+```
+
+### G2 指令预取（Zicbop prefetch.i）
+
+在每个循环头对应的"非回边、布局最近"的 preheader 块首注入 `prefetch.i` 指令，预取循环体指令到 BOOM L1 I-cache，改善指令缓存局部性。
+
+```mermaid
+flowchart TD
+    subgraph 注入前
+        PH1["PreHeader"] --> HD1["Loop Header<br/>(循环体入口)"]
+        HD1 --> BODY1["Loop Body"]
+    end
+    subgraph 注入后
+        PH2["PreHeader<br/>+ la t0, .LloopHeader<br/>+ prefetch.i 0(t0)<br/>(0x0002E013)"]
+        PH2 --> HD2["Loop Header<br/>.LloopHeader:"]
+        HD2 --> BODY2["Loop Body"]
+    end
+```
+
+- 寄存器安全：t0(x5) 不在 RA 的 INT_REGS 池（s0-s11,t3-t6）中，块首 clobber 安全。
+- 编码：`prefetch.i 0(t0)` 编码为 `0x0002E013`，可在纯 RV64GC（不含 zicbop）上汇编链接运行。
+- PeepholeOptimizer 的死 trampoline 清理已识别 `la`/`lui` 标签引用，不会误删预取目标标签。
+- 开关：`G2_OFF=1` 关闭，`G2_MINLOOP=N` 调整最小循环体门限（默认 4）。
+
+### SimplifyCFG 空块合并
+
+```mermaid
+flowchart LR
+    subgraph 变换前
+        P1a["pred1"] --> Ca["curr<br/>(空块: j dest)"]
+        P2a["pred2"] --> Ca
+        Ca --> Desta["dest"]
+        Othera["other"] --> Desta
+    end
+    subgraph 变换后
+        P1b["pred1"] --> Destb["dest"]
+        P2b["pred2"] --> Destb
+        Otherb["other"] --> Destb
+    end
+```
+
+### SoftwarePipelining（跨迭代 LOAD 预取）
+
+```mermaid
+flowchart LR
+    subgraph 变换前
+        I1a["iter i:<br/>LOAD a[i]<br/>COMPUTE<br/>STORE r"]
+        I2a["iter i+1:<br/>LOAD a[i+1]<br/>COMPUTE<br/>STORE r"]
+    end
+    subgraph 变换后
+        PRO["Prologue<br/>LOAD a[0]"]
+        KER["Kernel<br/>STORE r[i-1]<br/>LOAD a[i+1]<br/>COMPUTE r[i]"]
+        EPI["Epilogue<br/>STORE r[last]"]
+        PRO --> KER --> EPI
+    end
+```
+
+隐藏 BOOM 4 周期 load-use 延迟。使用 step-aware 迭代计数计算（`inferTripCount` + `traceAddChain`/`computeAllocaStep`，要求 `(bound-init) % step == 0`）。开关 `P9_OFF=1` 禁用。
+
+---
+
+## 函数功能列表
+
+### 前端（Frontend）
+
+| 文件                        | 入口函数                         | 职责                                                        |
+| --------------------------- | -------------------------------- | ----------------------------------------------------------- |
+| `grammar/SysY2022Lexer.g4`  | —（ANTLR4 生成）                 | SysY2022 词法规则                                           |
+| `grammar/SysY2022Parser.g4` | —（ANTLR4 生成）                 | SysY2022 语法规则                                           |
+| `src/ir/IRBuilder.cpp`      | `IRBuilder::compile(sourcePath)` | Visitor 模式从 ParseTree 直接生成 IR Module                 |
+| `src/main.cpp`              | `main()`                         | 命令行解析 + 调度编译流程                                   |
+| `src/Compiler.cpp`          | `Compiler::emitAsmToFile()`      | 编译门面：compile → runOptPasses → TargetCodeGen → peephole |
+
+### 中间表示（IR）
+
+| 文件                                | 核心类型/函数                                                                                                                                                                                   | 职责                         |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| `include/ir/IR.h` / `src/ir/IR.cpp` | `Value`, `Instruction`, `BasicBlock`, `Function`, `Module`, `Type`/`IntegerType`/`FloatType`/`ArrayType`/`FunctionType`, `Constant`/`ConstantInt`/`ConstantFloat`, `Argument`, `GlobalVariable` | IR 类型系统与数据结构        |
+| `include/ir/IRBuilder.h`            | `IRBuilder`                                                                                                                                                                                     | IR 构造器（Visitor 直生 IR） |
 
 ---
 
 ## 测试体系
+
+```mermaid
+graph TD
+    Unit["单元测试<br/>tests/ (CMake/CTest)"]
+    Func["功能测试<br/>test/functional/<br/>100 用例"]
+    HFunc["硬件功能测试<br/>test/h_functional/<br/>40 用例"]
+    Perf["性能测试<br/>test/performance/<br/>60 用例"]
+    QEMU["QEMU 用户态模拟<br/>qemu-riscv64"]
+    GCC["riscv64-linux-gnu-gcc 交叉链接<br/>+ libsylib.a"]
+
+    Unit --> Build["cmake --build build"]
+    Func --> GCC --> QEMU
+    HFunc --> GCC --> QEMU
+    Perf --> GCC --> QEMU
+    Build --> Unit
+```
 
 ### 单元测试（`tests/`，CMake/CTest 驱动）
 
@@ -254,22 +458,15 @@ include/utils/Error.h, Logger.h  ← 通用工具
 | `test_matrix_blocking`    | `tests/test_matrix_blocking.cppx`           | 矩阵分块合法性 + 触发条件                    | `ctest --test-dir build -R matrix_blocking_unit`    |
 | `test_register_allocator` | `tests/test_register_allocator.cpp`（可选） | 寄存器分配回归                               | `ctest --test-dir build -R register_allocator_unit` |
 
-```bash
-# 构建并运行全部单元测试
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-```
-
 ### 系统测试（QEMU 模拟执行）
 
 | 套件         | 目录                 | 用例数 | 运行脚本                             | 期望基线（-O1/OALL）   |
 | ------------ | -------------------- | ------ | ------------------------------------ | ---------------------- |
-| 功能测试     | `test/functional/`   | 100    | `bash scripts/run_tests.sh func O1`  | 96 OK / 3 DIFF / 1 TO¹ |
+| 功能测试     | `test/functional/`   | 100    | `bash scripts/run_tests.sh func O1`  | 97 OK / 3 DIFF / 0 TO¹ |
 | 硬件功能测试 | `test/h_functional/` | 40     | `bash scripts/run_tests.sh hfunc O1` | 36 OK / 4 DIFF²        |
 | 性能测试     | `test/performance/`  | 60     | `bash scripts/test_perf_wsl.sh`      | 60/60 PASS             |
 
-> ¹ 62_percolation / 68_brainfk / 75_max_flow 在合并基线即失败（非本轮引入），1 个超时为 FPGA 抖动。
+> ¹ 62_percolation / 68_brainfk / 71_full_conn 在合并基线即失败（非本轮引入）。
 > ² 12_DSU / 21_union_find / 30_many_dimensions / 35_math 在合并基线即失败。
 
 **测试运行前准备：**
@@ -371,10 +568,15 @@ make -j$(nproc)
 | ---------------------- | --------------------------------------- | ------------------------------------------------------------------ |
 | `OPT_DISABLE`          | 黑名单：禁用指定 Pass                   | `OPT_DISABLE="gvn,licm" ./build/compiler -S -o out.s in.sy -O1`    |
 | `OPT_ENABLE`           | 白名单：只运行指定 Pass                 | `OPT_ENABLE="mem2reg,sccp" ./build/compiler -S -o out.s in.sy -O1` |
+| `G2_OFF=1`             | 禁用指令预取                            | —                                                                  |
+| `G2_MINLOOP=N`         | 指令预取最小循环体门限（默认 4）        | —                                                                  |
 | `P6_OFF=1`             | 禁用宏指令融合                          | `P6_OFF=1 ./build/compiler ...`                                    |
 | `P8_OFF=1`             | 禁用软件流水（旧）                      | —                                                                  |
 | `P9_OFF=1`             | 禁用跨迭代 LOAD 预取（软件流水）        | —                                                                  |
 | `LAYOUT_PROB_OFF=1`    | 禁用分支概率引导布局                    | —                                                                  |
+| `SCHED_PRESSURE_OFF=1` | 禁用 PostRA 寄存器压力感知调度          | —                                                                  |
+| `COLD_SPLIT_OFF=1`     | 禁用冷热分离优化                        | —                                                                  |
+| `IFCONV_EXT_OFF=1`     | 禁用 If-Conversion 双路菱形扩展         | —                                                                  |
 | `ROT_ALLOCA_OFF=1`     | 禁用 alloca-IV 循环旋转路径             | —                                                                  |
 | `NO_PEEPHOLE=1`        | 禁用窥孔优化                            | —                                                                  |
 | `DEBUG_LOWER_PHI=1`    | 启用 PHI 降级（调试）                   | —                                                                  |

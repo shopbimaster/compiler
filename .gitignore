@@ -54,6 +54,11 @@ temp/
 *.bak
 *.backup
 
+# Node.js dependencies (mermaid validation tooling, not part of build)
+node_modules/
+package.json
+package-lock.json
+
 # CMake generated files in root
 CMakeCache.txt
 CMakeFiles/
