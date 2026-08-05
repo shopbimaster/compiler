@@ -377,6 +377,16 @@ std::string peepholeOptimize(const std::string& asmCode) {
                            opName == "bge" || opName == "bltu" || opName == "bgeu") {
                     if (tryMatch(line, opName, rd, rs, imm) && !imm.empty())
                         referencedLabels.insert(imm);
+                } else if (opName == "la" || opName == "lui") {
+                    // la rd, symbol / lui rd, imm：引用符号/标签。
+                    // ★ G2 指令预取发射 `la t0, .L<loopHeader>`，若此处不把该标签计入
+                    //   referencedLabels，下面"删除死 trampoline"会把它当无人引用而删掉，
+                    //   导致 `.Linterpret_merge_11` 悬空虚引用（68_brainfk/23_json 链接错误）。
+                    std::string aRd, aRs, aImm;
+                    if (tryMatch(line, opName, aRd, aRs, aImm)) {
+                        if (!aImm.empty()) referencedLabels.insert(aImm);
+                        else if (!aRs.empty()) referencedLabels.insert(aRs);
+                    }
                 }
             }
 
@@ -588,6 +598,14 @@ std::string peepholeOptimize(const std::string& asmCode) {
                            opName == "bge" || opName == "bltu" || opName == "bgeu") {
                     if (tryMatch(line, opName, rRd, rRs, rImm) && !rImm.empty())
                         referencedLabels.insert(rImm);
+                } else if (opName == "la" || opName == "lui") {
+                    // 与上文 trampoline 清理保持一致：la/lui 引用的标签视为"被引用"，
+                    // 在标签处清空 LVN 跟踪（保守，安全）。
+                    std::string aRd, aRs, aImm;
+                    if (tryMatch(line, opName, aRd, aRs, aImm)) {
+                        if (!aImm.empty()) referencedLabels.insert(aImm);
+                        else if (!aRs.empty()) referencedLabels.insert(aRs);
+                    }
                 }
             }
 

@@ -316,6 +316,14 @@ void TargetCodeGen::detectPrefetchSites(IR::Function& func) {
         if (loopInsts < minSize) continue;
 
         prefetchTargetMap[preheader] = h;
+        if (std::getenv("DBG_G2")) {
+            // 校验 target 是否确实在 func.getBlocks() 中（应为真）
+            bool inBlocks = false;
+            for (auto& bb : blocks) if (bb.get() == h) inBlocks = true;
+            fprintf(stderr, "[G2] fn=%s preheader=%s target=%s inBlocks=%d\n",
+                    func.getName().c_str(), preheader->getName().c_str(),
+                    h->getName().c_str(), (int)inBlocks);
+        }
     }
 }
 
@@ -426,6 +434,8 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
         for (size_t i = 0; i < blocks.size(); ++i) {
             nextBB = (i + 1 < blocks.size()) ? blocks[i + 1].get() : nullptr;
             nextIsExit = (i + 1 == blocks.size());
+            if (std::getenv("DBG_G2"))
+                fprintf(stderr, "[G2-EMIT] %s\n", blocks[i]->getName().c_str());
             emitBasicBlock(*blocks[i]);
         }
         nextBB = nullptr;
