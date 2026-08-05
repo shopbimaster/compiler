@@ -19,6 +19,18 @@ struct OptimizationResult {
     bool callsHotLoopTest = false;
 };
 
+bool hasMatrixReductionHelpers(const OptimizationResult& result) {
+    return result.ir.find("__opt_contract_row_sum") != std::string::npos ||
+        result.ir.find("__opt_affine_row_summary") != std::string::npos ||
+        result.ir.find("__opt_reduction_summary_total") != std::string::npos;
+}
+
+bool hasCompleteMatrixReductionHelpers(const OptimizationResult& result) {
+    return result.ir.find("__opt_contract_row_sum") != std::string::npos &&
+        result.ir.find("__opt_affine_row_summary") != std::string::npos &&
+        result.ir.find("__opt_reduction_summary_total") != std::string::npos;
+}
+
 OptimizationResult runFocusedPass(
         const std::string& source, bool (*pass)(IR::Module*)) {
     IR::IRBuilder builder;
@@ -79,6 +91,79 @@ int main() {
     setenv("M2R_NONENTRY_ALLPASS", "1", 1);
 #endif
 
+    const OptimizationResult constantFillReduction = optimizeToO2(
+        "../tests/regression/matrix_reduction_constant_fill.sy");
+    if (!hasCompleteMatrixReductionHelpers(constantFillReduction)) {
+        std::cerr << "valid constant-fill matrix reduction did not trigger\n";
+        return 1;
+    }
+
+    const OptimizationResult guardedReduction = optimizeToO2(
+        "../tests/regression/matrix_reduction_guarded_update.sy");
+    if (!hasCompleteMatrixReductionHelpers(guardedReduction)) {
+        std::cerr << "valid guarded matrix reduction did not trigger\n";
+        return 1;
+    }
+
+    const OptimizationResult dynamicFillReduction = optimizeToO2(
+        "../tests/regression/matrix_reduction_dynamic_fill.sy");
+    if (!hasCompleteMatrixReductionHelpers(dynamicFillReduction)) {
+        std::cerr << "valid dynamic-fill matrix reduction did not trigger\n";
+        return 1;
+    }
+
+    const OptimizationResult reorderedArgumentsReduction = optimizeToO2(
+        "../tests/regression/matrix_reduction_reordered_args.sy");
+    if (!hasCompleteMatrixReductionHelpers(reorderedArgumentsReduction)) {
+        std::cerr << "valid reordered-argument matrix reduction did not trigger\n";
+        return 1;
+    }
+
+    struct RejectedMatrixReductionFixture {
+        const char* source;
+        const char* description;
+    };
+    const RejectedMatrixReductionFixture rejectedReductions[] = {
+        {"../tests/regression/matrix_reduction_reject_diagonal_init.sy",
+         "diagonal-only initialization"},
+        {"../tests/regression/matrix_reduction_reject_conditional_init.sy",
+         "conditional initialization"},
+        {"../tests/regression/matrix_reduction_reject_late_init.sy",
+         "initialization after the recurrence"},
+        {"../tests/regression/matrix_reduction_reject_kernel_early_return.sy",
+         "coefficient guard that returns from the kernel"},
+        {"../tests/regression/matrix_reduction_reject_kernel_return_before_recurrence.sy",
+         "kernel return between initialization and recurrence"},
+        {"../tests/regression/matrix_reduction_reject_kernel_extra_loop.sy",
+         "additional possibly nonterminating kernel loop"},
+        {"../tests/regression/matrix_reduction_reject_diagonal_final_reduction.sy",
+         "diagonal-only final reduction"},
+        {"../tests/regression/matrix_reduction_reject_conditional_final_reduction.sy",
+         "conditional final reduction"},
+        {"../tests/regression/matrix_reduction_reject_accumulator_extra_read.sy",
+         "extra accumulator read controlling an early return"},
+        {"../tests/regression/matrix_reduction_reject_submatrix_slice.sy",
+         "submatrix input slice"},
+        {"../tests/regression/matrix_reduction_reject_zero_slice.sy",
+         "zero-offset slice of a three-dimensional global"},
+        {"../tests/regression/matrix_reduction_reject_const_seed.sy",
+         "read-only matrix used as the summary seed"},
+        {"../tests/regression/matrix_reduction_reject_reduction_extra_loop.sy",
+         "additional possibly nonterminating final-reduction loop"},
+        {"../tests/regression/matrix_reduction_reject_call_loop_extra_loop.sy",
+         "possibly nonterminating loop before the kernel call"},
+        {"../tests/regression/matrix_reduction_reject_zero_trip_call_loop.sy",
+         "possibly zero-trip call loop with a distinct result matrix"},
+    };
+    for (const auto& fixture : rejectedReductions) {
+        const OptimizationResult result = optimizeToO2(fixture.source);
+        if (hasMatrixReductionHelpers(result)) {
+            std::cerr << "unsafe matrix reduction triggered for "
+                      << fixture.description << "\n";
+            return 1;
+        }
+    }
+
     const OptimizationResult inPlace = optimizeToO2(
         "../test/performance/many_mat_cal-1.sy");
     if (inPlace.ir.find("__opt_inplace_matrix_row_private") ==
@@ -118,6 +203,14 @@ int main() {
     }
     if (!conditional.conditionalHelperPrefersExpandedRegisters) {
         std::cerr << "conditional helper is missing its leaf-register hint\n";
+        return 1;
+    }
+    const auto firstProduct = conditional.ir.find("%block.product.0 =");
+    const auto firstMaskLoad = conditional.ir.find("%block.B.0 = load");
+    if (firstProduct == std::string::npos ||
+        firstMaskLoad == std::string::npos ||
+        firstProduct > firstMaskLoad) {
+        std::cerr << "conditional lane product was sunk across its mask chain\n";
         return 1;
     }
 
@@ -170,6 +263,57 @@ int main() {
     if (!genericFixedPoint.changed ||
         genericFixedPoint.ir.find("fixedpoint.ready") == std::string::npos) {
         std::cerr << "renamed dynamic fixed-point variant did not trigger\n";
+        return 1;
+    }
+
+    IR::Module effectsModule;
+    auto* i32 = IR::IntegerType::I32;
+    auto* tracked = effectsModule.createGlobalVariable(
+        IR::PointerType::get(i32), "tracked", false,
+        IR::ConstantInt::get(i32, 0));
+    auto* observer = effectsModule.createFunction(
+        IR::FunctionType::get(
+            IR::VoidType::get(), {tracked->getType()}),
+        "observe", true);
+    auto* effectsFunction = effectsModule.createFunction(
+        IR::FunctionType::get(IR::VoidType::get(), {}),
+        "effects");
+    auto* effectsEntry = effectsFunction->createBlock("entry");
+    effectsEntry->pushBack(
+        IR::Instruction::createLoad(i32, tracked, "loaded"));
+    effectsEntry->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(i32, 1), tracked));
+    effectsEntry->pushBack(IR::Instruction::createCall(
+        observer->getFunctionType(), observer, {tracked}, ""));
+    effectsEntry->pushBack(IR::Instruction::createRet(nullptr));
+
+    Opt::GlobalMemoryEffects effects;
+    if (!Opt::analyzeGlobalMemoryEffects(tracked, effects) ||
+        effects.loads.size() != 1 ||
+        effects.stores.size() != 1 ||
+        effects.calls.size() != 1) {
+        std::cerr << "global memory effects were not classified precisely\n";
+        return 1;
+    }
+
+    IR::Module escapeModule;
+    auto* escaped = escapeModule.createGlobalVariable(
+        IR::PointerType::get(i32), "escaped", false,
+        IR::ConstantInt::get(i32, 0));
+    auto* escapeFunction = escapeModule.createFunction(
+        IR::FunctionType::get(IR::VoidType::get(), {}),
+        "escape");
+    auto* escapeEntry = escapeFunction->createBlock("entry");
+    auto* pointerSlot = IR::Instruction::createAlloca(
+        escaped->getType(), "pointer.slot");
+    escapeEntry->pushBack(pointerSlot);
+    escapeEntry->pushBack(
+        IR::Instruction::createStore(escaped, pointerSlot));
+    escapeEntry->pushBack(IR::Instruction::createRet(nullptr));
+    Opt::GlobalMemoryEffects escapedEffects;
+    if (Opt::analyzeGlobalMemoryEffects(
+            escaped, escapedEffects)) {
+        std::cerr << "stored global address was not treated as an escape\n";
         return 1;
     }
 

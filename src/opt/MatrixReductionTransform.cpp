@@ -303,10 +303,92 @@ IR::Function* createRowSummaryFunction(
     return function;
 }
 
+IR::Function* createReductionSummaryTotalFunction(
+    IR::Module* module, IR::ArrayType* rowType,
+    int64_t start, int64_t step,
+    bool inclusiveUpperBound) {
+    auto* i32 = IR::IntegerType::I32;
+    auto* rowPointer = IR::PointerType::get(rowType);
+    auto* type = IR::FunctionType::get(
+        i32, {i32, rowPointer});
+    auto* function = module->createFunction(
+        type, "__opt_reduction_summary_total", false);
+
+    auto* zero = IR::ConstantInt::get(i32, 0);
+    auto* indexStart = IR::ConstantInt::get(i32, start);
+    auto* indexStep = IR::ConstantInt::get(i32, step);
+    const std::string loopPredicate =
+        inclusiveUpperBound ? "sle" : "slt";
+    auto* entry = function->createBlock("total.entry");
+    auto* header = function->createBlock("total.i.cond");
+    auto* body = function->createBlock("total.i.body");
+    auto* exit = function->createBlock("total.exit");
+
+    auto* indexNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "total.i.next", nullptr,
+        indexStep);
+    auto* sumNext = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "total.sum.next", nullptr, nullptr);
+    auto* index = makePhi(
+        i32, "total.i", indexStart, entry, indexNext, body);
+    auto* sum = makePhi(
+        i32, "total.sum", zero, entry, sumNext, body);
+    indexNext->setOperand(0, index);
+
+    entry->pushBack(IR::Instruction::createBr(header));
+    header->pushBack(index);
+    header->pushBack(sum);
+    auto* compare = IR::Instruction::createCmp(
+        Opc::ICMP, index, function->getArg(0),
+        loopPredicate);
+    header->pushBack(compare);
+    header->pushBack(
+        IR::Instruction::createCondBr(compare, body, exit));
+
+    auto* row = IR::Instruction::createGetElementPtr(
+        rowType, function->getArg(1), {index},
+        "total.row");
+    auto* summaryAddress =
+        IR::Instruction::createGetElementPtr(
+            i32, row, {zero, indexStart},
+            "total.summary.addr");
+    auto* summary = IR::Instruction::createLoad(
+        i32, summaryAddress, "total.summary");
+    sumNext->setOperand(0, sum);
+    sumNext->setOperand(1, summary);
+    body->pushBack(row);
+    body->pushBack(summaryAddress);
+    body->pushBack(summary);
+    body->pushBack(sumNext);
+    body->pushBack(indexNext);
+    body->pushBack(IR::Instruction::createBr(header));
+
+    exit->pushBack(IR::Instruction::createRet(sum));
+    return function;
+}
+
 } // namespace
 
 bool applyMatrixReductionPlan(
     IR::Module* module, const MatrixReductionPlan& plan) {
+    auto* seedMatrixType = dynamic_cast<IR::PointerType*>(
+        plan.seedMatrix->getType());
+    auto* resultMatrixType = dynamic_cast<IR::PointerType*>(
+        plan.resultMatrix->getType());
+    auto* callLoopTerminator =
+        plan.loopPreheader->getTerminator();
+    auto* reductionTerminator =
+        plan.finalReductionPreheader->getTerminator();
+    if (!seedMatrixType || !resultMatrixType ||
+        !callLoopTerminator || !reductionTerminator ||
+        reductionTerminator->getOpcode() != Opc::BR ||
+        reductionTerminator->getNumOperands() != 1 ||
+        !plan.finalReductionInitialization ||
+        plan.finalReductionInitialization->getParent() !=
+            plan.finalReductionPreheader) {
+        return false;
+    }
+
     auto* summaryFunction =
         createRowSummaryFunction(
             module, plan.kernel.rowType,
@@ -315,41 +397,65 @@ bool applyMatrixReductionPlan(
             plan.kernel.inclusiveUpperBound);
     auto* summaryKernel =
         createAffineRowSummaryFunction(module, plan.kernel);
+    auto* totalFunction =
+        createReductionSummaryTotalFunction(
+            module, plan.kernel.rowType,
+            plan.kernel.indexStart,
+            plan.kernel.indexStep,
+            plan.kernel.inclusiveUpperBound);
     auto* zero =
         IR::ConstantInt::get(IR::IntegerType::I32, 0);
-    auto* matrixType = dynamic_cast<IR::PointerType*>(
-        plan.seedMatrix->getType());
-    if (!matrixType) return false;
     auto* matrixBase =
         IR::Instruction::createGetElementPtr(
-            matrixType->getPointeeType(), plan.seedMatrix,
+            seedMatrixType->getPointeeType(), plan.seedMatrix,
             {zero, zero}, "contract.B.base");
     auto* summaryCall = IR::Instruction::createCall(
         summaryFunction->getFunctionType(), summaryFunction,
         {plan.size, matrixBase}, "");
 
-    auto* terminator = plan.loopPreheader->getTerminator();
-    if (!terminator) return false;
+    auto* resultBase =
+        IR::Instruction::createGetElementPtr(
+            resultMatrixType->getPointeeType(),
+            plan.resultMatrix, {zero, zero},
+            "contract.result.base");
+    auto* totalCall = IR::Instruction::createCall(
+        totalFunction->getFunctionType(), totalFunction,
+        {plan.size, resultBase}, "contract.result.total");
+
     for (auto iterator = plan.loopPreheader->begin();
          iterator != plan.loopPreheader->end(); ++iterator) {
-        if (iterator->get() != terminator) continue;
+        if (iterator->get() != callLoopTerminator) continue;
         iterator =
             plan.loopPreheader->insert(iterator, matrixBase);
         ++iterator;
         plan.loopPreheader->insert(iterator, summaryCall);
-        for (auto* call : plan.calls) {
-            call->setOperand(0, summaryKernel);
-        }
-        plan.finalInnerCompare->setOperand(
-            0, plan.finalInnerInduction);
-        plan.finalInnerCompare->setOperand(
-            1, IR::ConstantInt::get(
-                   IR::IntegerType::I32,
-                   plan.kernel.indexStart));
-        plan.finalInnerCompare->setName("eq");
-        return true;
+        break;
     }
-    return false;
+
+    bool insertedTotal = false;
+    for (auto iterator = plan.finalReductionPreheader->begin();
+         iterator != plan.finalReductionPreheader->end(); ++iterator) {
+        if (iterator->get() !=
+            plan.finalReductionInitialization) {
+            continue;
+        }
+        iterator = plan.finalReductionPreheader->insert(
+            iterator, resultBase);
+        ++iterator;
+        plan.finalReductionPreheader->insert(
+            iterator, totalCall);
+        insertedTotal = true;
+        break;
+    }
+    if (!insertedTotal) return false;
+
+    for (auto* call : plan.calls) {
+        call->setOperand(0, summaryKernel);
+    }
+    plan.finalReductionInitialization->setOperand(0, totalCall);
+    reductionTerminator->setOperand(
+        0, plan.finalReductionExit);
+    return true;
 }
 
 } // namespace Opt

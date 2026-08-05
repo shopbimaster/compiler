@@ -58,6 +58,158 @@ int main() {
     passed &= expectContains(integerResult, "global_int",
                              "folded lw lost its symbol");
 
+    const std::string privateIntegerSpill =
+        "entry:\n"
+        "  sw t0, 40(sp)\n"
+        "  lw t0, 40(sp)\n"
+        "  addw t1, t0, t2\n"
+        "  ret\n";
+    const std::string privateIntegerResult =
+        Opt::peepholeOptimize(privateIntegerSpill);
+    passed &= expectNotContains(privateIntegerResult, "40(sp)",
+                                "private integer spill round trip remained");
+
+    const std::string privatePointerSpill =
+        "entry:\n"
+        "  sd t0, 48(sp)\n"
+        "  ld t1, 48(sp)\n"
+        "  lw t2, 0(t1)\n"
+        "  ret\n";
+    const std::string privatePointerResult =
+        Opt::peepholeOptimize(privatePointerSpill);
+    passed &= expectNotContains(privatePointerResult, "48(sp)",
+                                "private pointer spill round trip remained");
+    passed &= expectContains(privatePointerResult, "mv      t1, t0",
+                             "private pointer reload was not forwarded");
+
+    const std::string sharedSpill =
+        "entry:\n"
+        "  sw t0, 56(sp)\n"
+        "  lw t0, 56(sp)\n"
+        "  addw t1, t0, t2\n"
+        "  addw t4, t3, t5\n"
+        "  li t0, 0\n"
+        "  lw t3, 56(sp)\n"
+        "  addw a0, t1, t3\n"
+        "  ret\n";
+    const std::string sharedSpillResult = Opt::peepholeOptimize(sharedSpill);
+    passed &= expectContains(sharedSpillResult, "sw t0, 56(sp)",
+                             "shared spill store was incorrectly removed");
+
+    const std::string escapedSlot =
+        "entry:\n"
+        "  sw t0, 64(sp)\n"
+        "  lw t0, 64(sp)\n"
+        "  addi a0, sp, 64\n"
+        "  call consume\n"
+        "  ret\n";
+    const std::string escapedSlotResult = Opt::peepholeOptimize(escapedSlot);
+    passed &= expectContains(escapedSlotResult, "sw t0, 64(sp)",
+                             "escaped stack slot store was incorrectly removed");
+
+    const std::string nonAdjacentSurvivingSource =
+        "entry:\n"
+        "  sw t0, 72(sp)\n"
+        "  addiw t2, t2, 1\n"
+        "  lw t0, 72(sp)\n"
+        "  ret\n";
+    const std::string nonAdjacentSurvivingResult =
+        Opt::peepholeOptimize(nonAdjacentSurvivingSource);
+    passed &= expectNotContains(nonAdjacentSurvivingResult, "72(sp)",
+                                "surviving spill source was not forwarded");
+
+    const std::string earlyCaptureSpill =
+        "entry:\n"
+        "  sw t0, 80(sp)\n"
+        "  lw t0, 0(a0)\n"
+        "  addw t2, t2, t3\n"
+        "  lw t1, 80(sp)\n"
+        "  addw a0, t1, t2\n"
+        "  ret\n";
+    const std::string earlyCaptureResult =
+        Opt::peepholeOptimize(earlyCaptureSpill);
+    passed &= expectNotContains(earlyCaptureResult, "80(sp)",
+                                "early-capture spill round trip remained");
+    passed &= expectContains(earlyCaptureResult, "mv      t1, t0",
+                             "spill value was not captured before clobber");
+
+    const std::string liveDestinationSpill =
+        "entry:\n"
+        "  sw t0, 88(sp)\n"
+        "  addw t2, t1, t3\n"
+        "  lw t0, 0(a0)\n"
+        "  lw t1, 88(sp)\n"
+        "  addw a0, t1, t2\n"
+        "  ret\n";
+    const std::string liveDestinationResult =
+        Opt::peepholeOptimize(liveDestinationSpill);
+    passed &= expectContains(liveDestinationResult, "sw t0, 88(sp)",
+                             "live reload destination was overwritten early");
+
+    const std::string reservedScratchSpill =
+        "entry:\n"
+        "  sw t0, 120(sp)\n"
+        "  lw t1, 0(a0)\n"
+        "  addw t0, t1, t3\n"
+        "  lw t1, 120(sp)\n"
+        "  mulw t1, t0, t1\n"
+        "  ret\n";
+    const std::string reservedScratchResult =
+        Opt::peepholeOptimize(reservedScratchSpill);
+    passed &= expectNotContains(reservedScratchResult, "120(sp)",
+                                "reserved scratch did not carry private spill");
+    passed &= expectContains(reservedScratchResult, "mv      t2, t0",
+                             "private spill was not captured in t2");
+
+    const std::string busyScratchSpill =
+        "entry:\n"
+        "  sw t0, 128(sp)\n"
+        "  lw t1, 0(a0)\n"
+        "  addw t0, t1, t3\n"
+        "  addw t2, t2, t4\n"
+        "  lw t1, 128(sp)\n"
+        "  mulw t1, t0, t1\n"
+        "  ret\n";
+    const std::string busyScratchResult =
+        Opt::peepholeOptimize(busyScratchSpill);
+    passed &= expectContains(busyScratchResult, "sw t0, 128(sp)",
+                             "live t2 was overwritten by spill forwarding");
+
+    const std::string crossBlockSpill =
+        "entry:\n"
+        "  sw t0, 96(sp)\n"
+        "next:\n"
+        "  lw t0, 96(sp)\n"
+        "  ret\n";
+    const std::string crossBlockResult =
+        Opt::peepholeOptimize(crossBlockSpill);
+    passed &= expectContains(crossBlockResult, "sw t0, 96(sp)",
+                             "spill was forwarded across a block boundary");
+
+    const std::string overlappingSlot =
+        "entry:\n"
+        "  sd t0, 104(sp)\n"
+        "  lw t1, 108(sp)\n"
+        "  ld t0, 104(sp)\n"
+        "  addw a0, t1, t2\n"
+        "  ret\n";
+    const std::string overlappingSlotResult =
+        Opt::peepholeOptimize(overlappingSlot);
+    passed &= expectContains(overlappingSlotResult, "sd t0, 104(sp)",
+                             "overlapping stack access lost its source store");
+
+    const std::string indirectlyEscapedSlot =
+        "entry:\n"
+        "  sw t0, 112(sp)\n"
+        "  mv a0, sp\n"
+        "  addi a0, a0, 112\n"
+        "  lw t0, 112(sp)\n"
+        "  ret\n";
+    const std::string indirectlyEscapedResult =
+        Opt::peepholeOptimize(indirectlyEscapedSlot);
+    passed &= expectContains(indirectlyEscapedResult, "sw t0, 112(sp)",
+                             "indirectly escaped stack slot lost its store");
+
     if (passed) std::cout << "Peephole floating-load regression passed\n";
     return passed ? 0 : 1;
 }

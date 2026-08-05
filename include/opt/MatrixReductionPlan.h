@@ -32,8 +32,9 @@ struct MatrixReductionPlan {
     AffineKernelSummary kernel;
     IR::Function* caller = nullptr;
     IR::BasicBlock* loopPreheader = nullptr;
-    IR::Instruction* finalInnerCompare = nullptr;
-    IR::Value* finalInnerInduction = nullptr;
+    IR::BasicBlock* finalReductionPreheader = nullptr;
+    IR::BasicBlock* finalReductionExit = nullptr;
+    IR::Instruction* finalReductionInitialization = nullptr;
     std::vector<IR::Instruction*> calls;
     IR::GlobalVariable* seedMatrix = nullptr;
     IR::GlobalVariable* resultMatrix = nullptr;

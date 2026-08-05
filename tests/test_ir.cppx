@@ -778,6 +778,58 @@ void test_instruction_scheduling_dep_chain() {
     PASS();
 }
 
+void test_instruction_scheduling_reduction_pressure() {
+    TEST("InstructionScheduling interleaves loads with a reduction chain");
+    Module mod;
+
+    auto* func = mod.createFunction(
+        FunctionType::get(IntegerType::I32, {}), "main");
+    auto* bb = func->createBlock("entry");
+
+    auto* a = Instruction::createAlloca(IntegerType::I32, "a");
+    auto* b = Instruction::createAlloca(IntegerType::I32, "b");
+    auto* c = Instruction::createAlloca(IntegerType::I32, "c");
+    auto* d = Instruction::createAlloca(IntegerType::I32, "d");
+    bb->pushBack(a);
+    bb->pushBack(b);
+    bb->pushBack(c);
+    bb->pushBack(d);
+
+    auto* av = Instruction::createLoad(IntegerType::I32, a, "av");
+    auto* bv = Instruction::createLoad(IntegerType::I32, b, "bv");
+    auto* cv = Instruction::createLoad(IntegerType::I32, c, "cv");
+    auto* dv = Instruction::createLoad(IntegerType::I32, d, "dv");
+    bb->pushBack(av);
+    bb->pushBack(bv);
+    bb->pushBack(cv);
+    bb->pushBack(dv);
+
+    auto* ab = Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "ab", av, bv);
+    auto* abc = Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "abc", ab, cv);
+    auto* abcd = Instruction::createBinOp(Instruction::Opcode::ADD,
+        IntegerType::I32, "abcd", abc, dv);
+    bb->pushBack(ab);
+    bb->pushBack(abc);
+    bb->pushBack(abcd);
+    bb->pushBack(Instruction::createRet(abcd));
+
+    Opt::instructionScheduling(&mod);
+    std::string after = mod.dump();
+
+    auto abPos = after.find("%ab =");
+    auto cvPos = after.find("%cv =");
+    auto abcPos = after.find("%abc =");
+    auto dvPos = after.find("%dv =");
+    CHECK(abPos != std::string::npos && cvPos != std::string::npos);
+    CHECK(abcPos != std::string::npos && dvPos != std::string::npos);
+    CHECK(abPos < cvPos);
+    CHECK(abcPos < dvPos);
+
+    PASS();
+}
+
 void test_counted_loop_nonzero_reversed_compare() {
     TEST("CountedLoop 非零起点与反向比较");
     Module mod;
@@ -961,6 +1013,7 @@ int main() {
     std::cout << "\n[Instruction Scheduling]\n";
     test_instruction_scheduling_load_hoist();
     test_instruction_scheduling_dep_chain();
+    test_instruction_scheduling_reduction_pressure();
 
     std::cout << "\n[Loop Pattern Analysis]\n";
     test_counted_loop_nonzero_reversed_compare();
