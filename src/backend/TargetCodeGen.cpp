@@ -228,6 +228,97 @@ void TargetCodeGen::detectLoopHeaders(IR::Function& func) {
     }
 }
 
+// ================================================================
+// G2 指令预取（Zicbop prefetch.i）
+// ================================================================
+// 为每个循环头找到"非回边、布局上最靠近"的前驱 preheader，在其块首注入
+//   la t0, .Lfunc_<loopHeader>
+//   .word 0x0002E013            # prefetch.i 0(t0)
+// 每进入循环一次预取一次循环体，改善 BOOM L1 I-cache 局部性。
+//
+// 正确性要点：
+//  - t0(x5) 不在 INT_REGS(s0-s11,t3-t6) 中，RA 从不分配它，仅作 codegen 局部
+//    临时寄存器（write-then-read），从不跨块承载活跃值。块首 clobber t0 安全。
+//  - 预取指令是 hint：QEMU 与支持 Zicbop 的 BOOM 将其作为 no-op 处理，不改变
+//    架构状态，故不影响功能正确性。
+//  - 保守：循环体过小（< G2_MINLOOP，默认 4 条）不预取，避免噪声。
+// 开关：G2_OFF=1 关闭；G2_MINLOOP=N 调整最小循环体门限。
+// ================================================================
+void TargetCodeGen::detectPrefetchSites(IR::Function& func) {
+    prefetchTargetMap.clear();
+    const auto& blocks = func.getBlocks();
+    std::unordered_map<IR::BasicBlock*, size_t> bbIndex;
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        bbIndex[blocks[i].get()] = i;
+    }
+
+    using Opc = IR::Instruction::Opcode;
+    auto getSuccs = [&](IR::BasicBlock* b) {
+        std::vector<IR::BasicBlock*> out;
+        auto* term = b->getTerminator();
+        if (!term) return out;
+        if (term->getOpcode() == Opc::BR) {
+            if (term->getNumOperands() >= 1)
+                if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(0))) out.push_back(t);
+        } else if (term->getOpcode() == Opc::COND_BR) {
+            for (unsigned j = 1; j <= 2 && j < term->getNumOperands(); ++j)
+                if (auto* t = dynamic_cast<IR::BasicBlock*>(term->getOperand(j))) out.push_back(t);
+        }
+        return out;
+    };
+    auto getPreds = [&](IR::BasicBlock* b) {
+        std::vector<IR::BasicBlock*> out;
+        for (auto& sb : blocks)
+            for (auto* s : getSuccs(sb.get()))
+                if (s == b) out.push_back(sb.get());
+        return out;
+    };
+
+    int minSize = 4;
+    if (const char* m = std::getenv("G2_MINLOOP")) minSize = std::atoi(m);
+
+    for (auto* h : loopHeaders) {
+        auto hIt = bbIndex.find(h);
+        if (hIt == bbIndex.end()) continue;
+        size_t hIdx = hIt->second;
+        if (hIdx == 0) continue;  // 循环头是入口块，无 preheader
+
+        // 找 preheader：非回边前驱中，布局上最靠近循环头的（通常为 fall-through）
+        IR::BasicBlock* preheader = nullptr;
+        size_t bestIdx = 0;
+        for (auto* p : getPreds(h)) {
+            auto it = bbIndex.find(p);
+            if (it == bbIndex.end() || it->second >= hIdx) continue;  // 跳过回边
+            if (it->second > bestIdx) { bestIdx = it->second; preheader = p; }
+        }
+        if (!preheader) continue;
+
+        // 自然循环 = 可从 h 到达 且 可回到 h 的块集；统计其指令数作门限
+        std::unordered_set<IR::BasicBlock*> reached, canReachH;
+        std::vector<IR::BasicBlock*> stack{h};
+        while (!stack.empty()) {
+            auto* cur = stack.back(); stack.pop_back();
+            if (reached.count(cur)) continue;
+            reached.insert(cur);
+            for (auto* s : getSuccs(cur)) stack.push_back(s);
+        }
+        stack.assign(1, h);
+        while (!stack.empty()) {
+            auto* cur = stack.back(); stack.pop_back();
+            if (canReachH.count(cur)) continue;
+            canReachH.insert(cur);
+            for (auto* p : getPreds(cur)) stack.push_back(p);
+        }
+        int loopInsts = 0;
+        for (auto& bb : blocks)
+            if (reached.count(bb.get()) && canReachH.count(bb.get()))
+                loopInsts += (int)bb->getInstructions().size();
+        if (loopInsts < minSize) continue;
+
+        prefetchTargetMap[preheader] = h;
+    }
+}
+
 void TargetCodeGen::emitFunction(IR::Function& func) {
     currentFunc = &func;
     promotedAllocas.clear();
@@ -235,6 +326,8 @@ void TargetCodeGen::emitFunction(IR::Function& func) {
 
     // 检测循环头（用于后续对齐）
     detectLoopHeaders(func);
+    // G2 指令预取：检测循环 preheader → 循环头 的预取注入点
+    detectPrefetchSites(func);
 
     // 先收集全局变量地址并分配 callee-saved 寄存器缓存（优先级高于 ALLOCA 提升）
     globalAddrCache.clear();
@@ -939,6 +1032,19 @@ void TargetCodeGen::emitBasicBlock(IR::BasicBlock& bb) {
     }
     // Use .L prefix for local labels to avoid symbol conflicts across functions
     emitter.emitText(".L" + currentFunc->getName() + "_" + bb.getName() + ":");
+
+    // G2 指令预取：在循环 preheader 块首预取循环体（每进入循环一次）。
+    //   la t0, .Lfunc_<loopHeader>; .word 0x0002E013  # prefetch.i 0(t0)
+    // t0 不在 RA 的 INT_REGS 池中（见 RegisterAllocator::INT_REGS），RA 从不分配，
+    // 仅作 codegen 局部临时，块首 clobber 不破坏跨块活跃值。G2_OFF=1 关闭。
+    if (!(std::getenv("G2_OFF") && std::string(std::getenv("G2_OFF")) == "1")) {
+        auto pit = prefetchTargetMap.find(&bb);
+        if (pit != prefetchTargetMap.end()) {
+            auto* target = pit->second;
+            emitter.emitText("  la      t0, .L" + currentFunc->getName() + "_" + target->getName());
+            emitter.emitText("  .word   0x0002E013");
+        }
+    }
 
     auto& insts = bb.getInstructions();
     for (auto& inst : insts) {

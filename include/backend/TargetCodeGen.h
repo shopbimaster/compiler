@@ -82,6 +82,12 @@ private:
     std::unordered_set<IR::BasicBlock*> loopHeaders;
     void detectLoopHeaders(IR::Function& func);
 
+    // G2 指令预取（Zicbop prefetch.i）：在循环 preheader 块首预取循环体地址，
+    // 每进入循环一次预取一次，改善 BOOM I-cache 局部性。
+    // 映射：preheader 块 → 预取目标（循环头）块。
+    std::unordered_map<IR::BasicBlock*, IR::BasicBlock*> prefetchTargetMap;
+    void detectPrefetchSites(IR::Function& func);
+
     // PHI 消除：直接在前驱块中插入寄存器拷贝，避免通过内存传递
     // 使用 (前驱, 后继) 边作为键，确保 COND_BR 的不同分支只发射各自的 PHI moves
     struct PhiMove {
