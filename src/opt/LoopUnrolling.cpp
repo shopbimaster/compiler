@@ -234,6 +234,7 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
 
     // 推导或使用预设迭代次数
     int tc = loop.tripCount;
+    bool usedStackSCEV = false;
     if (tc < 0) tc = inferTripCount(loop.header);
     if (tc < 0) {
         NaturalLoop naturalLoop;
@@ -244,6 +245,7 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
         if (induction.tripCount > 0 &&
             induction.tripCount <= 64) {
             tc = static_cast<int>(induction.tripCount);
+            usedStackSCEV = true;
         }
     }
     loop.tripCount = tc;
@@ -262,6 +264,10 @@ bool unrollLoop(LoopInfo& loop, IR::Function* func) {
     }
     // 如果没有整除因子且 tc ≤ 8，完全展开（支持质数 tc：5, 7）
     if (factor == 0 && tc <= 8) {
+        // Keep the stack-slot fallback on the proven partial-unroll path.
+        // Fully cloning a memory-form recurrence also clones incidental
+        // memory operations that the established PHI remapping does not cover.
+        if (usedStackSCEV) return false;
         factor = static_cast<unsigned>(tc);
     }
     if (factor == 0) return false;

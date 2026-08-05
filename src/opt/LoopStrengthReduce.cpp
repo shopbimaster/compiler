@@ -82,6 +82,16 @@ bool strengthReduceLoop(const NaturalLoop& loop, IR::Function* func) {
     auto info = analyzeLoopInduction(loop, func);
     if (info.tripCount < 0) return false;
 
+    // The accumulator recurrence is an SSA transformation: its header load
+    // and latch update rely on the induction value having one PHI-defined
+    // state per iteration. A memory-form induction slot can be reinitialized
+    // by an enclosing loop and needs a separate memory-SSA proof.
+    auto* induction = dynamic_cast<IR::Instruction*>(info.var);
+    if (!induction ||
+        induction->getOpcode() != IR::Instruction::Opcode::PHI) {
+        return false;
+    }
+
     int64_t multiplier = mul.constOperand->getValue();
     int64_t stepVal = 0;
     if (auto* stepCI = dynamic_cast<IR::ConstantInt*>(info.step)) {
@@ -92,6 +102,15 @@ bool strengthReduceLoop(const NaturalLoop& loop, IR::Function* func) {
 
     int64_t accumStep = multiplier * stepVal;
     auto* mulBB = mul.mulInst->getParent();
+
+    auto predecessors = buildPredecessors(func);
+    IR::BasicBlock* preheader = nullptr;
+    for (auto* predecessor : predecessors[loop.header]) {
+        if (loop.body.count(predecessor)) continue;
+        if (preheader && preheader != predecessor) return false;
+        preheader = predecessor;
+    }
+    if (!preheader) return false;
 
     // 1. 在 header 的 preheader 或 header 开头创建累加器的初始值
     // 初始值 = 0（如果起始值是 0）或 start * multiplier
@@ -112,9 +131,13 @@ bool strengthReduceLoop(const NaturalLoop& loop, IR::Function* func) {
     }
     entry->insert(entryIt, alloca);
 
-    // 初始化累加器
+    // Initialize on every loop entry. Placing this store in the function
+    // entry is incorrect for a nested loop because later invocations would
+    // reuse the accumulator left by the previous entry.
     auto* initStore = IR::Instruction::createStore(initConst, alloca);
-    entry->insert(entryIt, initStore);
+    auto preheaderIt = preheader->end();
+    if (preheaderIt != preheader->begin()) --preheaderIt;
+    preheader->insert(preheaderIt, initStore);
 
     // 2. 在循环头中 LOAD 累加器
     auto* loadAccum = IR::Instruction::createLoad(IR::IntegerType::get(32), alloca, "lsr.load." + suffix);
