@@ -127,10 +127,13 @@ public:
     BTypeContext *bType();
     antlr4::tree::TerminalNode *GT();
     antlr4::tree::TerminalNode *IDENTIFIER();
+    antlr4::tree::TerminalNode *SEMICOLON();
     antlr4::tree::TerminalNode *L_BRACKET();
     ConstExpContext *constExp();
     antlr4::tree::TerminalNode *R_BRACKET();
-    antlr4::tree::TerminalNode *SEMICOLON();
+    antlr4::tree::TerminalNode *L_PAREN();
+    ExpContext *exp();
+    antlr4::tree::TerminalNode *R_PAREN();
 
     virtual void enterRule(antlr4::tree::ParseTreeListener *listener) override;
     virtual void exitRule(antlr4::tree::ParseTreeListener *listener) override;

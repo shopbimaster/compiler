@@ -10,10 +10,14 @@ compilationUnit: (decl | funcDef)* EOF;
 // 声明
 decl: constDecl | varDecl | vectorDecl;
 
-// 向量声明：vector<T> name [ constLen ] ;（T ∈ {int, float}，长度为编译期常量）
+// 向量声明（两种形态）：
+//   vector<T> name [ constLen ] ;  定长：去语法糖为定长数组 ArrayType
+//   vector<T> name ( len ) ;       变长：len 可为运行时 exp，数据在运行时堆上
 vectorDecl:
     VECTOR LT bType GT IDENTIFIER
-    L_BRACKET constExp R_BRACKET SEMICOLON;
+    ( L_BRACKET constExp R_BRACKET       // 定长
+    | L_PAREN exp R_PAREN                // 变长（运行时长度）
+    ) SEMICOLON;
 
 // 常量声明
 constDecl: CONST bType constDef (COMMA constDef)* SEMICOLON;

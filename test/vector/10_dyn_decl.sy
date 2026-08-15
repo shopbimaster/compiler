@@ -1,0 +1,17 @@
+// 变长向量：声明 + vec_len + 零初始化读取
+int main() {
+    vector<int> v(10);
+    int n = vec_len(v);       // 10
+    putint(n);
+    putch(10);
+    // 零初始化验证
+    int i = 0;
+    int sum = 0;
+    while (i < n) {
+        sum = sum + v[i];     // 全 0
+        i = i + 1;
+    }
+    putint(sum);              // 0
+    putch(10);
+    return 0;
+}

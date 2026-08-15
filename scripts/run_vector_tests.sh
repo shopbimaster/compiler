@@ -31,7 +31,12 @@ for src in "$DIR"/*.sy; do
   if ! $GCC -march=rv64gc -mabi=lp64d -static -o "$bin" "$asm" "$SYLIB" 2>"$TMP/$name.lerr"; then
     echo -e "  ${RED}LINK FAIL${NC}:    $name"; sed -n '1,3p' "$TMP/$name.lerr"; lfail=$((lfail+1)); continue
   fi
-  timeout 30 $QEMU "$bin" > "$TMP/$name.act" 2>/dev/null
+  infile="$DIR/$name.in"
+  if [ -f "$infile" ]; then
+    timeout 30 $QEMU "$bin" < "$infile" > "$TMP/$name.act" 2>/dev/null
+  else
+    timeout 30 $QEMU "$bin" > "$TMP/$name.act" 2>/dev/null
+  fi
   ret=$?
   if [ $ret -eq 124 ]; then echo -e "  ${YELLOW}TIMEOUT${NC}:      $name"; tout=$((tout+1)); continue; fi
   if [ $ret -eq 139 ]; then echo -e "  ${RED}SEGFAULT${NC}:     $name"; seg=$((seg+1)); continue; fi

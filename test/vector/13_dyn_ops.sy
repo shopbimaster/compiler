@@ -1,0 +1,18 @@
+// 变长向量参与 vec_* 运算（与定长同一套接口）
+int main() {
+    int n = 12;
+    vector<int> a(n);
+    vector<int> b(n);
+    vector<int> c(n);
+    int i = 0;
+    while (i < n) {
+        a[i] = i;
+        b[i] = 2;
+        i = i + 1;
+    }
+    vec_add(a, b, c, vec_len(c));   // c[i] = i + 2
+    int s = vec_sum(c, n);          // sum(0+2 .. 11+2) = 66+24 = 90
+    putint(s);
+    putch(10);
+    return 0;
+}

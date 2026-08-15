@@ -106,3 +106,40 @@ int vec_sum(int* a, int n) {
     for (int i = 0; i < n; i++) s += a[i];
     return s;
 }
+
+/* ===== Dynamic (variable-length) vector runtime =====
+ * BOOM has no OS brk/malloc, so we keep a static bump heap.
+ * Layout per block: [ len | e0 e1 ... e(n-1) ]; vec_new returns &e0.
+ * Bump allocator never frees: only grows. Safe for contest use.
+ * Heap size configurable; overflow returns 0 (caller must check). */
+#define VEC_HEAP_INTS (4 * 1024 * 1024)   /* 16 MB of int heap */
+static int _vec_heap[VEC_HEAP_INTS];
+static int _vec_off = 0;                   /* next free index (in ints) */
+
+int* vec_new(int n) {
+    if (n < 0) n = 0;
+    /* need 1 header int + n data ints */
+    if (_vec_off + 1 + n > VEC_HEAP_INTS) return 0;   /* heap exhausted */
+    int* blk = &_vec_heap[_vec_off];
+    blk[0] = n;                                        /* header: length */
+    for (int i = 0; i < n; i++) blk[1 + i] = 0;        /* zero-init data */
+    _vec_off += 1 + n;
+    return &blk[1];                                    /* data pointer */
+}
+
+int vec_len(int* a) {
+    if (a == 0) return 0;
+    return a[-1];                                      /* header is 1 int before data */
+}
+
+int* vec_resize(int* a, int n) {
+    if (n < 0) n = 0;
+    int oldlen = vec_len(a);
+    int* nd = vec_new(n);                              /* zero-inits new block */
+    if (nd == 0) return 0;
+    int cp = (oldlen < n) ? oldlen : n;                /* keep min(old,new) */
+    if (a != 0) {
+        for (int i = 0; i < cp; i++) nd[i] = a[i];
+    }
+    return nd;
+}

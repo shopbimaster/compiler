@@ -83,14 +83,51 @@ std::any IRBuilder::visitDecl(SysY2022Parser::DeclContext* ctx) {
 }
 
 // ================================================================
-// vectorDecl: VECTOR LT bType GT IDENTIFIER L_BRACKET constExp R_BRACKET SEMICOLON
-// 向量 = 定长数组（去语法糖为 ArrayType），运算经 vec_* 运行时函数完成。
+// vectorDecl: VECTOR LT bType GT IDENTIFIER
+//             ( L_BRACKET constExp R_BRACKET      -- 定长：ArrayType 数组
+//             | L_PAREN exp R_PAREN               -- 变长：堆分配数据指针
+//             ) SEMICOLON
+// 定长：去语法糖为 ArrayType（后端零感知）。
+// 变长：符号表存 alloca i32*（堆数据指针），长度由运行时堆块头维护，
+//       v[i] 复用现有"指针参数下标"路径（visitLVal 自动 load 指针再 GEP）。
 // ================================================================
 std::any IRBuilder::visitVectorDecl(SysY2022Parser::VectorDeclContext* ctx) {
     Type* elemType = std::any_cast<Type*>(visitBType(ctx->bType()));
     std::string name = ctx->IDENTIFIER()->getText();
 
-    // 长度为编译期常量
+    // ---------- 变长形态：vector<T> name ( len ) ; ----------
+    if (ctx->L_PAREN() != nullptr) {
+        if (currentFunc == nullptr) {
+            throw std::runtime_error("dynamic vector must be declared inside a function: " + name);
+        }
+        if (!elemType->isInteger()) {
+            throw std::runtime_error("dynamic vector only supports int element for now: " + name);
+        }
+        // 数据指针槽：alloca i32*（存堆数据指针）
+        Type* elemPtrTy = PointerType::get(elemType);
+        auto* slot = Instruction::createAlloca(elemPtrTy, name);
+        currentBB->pushBack(slot);
+
+        // len 为运行时 exp
+        Value* lenVal = valFrom(visitExp(ctx->exp()));
+        lenVal = implConvert(lenVal, IntegerType::I32);
+
+        // p = vec_new(len)
+        FunctionType* ft = funcTypeTable["vec_new"];
+        Function* callee = module->createFunction(ft, "vec_new", true);
+        std::vector<Value*> args{lenVal};
+        auto* call = Instruction::createCall(ft, callee, args, newTempName());
+        currentBB->pushBack(call);
+
+        // store p -> slot
+        auto* store = Instruction::createStore(call, slot);
+        currentBB->pushBack(store);
+
+        declare(name, slot);
+        return {};
+    }
+
+    // ---------- 定长形态：vector<T> name [ constLen ] ; ----------
     Value* dimVal = valFrom(visitConstExp(ctx->constExp()));
     int n = 0;
     if (auto* ci = dynamic_cast<ConstantInt*>(dimVal)) {
@@ -1307,6 +1344,19 @@ void IRBuilder::registerBuiltinFunctions() {
     // int vec_sum(int* a, int n)
     funcTypeTable["vec_sum"] = FunctionType::get(i32, {iptr, i32});
     module->createFunction(FunctionType::get(i32, {iptr, i32}), "vec_sum", true);
+
+    // ===== 变长向量运行时 =====
+    // int* vec_new(int n)        —— 堆上分配 n 个 int，返回数据指针
+    funcTypeTable["vec_new"] = FunctionType::get(iptr, {i32});
+    module->createFunction(FunctionType::get(iptr, {i32}), "vec_new", true);
+
+    // int vec_len(int* a)        —— 查询变长向量当前长度
+    funcTypeTable["vec_len"] = FunctionType::get(i32, {iptr});
+    module->createFunction(FunctionType::get(i32, {iptr}), "vec_len", true);
+
+    // int* vec_resize(int* a, int n) —— 重分配为 n 个 int，保留旧数据
+    funcTypeTable["vec_resize"] = FunctionType::get(iptr, {iptr, i32});
+    module->createFunction(FunctionType::get(iptr, {iptr, i32}), "vec_resize", true);
 }
 
 // ================================================================
