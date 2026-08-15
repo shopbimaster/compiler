@@ -1,0 +1,17 @@
+// 全局向量声明 + 函数内运算
+vector<int> g[10];
+vector<int> r[10];
+
+int compute() {
+    vec_fill(g, 5, 10);
+    vec_scale(g, 2, r, 10);   // r[i] = 10
+    return 0;
+}
+
+int main() {
+    compute();
+    int s = vec_sum(r, 10);   // 10*10 = 100
+    putint(s);
+    putch(10);
+    return 0;
+}

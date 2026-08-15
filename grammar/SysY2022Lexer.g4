@@ -10,6 +10,7 @@ INT:      'int';
 FLOAT:    'float';
 VOID:     'void';
 CONST:    'const';
+VECTOR:   'vector';
 IF:       'if';
 ELSE:     'else';
 WHILE:    'while';

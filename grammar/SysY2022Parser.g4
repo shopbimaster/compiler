@@ -8,7 +8,12 @@ options {
 compilationUnit: (decl | funcDef)* EOF;
 
 // 声明
-decl: constDecl | varDecl;
+decl: constDecl | varDecl | vectorDecl;
+
+// 向量声明：vector<T> name [ constLen ] ;（T ∈ {int, float}，长度为编译期常量）
+vectorDecl:
+    VECTOR LT bType GT IDENTIFIER
+    L_BRACKET constExp R_BRACKET SEMICOLON;
 
 // 常量声明
 constDecl: CONST bType constDef (COMMA constDef)* SEMICOLON;

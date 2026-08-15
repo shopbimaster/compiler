@@ -1,0 +1,14 @@
+// 向量声明 + vec_fill + 逐元素读取验证
+int main() {
+    vector<int> a[8];
+    vec_fill(a, 7, 8);
+    int i = 0;
+    int sum = 0;
+    while (i < 8) {
+        sum = sum + a[i];
+        i = i + 1;
+    }
+    putint(sum);   // 7*8 = 56
+    putch(10);
+    return 0;
+}

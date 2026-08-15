@@ -28,4 +28,12 @@ __attribute((destructor)) void after_main();
 void _sysy_starttime(int lineno);
 void _sysy_stoptime(int lineno);
 
+/* Vector runtime (scalar loop simulation on RV64GC, no V extension) */
+void vec_fill(int* a, int v, int n);
+void vec_add(int* a, int* b, int* res, int n);
+void vec_sub(int* a, int* b, int* res, int n);
+void vec_mul(int* a, int* b, int* res, int n);
+void vec_scale(int* a, int s, int* res, int n);
+int  vec_sum(int* a, int n);
+
 #endif

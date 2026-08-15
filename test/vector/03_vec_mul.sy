@@ -1,0 +1,15 @@
+// 向量乘法：c[i] = a[i] * b[i]
+int main() {
+    vector<int> a[8];
+    vector<int> b[8];
+    vector<int> c[8];
+    int i = 0;
+    while (i < 8) {
+        a[i] = i + 1;
+        b[i] = 2;
+        i = i + 1;
+    }
+    vec_mul(a, b, c, 8);
+    putarray(8, c);   // 2 4 6 8 10 12 14 16
+    return 0;
+}

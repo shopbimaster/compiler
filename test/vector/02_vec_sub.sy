@@ -1,0 +1,15 @@
+// 向量减法：c[i] = a[i] - b[i]
+int main() {
+    vector<int> a[10];
+    vector<int> b[10];
+    vector<int> c[10];
+    int i = 0;
+    while (i < 10) {
+        a[i] = i * 3;
+        b[i] = i;
+        i = i + 1;
+    }
+    vec_sub(a, b, c, 10);
+    putarray(10, c);   // 0 2 4 6 8 10 12 14 16 18
+    return 0;
+}

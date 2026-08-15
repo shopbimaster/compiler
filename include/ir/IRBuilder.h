@@ -23,6 +23,7 @@ public:
     std::any visitConstDecl(SysY2022Parser::ConstDeclContext* ctx) override;
     std::any visitBType(SysY2022Parser::BTypeContext* ctx) override;
     std::any visitVarDecl(SysY2022Parser::VarDeclContext* ctx) override;
+    std::any visitVectorDecl(SysY2022Parser::VectorDeclContext* ctx) override;
     std::any visitVarDef(SysY2022Parser::VarDefContext* ctx) override;
     std::any visitInitVal(SysY2022Parser::InitValContext* ctx) override;
     std::any visitFuncDef(SysY2022Parser::FuncDefContext* ctx) override;

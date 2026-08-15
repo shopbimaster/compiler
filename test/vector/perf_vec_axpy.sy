@@ -1,0 +1,29 @@
+// 向量性能测试：Y = a*X + Y  (AXPY)，重复迭代压测
+const int N = 100000;
+int X[100000];
+int Y[100000];
+
+int main() {
+    int i = 0;
+    while (i < N) {
+        X[i] = i % 7;
+        Y[i] = i % 5;
+        i = i + 1;
+    }
+    starttime();
+    int iter = 0;
+    while (iter < 20) {
+        // 每次迭代先把 Y 重置为 X，避免累乘溢出：Y = X*3 + X = 4X（与迭代次数无关）
+        vec_scale(X, 3, Y, N);   // Y[i] = X[i]*3
+        vec_add(X, Y, Y, N);     // Y[i] = X[i] + Y[i] = 4*X[i]
+        iter = iter + 1;
+    }
+    stoptime();
+    // sum(Y) = 4 * sum(X)，X[i]=i%7，i=0..99999
+    // sum(X) = 14285*21 + (0+1+2+3+4) = 299985 + 10 = 299995
+    // sum(Y) = 4 * 299995 = 1199980
+    int s = vec_sum(Y, N);
+    putint(s);
+    putch(10);
+    return 0;
+}

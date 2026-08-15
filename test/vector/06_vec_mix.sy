@@ -1,0 +1,19 @@
+// 混合向量运算：d = (a + b) * 2，再求和
+int main() {
+    vector<int> a[10];
+    vector<int> b[10];
+    vector<int> t[10];
+    vector<int> d[10];
+    int i = 0;
+    while (i < 10) {
+        a[i] = i;
+        b[i] = 1;
+        i = i + 1;
+    }
+    vec_add(a, b, t, 10);      // t[i] = i + 1
+    vec_scale(t, 2, d, 10);    // d[i] = 2*(i+1)
+    int s = vec_sum(d, 10);    // 2*(1+2+...+10) = 110
+    putint(s);
+    putch(10);
+    return 0;
+}

@@ -76,7 +76,43 @@ std::any IRBuilder::visitDecl(SysY2022Parser::DeclContext* ctx) {
     if (ctx->constDecl()) {
         return visitConstDecl(ctx->constDecl());
     }
+    if (ctx->vectorDecl()) {
+        return visitVectorDecl(ctx->vectorDecl());
+    }
     return visitVarDecl(ctx->varDecl());
+}
+
+// ================================================================
+// vectorDecl: VECTOR LT bType GT IDENTIFIER L_BRACKET constExp R_BRACKET SEMICOLON
+// 向量 = 定长数组（去语法糖为 ArrayType），运算经 vec_* 运行时函数完成。
+// ================================================================
+std::any IRBuilder::visitVectorDecl(SysY2022Parser::VectorDeclContext* ctx) {
+    Type* elemType = std::any_cast<Type*>(visitBType(ctx->bType()));
+    std::string name = ctx->IDENTIFIER()->getText();
+
+    // 长度为编译期常量
+    Value* dimVal = valFrom(visitConstExp(ctx->constExp()));
+    int n = 0;
+    if (auto* ci = dynamic_cast<ConstantInt*>(dimVal)) {
+        n = static_cast<int>(ci->getValue());
+    }
+    if (n <= 0) {
+        throw std::runtime_error("vector length must be a positive compile-time constant: " + name);
+    }
+    Type* vecType = ArrayType::get(elemType, static_cast<unsigned>(n));
+
+    if (currentFunc == nullptr) {
+        // 全局向量：与普通全局数组一致
+        auto* gv = module->createGlobalVariable(
+            PointerType::get(vecType), name, false, nullptr);
+        declare(name, gv);
+    } else {
+        // 局部向量：alloca 一块连续数组空间
+        auto* alloca = Instruction::createAlloca(vecType, name);
+        currentBB->pushBack(alloca);
+        declare(name, alloca);
+    }
+    return {};
 }
 
 // ================================================================
@@ -1244,6 +1280,33 @@ void IRBuilder::registerBuiltinFunctions() {
 
     funcTypeTable["_sysy_stoptime"] = FunctionType::get(vd, {i32});
     module->createFunction(FunctionType::get(vd, {i32}), "_sysy_stoptime", true);
+
+    // ===== 向量运行时库（int 元素，标量循环模拟）=====
+    auto* iptr = PointerType::get(i32);
+
+    // void vec_fill(int* a, int v, int n)
+    funcTypeTable["vec_fill"] = FunctionType::get(vd, {iptr, i32, i32});
+    module->createFunction(FunctionType::get(vd, {iptr, i32, i32}), "vec_fill", true);
+
+    // void vec_add(int* a, int* b, int* res, int n)
+    funcTypeTable["vec_add"] = FunctionType::get(vd, {iptr, iptr, iptr, i32});
+    module->createFunction(FunctionType::get(vd, {iptr, iptr, iptr, i32}), "vec_add", true);
+
+    // void vec_sub(int* a, int* b, int* res, int n)
+    funcTypeTable["vec_sub"] = FunctionType::get(vd, {iptr, iptr, iptr, i32});
+    module->createFunction(FunctionType::get(vd, {iptr, iptr, iptr, i32}), "vec_sub", true);
+
+    // void vec_mul(int* a, int* b, int* res, int n)
+    funcTypeTable["vec_mul"] = FunctionType::get(vd, {iptr, iptr, iptr, i32});
+    module->createFunction(FunctionType::get(vd, {iptr, iptr, iptr, i32}), "vec_mul", true);
+
+    // void vec_scale(int* a, int s, int* res, int n)
+    funcTypeTable["vec_scale"] = FunctionType::get(vd, {iptr, i32, iptr, i32});
+    module->createFunction(FunctionType::get(vd, {iptr, i32, iptr, i32}), "vec_scale", true);
+
+    // int vec_sum(int* a, int n)
+    funcTypeTable["vec_sum"] = FunctionType::get(i32, {iptr, i32});
+    module->createFunction(FunctionType::get(i32, {iptr, i32}), "vec_sum", true);
 }
 
 // ================================================================

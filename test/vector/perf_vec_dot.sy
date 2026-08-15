@@ -1,0 +1,26 @@
+// 向量性能测试：点积 sum(a[i]*b[i])，大规模重复
+const int N = 50000;
+int A[50000];
+int B[50000];
+int T[50000];
+
+int main() {
+    int i = 0;
+    while (i < N) {
+        A[i] = i % 3;
+        B[i] = i % 11;
+        i = i + 1;
+    }
+    starttime();
+    int acc = 0;
+    int iter = 0;
+    while (iter < 30) {
+        vec_mul(A, B, T, N);     // T[i] = A[i]*B[i]
+        acc = acc + vec_sum(T, N);
+        iter = iter + 1;
+    }
+    stoptime();
+    putint(acc);
+    putch(10);
+    return 0;
+}

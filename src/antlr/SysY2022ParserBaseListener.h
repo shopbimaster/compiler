@@ -1,5 +1,5 @@
 
-// Generated from grammar/SysY2022Parser.g4 by ANTLR 4.13.1
+// Generated from /mnt/d/VSCodeProjects/compiler/grammar/SysY2022Parser.g4 by ANTLR 4.10.1
 
 #pragma once
 
@@ -21,6 +21,9 @@ public:
 
   virtual void enterDecl(SysY2022Parser::DeclContext * /*ctx*/) override { }
   virtual void exitDecl(SysY2022Parser::DeclContext * /*ctx*/) override { }
+
+  virtual void enterVectorDecl(SysY2022Parser::VectorDeclContext * /*ctx*/) override { }
+  virtual void exitVectorDecl(SysY2022Parser::VectorDeclContext * /*ctx*/) override { }
 
   virtual void enterConstDecl(SysY2022Parser::ConstDeclContext * /*ctx*/) override { }
   virtual void exitConstDecl(SysY2022Parser::ConstDeclContext * /*ctx*/) override { }

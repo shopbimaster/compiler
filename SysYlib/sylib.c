@@ -84,3 +84,25 @@ void _sysy_stoptime(int lineno){
 #undef stoptime
 void starttime() { _sysy_starttime(0); }
 void stoptime() { _sysy_stoptime(0); }
+
+/* ===== Vector runtime: scalar loop simulation (RV64GC has no V extension) ===== */
+void vec_fill(int* a, int v, int n) {
+    for (int i = 0; i < n; i++) a[i] = v;
+}
+void vec_add(int* a, int* b, int* res, int n) {
+    for (int i = 0; i < n; i++) res[i] = a[i] + b[i];
+}
+void vec_sub(int* a, int* b, int* res, int n) {
+    for (int i = 0; i < n; i++) res[i] = a[i] - b[i];
+}
+void vec_mul(int* a, int* b, int* res, int n) {
+    for (int i = 0; i < n; i++) res[i] = a[i] * b[i];
+}
+void vec_scale(int* a, int s, int* res, int n) {
+    for (int i = 0; i < n; i++) res[i] = a[i] * s;
+}
+int vec_sum(int* a, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) s += a[i];
+    return s;
+}
