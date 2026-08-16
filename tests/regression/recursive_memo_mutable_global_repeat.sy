@@ -1,0 +1,22 @@
+int bias;
+
+int recursive_value(int depth, int unused) {
+    if (depth == 0) {
+        return bias;
+    }
+    return recursive_value(depth - 1, unused) + 1;
+}
+
+int invoke_repeatedly(int remaining) {
+    if (remaining == 0) {
+        return 0;
+    }
+    bias = remaining;
+    return recursive_value(3, 0) + invoke_repeatedly(remaining - 1);
+}
+
+int main() {
+    putint(invoke_repeatedly(2));
+    putch(10);
+    return 0;
+}

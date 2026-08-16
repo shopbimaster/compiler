@@ -5,6 +5,7 @@
 // 合并方式：verbatim 拼接，每节保留独立匿名命名空间，零逻辑改动。
 
 #include "opt/Optimizer.h"
+#include "opt/LoopAnalysis.h"
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -375,11 +376,88 @@ bool isAllocaOf(IR::Function* function, IR::Value* value) {
            instruction->getParent()->getParent() == function;
 }
 
-// Returns true iff `function` matches the pure-self-recursion shape
-// described above. Purely structural: inspects opcodes, operand
-// shapes and call targets; never looks at the function's name or any
-// literal/runtime value.
-bool isMemoizableSelfRecursive(IR::Function* function) {
+bool isMemoCloneOpcode(Opc opcode) {
+    switch (opcode) {
+    case Opc::ADD:
+    case Opc::SUB:
+    case Opc::MUL:
+    case Opc::SDIV:
+    case Opc::SREM:
+    case Opc::AND:
+    case Opc::OR:
+    case Opc::XOR:
+    case Opc::SHL:
+    case Opc::ASHR:
+    case Opc::SMULH:
+    case Opc::FADD:
+    case Opc::FSUB:
+    case Opc::FMUL:
+    case Opc::FDIV:
+    case Opc::WIDE_SMOD_MUL:
+    case Opc::ICMP:
+    case Opc::FCMP:
+    case Opc::LOAD:
+    case Opc::STORE:
+    case Opc::GETELEMENTPTR:
+    case Opc::ZEXT:
+    case Opc::SEXT:
+    case Opc::TRUNC:
+    case Opc::SITOFP:
+    case Opc::FPTOSI:
+    case Opc::SELECT:
+    case Opc::CALL:
+    case Opc::ALLOCA:
+    case Opc::RET:
+    case Opc::BR:
+    case Opc::COND_BR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool blockIsOnCycle(IR::Function* function, IR::BasicBlock* target) {
+    if (!function || !target) return true;
+    auto successors = buildSuccessors(function);
+    std::vector<IR::BasicBlock*> worklist;
+    auto found = successors.find(target);
+    if (found != successors.end()) {
+        worklist = found->second;
+    }
+    std::unordered_set<IR::BasicBlock*> visited;
+    while (!worklist.empty()) {
+        auto* block = worklist.back();
+        worklist.pop_back();
+        if (block == target) return true;
+        if (!block || !visited.insert(block).second) continue;
+        auto next = successors.find(block);
+        if (next == successors.end()) continue;
+        worklist.insert(
+            worklist.end(), next->second.begin(), next->second.end());
+    }
+    return false;
+}
+
+bool isSingleProgramRootCall(IR::Instruction* call) {
+    auto* block = call ? call->getParent() : nullptr;
+    auto* caller = block ? block->getParent() : nullptr;
+    if (!caller || caller->getName() != "main" ||
+        blockIsOnCycle(caller, block)) {
+        return false;
+    }
+
+    // `main` is the SysY program entry and must not also be called from IR.
+    // Recognizing that language-defined role does not infer a test case.
+    return caller->getUses().empty();
+}
+
+// Returns true iff `function` is closed under self recursion and all state
+// contributing to its result remains stable for the cache lifetime. The
+// only distinguished symbol is the language-defined `main` entry, used to
+// prove a mutable-global-dependent recursion has one dynamic root call.
+bool isMemoizableSelfRecursive(
+        IR::Module* module, IR::Function* function,
+        IR::Instruction*& externalRootCall) {
     if (!function || function->isExternal()) return false;
     if (function->getNumArgs() != 2) return false;
 
@@ -394,10 +472,15 @@ bool isMemoizableSelfRecursive(IR::Function* function) {
         return false;
     }
 
+    const auto readOnlyGlobals = readOnlyGlobalAnalysis(module);
     bool sawSelfCall = false;
+    bool readsMutableGlobal = false;
     for (auto& block : function->getBlocks()) {
         for (auto& owned : block->getInstructions()) {
             auto* instruction = owned.get();
+            if (!isMemoCloneOpcode(instruction->getOpcode())) {
+                return false;
+            }
             switch (instruction->getOpcode()) {
             case Opc::PHI:
                 // Runs pre-Mem2Reg; a PHI here would indicate a shape
@@ -425,6 +508,24 @@ bool isMemoizableSelfRecursive(IR::Function* function) {
                 }
                 break;
             }
+            case Opc::LOAD: {
+                if (instruction->getNumOperands() != 1) return false;
+                auto* pointer = instruction->getOperand(0);
+                if (isAllocaOf(function, pointer)) break;
+
+                PointerAccess access;
+                if (!collectPointerAccess(pointer, nullptr, access)) {
+                    return false;
+                }
+                auto* global =
+                    dynamic_cast<IR::GlobalVariable*>(access.root);
+                if (!global) return false;
+                if (!global->isConstant() &&
+                    !readOnlyGlobals.count(global)) {
+                    readsMutableGlobal = true;
+                }
+                break;
+            }
             default:
                 break;
             }
@@ -438,6 +539,7 @@ bool isMemoizableSelfRecursive(IR::Function* function) {
     // the function reads) between two calls whose results would
     // otherwise be reused from the memo table.
     int externalCallSites = 0;
+    externalRootCall = nullptr;
     for (const auto& use : function->getUses()) {
         auto* instruction = dynamic_cast<IR::Instruction*>(use.user);
         if (!instruction || instruction->getOpcode() != Opc::CALL ||
@@ -446,9 +548,20 @@ bool isMemoizableSelfRecursive(IR::Function* function) {
         }
         if (instruction->getParent()->getParent() != function) {
             ++externalCallSites;
+            externalRootCall = instruction;
         }
     }
     if (externalCallSites != 1) return false;
+
+    // A cache key contains only the two scalar arguments. Mutable globals
+    // are nevertheless stable during one pure self-recursive activation,
+    // because the function cannot write them or call other functions. In
+    // that case prove that the sole root call can execute at most once;
+    // otherwise entries could become stale between two root activations.
+    if (readsMutableGlobal &&
+        !isSingleProgramRootCall(externalRootCall)) {
+        return false;
+    }
 
     return true;
 }
@@ -710,7 +823,9 @@ bool buildMemoWrapper(
 bool recursiveMemoization(IR::Module* module) {
     std::vector<IR::Function*> candidates;
     for (auto& function : module->getFunctions()) {
-        if (isMemoizableSelfRecursive(function.get())) {
+        IR::Instruction* externalRootCall = nullptr;
+        if (isMemoizableSelfRecursive(
+                module, function.get(), externalRootCall)) {
             candidates.push_back(function.get());
         }
     }
