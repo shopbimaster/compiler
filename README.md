@@ -147,6 +147,7 @@ flowchart TD
 | `modAddRecurrenceStrengthReduce`   | `NativeLowering.cpp`                   | 模加递推循环 → 原生加法+模运算                                |
 | `localMemoryAccessOptimization`    | `LocalMemoryAccessOptimization.cpp`    | 基本块内短距离 GEP 复用与带别名检查的内存转发               |
 | `redundantIterationElimination`    | `RedundantIterationElimination.cpp`    | 可证冗余的循环迭代消除                                        |
+| `dynamicIdempotentLoopElimination` | `DynamicIdempotentLoopElimination.cpp` | 动态幂等循环迭代消除                                          |
 | `recursiveMemoization`             | `RecursiveOpt.cpp`                     | 纯自递归函数 → 记忆化查表                                     |
 | `repeatedDivRemToNative`           | `NativeLowering.cpp`                   | 重复除余提取 → 原生位运算                                     |
 | `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 递归模乘 → WIDE_SMOD_MUL 指令                                 |
