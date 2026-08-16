@@ -12,6 +12,7 @@ cmake-build-release/
 .trae/
 .tare/
 .agents/
+docs/
 *.swp
 *.swo
 *~
