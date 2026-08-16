@@ -1,0 +1,75 @@
+int software_and(int first, int second) {
+    int first_bit;
+    int second_bit;
+    int remaining = 32;
+    int result = 0;
+    int power = 1;
+    while (remaining) {
+        first_bit = first % 2;
+        second_bit = second % 2;
+        first = first / 2;
+        second = second / 2;
+        if (first_bit == 1 && second_bit == 1) {
+            result = result + power;
+        }
+        power = power * 2;
+        remaining = remaining - 1;
+    }
+    return result;
+}
+
+int software_xor(int first, int second) {
+    int first_bit;
+    int second_bit;
+    int remaining = 32;
+    int result = 0;
+    int power = 1;
+    while (remaining) {
+        first_bit = first % 2;
+        second_bit = second % 2;
+        first = first / 2;
+        second = second / 2;
+        if (first_bit != second_bit) {
+            result = result + power;
+        }
+        power = power * 2;
+        remaining = remaining - 1;
+    }
+    return result;
+}
+
+int software_or(int first, int second) {
+    int first_bit;
+    int second_bit;
+    int remaining = 32;
+    int result = 0;
+    int power = 1;
+    while (remaining) {
+        first_bit = first % 2;
+        second_bit = second % 2;
+        first = first / 2;
+        second = second / 2;
+        if (first_bit == 1 || second_bit == 1) {
+            result = result + power;
+        }
+        power = power * 2;
+        remaining = remaining - 1;
+    }
+    return result;
+}
+
+int main() {
+    putint(software_and(13, 11));
+    putch(32);
+    putint(software_xor(13, 11));
+    putch(32);
+    putint(software_or(13, 11));
+    putch(32);
+    putint(software_and(-3, 5));
+    putch(32);
+    putint(software_xor(-3, 5));
+    putch(32);
+    putint(software_or(-3, 5));
+    putch(10);
+    return 0;
+}

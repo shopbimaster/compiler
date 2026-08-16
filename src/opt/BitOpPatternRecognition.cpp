@@ -14,6 +14,9 @@
 // ================================================================
 
 #include "opt/Optimizer.h"
+#include <algorithm>
+#include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -93,6 +96,408 @@ IR::Instruction* findConditionalBranch(
 struct SoftwareBitLoop {
     Opcode nativeOpcode = Opcode::XOR;
 };
+
+using InstructionList = std::vector<IR::Instruction*>;
+
+InstructionList getInstructions(IR::BasicBlock* block) {
+    InstructionList result;
+    if (!block) return result;
+    for (const auto& instruction : block->getInstructions()) {
+        result.push_back(instruction.get());
+    }
+    return result;
+}
+
+IR::BasicBlock* getBranchTarget(IR::Instruction* branch, unsigned index) {
+    if (!branch || index >= branch->getNumOperands()) return nullptr;
+    return dynamic_cast<IR::BasicBlock*>(branch->getOperand(index));
+}
+
+bool isUnconditionalBranchTo(IR::Instruction* instruction,
+                             IR::BasicBlock* target) {
+    return instruction && instruction->getOpcode() == Opcode::BR &&
+           instruction->getNumOperands() == 1 &&
+           instruction->getOperand(0) == target;
+}
+
+bool isLoadFrom(IR::Instruction* instruction, IR::Value* pointer) {
+    return instruction && instruction->getOpcode() == Opcode::LOAD &&
+           instruction->getNumOperands() == 1 &&
+           instruction->getOperand(0) == pointer;
+}
+
+bool isStoreTo(IR::Instruction* instruction, IR::Value* value,
+               IR::Value* pointer) {
+    return instruction && instruction->getOpcode() == Opcode::STORE &&
+           instruction->getNumOperands() == 2 &&
+           instruction->getOperand(0) == value &&
+           instruction->getOperand(1) == pointer;
+}
+
+bool hasOperands(IR::Instruction* instruction, IR::Value* first,
+                 IR::Value* second, bool commutative = false) {
+    if (!instruction || instruction->getNumOperands() != 2) return false;
+    if (instruction->getOperand(0) == first &&
+        instruction->getOperand(1) == second) {
+        return true;
+    }
+    return commutative && instruction->getOperand(0) == second &&
+           instruction->getOperand(1) == first;
+}
+
+IR::Instruction* findUniqueStore(
+    const InstructionList& instructions,
+    const std::function<bool(IR::Value*)>& valueMatches) {
+    IR::Instruction* result = nullptr;
+    for (auto* instruction : instructions) {
+        if (instruction->getOpcode() != Opcode::STORE ||
+            instruction->getNumOperands() != 2 ||
+            !valueMatches(instruction->getOperand(0))) {
+            continue;
+        }
+        if (result) return nullptr;
+        result = instruction;
+    }
+    return result;
+}
+
+bool matchLoopTail(IR::BasicBlock* updateBlock, IR::BasicBlock* skipBlock,
+                   IR::BasicBlock* tailBlock, IR::BasicBlock* conditionBlock,
+                   IR::Value* resultSlot, IR::Value* powerSlot,
+                   IR::Value* lengthSlot) {
+    auto update = getInstructions(updateBlock);
+    auto skip = getInstructions(skipBlock);
+    auto tail = getInstructions(tailBlock);
+    if (update.size() != 5 || skip.size() != 1 || tail.size() != 7) {
+        return false;
+    }
+
+    if (!isLoadFrom(update[0], resultSlot) ||
+        !isLoadFrom(update[1], powerSlot) ||
+        update[2]->getOpcode() != Opcode::ADD ||
+        !hasOperands(update[2], update[0], update[1], true) ||
+        !isStoreTo(update[3], update[2], resultSlot) ||
+        !isUnconditionalBranchTo(update[4], tailBlock) ||
+        !isUnconditionalBranchTo(skip[0], tailBlock)) {
+        return false;
+    }
+
+    return isLoadFrom(tail[0], powerSlot) &&
+           tail[1]->getOpcode() == Opcode::MUL &&
+           tail[1]->getNumOperands() == 2 &&
+           tail[1]->getOperand(0) == tail[0] &&
+           isIntConstant(tail[1]->getOperand(1), 2) &&
+           isStoreTo(tail[2], tail[1], powerSlot) &&
+           isLoadFrom(tail[3], lengthSlot) &&
+           tail[4]->getOpcode() == Opcode::SUB &&
+           tail[4]->getNumOperands() == 2 &&
+           tail[4]->getOperand(0) == tail[3] &&
+           isIntConstant(tail[4]->getOperand(1), 1) &&
+           isStoreTo(tail[5], tail[4], lengthSlot) &&
+           isUnconditionalBranchTo(tail[6], conditionBlock);
+}
+
+// Prove the complete local-memory and control-flow closure of the software
+// bit loop.  The earlier matcher only discovers a candidate operation; this
+// proof is what makes bypassing the original implementation legal.  Every
+// block and instruction in the function must participate in the proven
+// recurrence, so extra result updates, exits, or local state reject the fast
+// path conservatively.
+bool proveSoftwareBitLoopClosure(IR::Function* function,
+                                 Opcode nativeOpcode) {
+    const size_t expectedBlocks = nativeOpcode == Opcode::XOR ? 7 : 9;
+    if (!function || function->getBlocks().size() != expectedBlocks) {
+        return false;
+    }
+
+    auto* entryBlock = function->getEntryBlock();
+    auto entry = getInstructions(entryBlock);
+    if (entry.size() != 13) return false;
+
+    std::vector<IR::Value*> allocas;
+    int storeCount = 0;
+    for (auto* instruction : entry) {
+        if (instruction->getOpcode() == Opcode::ALLOCA) {
+            allocas.push_back(instruction);
+        } else if (instruction->getOpcode() == Opcode::STORE) {
+            ++storeCount;
+        } else if (instruction->getOpcode() != Opcode::BR) {
+            return false;
+        }
+    }
+    if (allocas.size() != 7 || storeCount != 5 ||
+        entry.back()->getOpcode() != Opcode::BR) {
+        return false;
+    }
+
+    auto* firstArgStore = findUniqueStore(entry, [&](IR::Value* value) {
+        return value == function->getArg(0);
+    });
+    auto* secondArgStore = findUniqueStore(entry, [&](IR::Value* value) {
+        return value == function->getArg(1);
+    });
+    auto* lengthInit = findUniqueStore(entry, [&](IR::Value* value) {
+        return isIntConstant(value, 32);
+    });
+    auto* resultInit = findUniqueStore(entry, [&](IR::Value* value) {
+        return isIntConstant(value, 0);
+    });
+    auto* powerInit = findUniqueStore(entry, [&](IR::Value* value) {
+        return isIntConstant(value, 1);
+    });
+    if (!firstArgStore || !secondArgStore || !lengthInit || !resultInit ||
+        !powerInit) {
+        return false;
+    }
+
+    IR::Value* argumentSlots[2] = {firstArgStore->getOperand(1),
+                                   secondArgStore->getOperand(1)};
+    IR::Value* lengthSlot = lengthInit->getOperand(1);
+    IR::Value* resultSlot = resultInit->getOperand(1);
+    IR::Value* powerSlot = powerInit->getOperand(1);
+    std::unordered_set<IR::Value*> initializedSlots = {
+        argumentSlots[0], argumentSlots[1], lengthSlot, resultSlot, powerSlot};
+    if (initializedSlots.size() != 5) return false;
+    for (auto* slot : initializedSlots) {
+        if (std::find(allocas.begin(), allocas.end(), slot) == allocas.end()) {
+            return false;
+        }
+    }
+
+    std::vector<IR::Value*> bitSlots;
+    for (auto* slot : allocas) {
+        if (!initializedSlots.count(slot)) bitSlots.push_back(slot);
+    }
+    if (bitSlots.size() != 2 || bitSlots[0] == bitSlots[1]) return false;
+
+    auto* conditionBlock = getBranchTarget(entry.back(), 0);
+    auto condition = getInstructions(conditionBlock);
+    if (condition.size() != 3 || !isLoadFrom(condition[0], lengthSlot) ||
+        condition[1]->getOpcode() != Opcode::ICMP ||
+        condition[1]->getName() != "ne" ||
+        !((condition[1]->getOperand(0) == condition[0] &&
+           isIntConstant(condition[1]->getOperand(1), 0)) ||
+          (condition[1]->getOperand(1) == condition[0] &&
+           isIntConstant(condition[1]->getOperand(0), 0))) ||
+        condition[2]->getOpcode() != Opcode::COND_BR ||
+        condition[2]->getNumOperands() != 3 ||
+        condition[2]->getOperand(0) != condition[1]) {
+        return false;
+    }
+
+    auto* bodyBlock = getBranchTarget(condition[2], 1);
+    auto* exitBlock = getBranchTarget(condition[2], 2);
+    auto exit = getInstructions(exitBlock);
+    if (exit.size() != 2 || !isLoadFrom(exit[0], resultSlot) ||
+        exit[1]->getOpcode() != Opcode::RET ||
+        exit[1]->getNumOperands() != 1 || exit[1]->getOperand(0) != exit[0]) {
+        return false;
+    }
+
+    auto body = getInstructions(bodyBlock);
+    const size_t expectedBodySize = nativeOpcode == Opcode::XOR ? 16 : 17;
+    if (body.size() != expectedBodySize ||
+        body.back()->getOpcode() != Opcode::COND_BR ||
+        body.back()->getNumOperands() != 3) {
+        return false;
+    }
+
+    std::unordered_set<IR::Value*> producedBitSlots;
+    for (int index = 0; index < 2; ++index) {
+        IR::Instruction* remainder = nullptr;
+        IR::Instruction* division = nullptr;
+        IR::Instruction* remainderStore = nullptr;
+        IR::Instruction* divisionStore = nullptr;
+        for (auto* instruction : body) {
+            if (instruction->getNumOperands() != 2 ||
+                !isIntConstant(instruction->getOperand(1), 2) ||
+                getLoadedPointer(instruction->getOperand(0)) !=
+                    argumentSlots[index]) {
+                continue;
+            }
+            if (instruction->getOpcode() == Opcode::SREM) {
+                if (remainder) return false;
+                remainder = instruction;
+            } else if (instruction->getOpcode() == Opcode::SDIV) {
+                if (division) return false;
+                division = instruction;
+            }
+        }
+        if (!remainder || !division) return false;
+        auto* remainderLoad = dynamic_cast<IR::Instruction*>(
+            remainder->getOperand(0));
+        auto* divisionLoad = dynamic_cast<IR::Instruction*>(
+            division->getOperand(0));
+        if (!remainderLoad || remainderLoad->getParent() != bodyBlock ||
+            !divisionLoad || divisionLoad->getParent() != bodyBlock) {
+            return false;
+        }
+        for (auto* instruction : body) {
+            if (instruction->getOpcode() != Opcode::STORE ||
+                instruction->getNumOperands() != 2) {
+                continue;
+            }
+            if (instruction->getOperand(0) == remainder) {
+                if (remainderStore) return false;
+                remainderStore = instruction;
+            }
+            if (instruction->getOperand(0) == division) {
+                if (divisionStore) return false;
+                divisionStore = instruction;
+            }
+        }
+        if (!remainderStore || !divisionStore ||
+            divisionStore->getOperand(1) != argumentSlots[index] ||
+            std::find(bitSlots.begin(), bitSlots.end(),
+                      remainderStore->getOperand(1)) == bitSlots.end()) {
+            return false;
+        }
+        producedBitSlots.insert(remainderStore->getOperand(1));
+    }
+    if (producedBitSlots.size() != 2) return false;
+
+    auto* bodyBranch = body.back();
+    if (nativeOpcode == Opcode::XOR) {
+        auto* predicate = dynamic_cast<IR::Instruction*>(bodyBranch->getOperand(0));
+        if (!predicate || predicate->getOpcode() != Opcode::ICMP ||
+            predicate->getName() != "ne" || predicate->getParent() != bodyBlock ||
+            predicate->getNumOperands() != 2) {
+            return false;
+        }
+        IR::Value* firstBit = getLoadedPointer(predicate->getOperand(0));
+        IR::Value* secondBit = getLoadedPointer(predicate->getOperand(1));
+        auto* firstBitLoad = dynamic_cast<IR::Instruction*>(
+            predicate->getOperand(0));
+        auto* secondBitLoad = dynamic_cast<IR::Instruction*>(
+            predicate->getOperand(1));
+        if (!producedBitSlots.count(firstBit) ||
+            !producedBitSlots.count(secondBit) || firstBit == secondBit ||
+            !firstBitLoad || firstBitLoad->getParent() != bodyBlock ||
+            !secondBitLoad || secondBitLoad->getParent() != bodyBlock) {
+            return false;
+        }
+
+        auto* updateBlock = getBranchTarget(bodyBranch, 1);
+        auto* skipBlock = getBranchTarget(bodyBranch, 2);
+        auto update = getInstructions(updateBlock);
+        auto skip = getInstructions(skipBlock);
+        if (update.size() != 5 || skip.size() != 1) return false;
+        auto* tailBlock = getBranchTarget(update.back(), 0);
+        std::unordered_set<IR::BasicBlock*> provenBlocks = {
+            entryBlock, conditionBlock, bodyBlock, exitBlock,
+            updateBlock, skipBlock, tailBlock};
+        return provenBlocks.size() == expectedBlocks && tailBlock &&
+               getBranchTarget(skip[0], 0) == tailBlock &&
+               matchLoopTail(updateBlock, skipBlock, tailBlock,
+                             conditionBlock, resultSlot, powerSlot,
+                             lengthSlot);
+    }
+
+    IR::Instruction* temporary = nullptr;
+    for (auto* instruction : body) {
+        if (instruction->getOpcode() == Opcode::ALLOCA) {
+            if (temporary) return false;
+            temporary = instruction;
+        }
+    }
+    if (!temporary) return false;
+
+    IR::Instruction* firstTest = nullptr;
+    for (auto* instruction : body) {
+        if (instruction->getOpcode() != Opcode::ICMP ||
+            instruction->getName() != "eq" ||
+            instruction->getNumOperands() != 2) {
+            continue;
+        }
+        IR::Value* testedSlot = nullptr;
+        if (isIntConstant(instruction->getOperand(1), 1)) {
+            testedSlot = getLoadedPointer(instruction->getOperand(0));
+        } else if (isIntConstant(instruction->getOperand(0), 1)) {
+            testedSlot = getLoadedPointer(instruction->getOperand(1));
+        }
+        if (producedBitSlots.count(testedSlot)) {
+            if (firstTest) return false;
+            firstTest = instruction;
+        }
+    }
+    if (!firstTest || bodyBranch->getOperand(0) != firstTest) return false;
+
+    const int64_t initialValue = nativeOpcode == Opcode::AND ? 0 : 1;
+    auto* temporaryInit = findUniqueStore(body, [&](IR::Value* value) {
+        return isIntConstant(value, initialValue);
+    });
+    if (!temporaryInit || temporaryInit->getOperand(1) != temporary) {
+        return false;
+    }
+
+    auto* rhsBlock = nativeOpcode == Opcode::AND
+                         ? getBranchTarget(bodyBranch, 1)
+                         : getBranchTarget(bodyBranch, 2);
+    auto* predicateBlock = nativeOpcode == Opcode::AND
+                               ? getBranchTarget(bodyBranch, 2)
+                               : getBranchTarget(bodyBranch, 1);
+    auto rhs = getInstructions(rhsBlock);
+    auto predicateBlockInstructions = getInstructions(predicateBlock);
+    if (rhs.size() != 4 || predicateBlockInstructions.size() != 3 ||
+        !isUnconditionalBranchTo(rhs[3], predicateBlock) ||
+        rhs[1]->getOpcode() != Opcode::ICMP || rhs[1]->getName() != "eq" ||
+        rhs[1]->getNumOperands() != 2 ||
+        !isStoreTo(rhs[2], rhs[1], temporary)) {
+        return false;
+    }
+    IR::Value* rhsBit = nullptr;
+    if (isIntConstant(rhs[1]->getOperand(1), 1)) {
+        rhsBit = getLoadedPointer(rhs[1]->getOperand(0));
+    } else if (isIntConstant(rhs[1]->getOperand(0), 1)) {
+        rhsBit = getLoadedPointer(rhs[1]->getOperand(1));
+    }
+    IR::Value* firstBit = nullptr;
+    if (isIntConstant(firstTest->getOperand(1), 1)) {
+        firstBit = getLoadedPointer(firstTest->getOperand(0));
+    } else {
+        firstBit = getLoadedPointer(firstTest->getOperand(1));
+    }
+    if (!isLoadFrom(rhs[0], rhsBit) || !producedBitSlots.count(rhsBit) ||
+        rhsBit == firstBit ||
+        !hasOperands(rhs[1], rhs[0],
+                     isIntConstant(rhs[1]->getOperand(0), 1)
+                         ? rhs[1]->getOperand(0)
+                         : rhs[1]->getOperand(1),
+                     true)) {
+        return false;
+    }
+
+    if (!isLoadFrom(predicateBlockInstructions[0], temporary) ||
+        predicateBlockInstructions[1]->getOpcode() != Opcode::ICMP ||
+        predicateBlockInstructions[1]->getName() != "ne" ||
+        predicateBlockInstructions[1]->getNumOperands() != 2 ||
+        !((predicateBlockInstructions[1]->getOperand(0) ==
+               predicateBlockInstructions[0] &&
+           isIntConstant(predicateBlockInstructions[1]->getOperand(1), 0)) ||
+          (predicateBlockInstructions[1]->getOperand(1) ==
+               predicateBlockInstructions[0] &&
+           isIntConstant(predicateBlockInstructions[1]->getOperand(0), 0))) ||
+        predicateBlockInstructions[2]->getOpcode() != Opcode::COND_BR ||
+        predicateBlockInstructions[2]->getNumOperands() != 3 ||
+        predicateBlockInstructions[2]->getOperand(0) !=
+            predicateBlockInstructions[1]) {
+        return false;
+    }
+
+    auto* updateBlock = getBranchTarget(predicateBlockInstructions[2], 1);
+    auto* skipBlock = getBranchTarget(predicateBlockInstructions[2], 2);
+    auto update = getInstructions(updateBlock);
+    auto skip = getInstructions(skipBlock);
+    if (update.size() != 5 || skip.size() != 1) return false;
+    auto* tailBlock = getBranchTarget(update.back(), 0);
+    std::unordered_set<IR::BasicBlock*> provenBlocks = {
+        entryBlock, conditionBlock, bodyBlock, exitBlock, rhsBlock,
+        predicateBlock, updateBlock, skipBlock, tailBlock};
+    return provenBlocks.size() == expectedBlocks && tailBlock &&
+           getBranchTarget(skip[0], 0) == tailBlock &&
+           matchLoopTail(updateBlock, skipBlock, tailBlock, conditionBlock,
+                         resultSlot, powerSlot, lengthSlot);
+}
 
 bool matchSoftwareBitLoop(IR::Function* function, SoftwareBitLoop& match) {
     if (!function || function->isExternal() || function->getNumArgs() != 2) {
@@ -358,7 +763,10 @@ bool recognizeSoftwareBitLoops(IR::Module* module) {
     bool changed = false;
     for (auto& function : module->getFunctions()) {
         SoftwareBitLoop match;
-        if (!matchSoftwareBitLoop(function.get(), match)) continue;
+        if (!matchSoftwareBitLoop(function.get(), match) ||
+            !proveSoftwareBitLoopClosure(function.get(), match.nativeOpcode)) {
+            continue;
+        }
         addGuardedNativeFastPath(function.get(), match.nativeOpcode);
         changed = true;
     }
@@ -391,6 +799,10 @@ bool tryFuseConsecutiveShifts(IR::Instruction* inst) {
     auto* innerCnt = dynamic_cast<IR::ConstantInt*>(innerInst->getOperand(1));
     if (!innerCnt) return false;
 
+    if (shiftCnt->getValue() < 0 || shiftCnt->getValue() > 31 ||
+        innerCnt->getValue() < 0 || innerCnt->getValue() > 31) {
+        return false;
+    }
     int64_t totalShift = shiftCnt->getValue() + innerCnt->getValue();
     if (totalShift > 31) return false; // 超出 32 位无意义
 
@@ -545,24 +957,24 @@ bool trySimplifyShiftAndMask(IR::Instruction* inst) {
 
     auto* shiftInst = getDefiningInst(inst->getOperand(0));
     if (!shiftInst) return false;
-    if (shiftInst->getOpcode() != IR::Instruction::Opcode::ASHR &&
-        shiftInst->getOpcode() != IR::Instruction::Opcode::SHL)
-        return false;
+    if (shiftInst->getOpcode() != IR::Instruction::Opcode::SHL) return false;
     if (shiftInst->getNumOperands() < 2) return false;
 
     auto* shiftCnt = dynamic_cast<IR::ConstantInt*>(shiftInst->getOperand(1));
     if (!shiftCnt) return false;
 
     int64_t shift = shiftCnt->getValue();
-    int64_t mask = maskConst->getValue();
+    if (shift < 0 || shift > 31) return false;
 
-    // 计算移位后有效位数
-    int effectiveBits = 32 - static_cast<int>(shift);
-    if (effectiveBits <= 0) return false;
-
-    // 如果 mask 覆盖了所有有效位，AND 是冗余的
-    int64_t fullMask = (1LL << effectiveBits) - 1;
-    if ((mask & fullMask) == fullMask) {
+    // SHL only makes its low `shift` bits known zero.  An AND can therefore
+    // be removed only when all other bits are preserved.  ASHR sign-fills
+    // high bits and has no corresponding non-trivial rule without a separate
+    // proof that its source is non-negative.
+    const uint32_t mask = static_cast<uint32_t>(maskConst->getValue());
+    const uint32_t knownZeroBits = shift == 0
+        ? 0u
+        : (uint32_t{1} << static_cast<unsigned>(shift)) - 1u;
+    if ((mask | knownZeroBits) == UINT32_MAX) {
         inst->replaceAllUsesWith(shiftInst);
         inst->dropAllUses();
         auto* bb = inst->getParent();

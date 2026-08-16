@@ -1,0 +1,26 @@
+int software_xor_with_offset(int first, int second) {
+    int first_bit;
+    int second_bit;
+    int remaining = 32;
+    int result = 0;
+    int power = 1;
+    while (remaining) {
+        first_bit = first % 2;
+        second_bit = second % 2;
+        first = first / 2;
+        second = second / 2;
+        if (first_bit != second_bit) {
+            result = result + power;
+        }
+        power = power * 2;
+        remaining = remaining - 1;
+    }
+    result = result + 7;
+    return result;
+}
+
+int main() {
+    putint(software_xor_with_offset(13, 11));
+    putch(10);
+    return 0;
+}
