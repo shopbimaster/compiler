@@ -150,7 +150,6 @@ add_library(sysy_opt STATIC
     src/opt/MatrixReductionTransform.cpp
     src/opt/LocalMemoryAccessOptimization.cpp
     src/opt/RedundantIterationElimination.cpp
-    src/opt/DynamicIdempotentLoopElimination.cpp
     src/opt/BitOpPatternRecognition.cpp
     src/opt/PowerOfTwoDispatch.cpp
     src/opt/GlobalVariablePromotion.cpp

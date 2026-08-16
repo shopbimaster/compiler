@@ -161,7 +161,6 @@ bool hoistRecursiveCallGuards(IR::Module* mod);
 bool matrixReductionContraction(IR::Module* mod);
 bool localMemoryAccessOptimization(IR::Module* mod);
 bool redundantIterationElimination(IR::Module* mod);
-bool dynamicIdempotentLoopElimination(IR::Module* mod);
 bool recursiveMemoization(IR::Module* mod);
 bool bitOpPatternRecognition(IR::Module* mod);
 bool powerOfTwoDispatchSimplification(IR::Module* mod);
