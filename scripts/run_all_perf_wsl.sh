@@ -117,11 +117,14 @@ normalize_output() {
 
 PASS=0
 FAIL=0
-TOTAL_SECONDS=0
+TOTAL_SYSY_SECONDS=0
+TOTAL_WALL_SECONDS=0
 FAILED_CASES=()
 
-printf '\n%-28s %-8s %12s\n' "Case" "Result" "QEMU time"
-printf '%-28s %-8s %12s\n' "----------------------------" "--------" "------------"
+printf '\n%-28s %-8s %12s %12s\n' \
+    "Case" "Result" "SysY time" "QEMU wall"
+printf '%-28s %-8s %12s %12s\n' \
+    "----------------------------" "--------" "------------" "------------"
 
 for name in "${CASES[@]}"; do
     sy="$PERF_DIR/$name.sy"
@@ -132,7 +135,8 @@ for name in "${CASES[@]}"; do
     actual="$WORK_DIR/$name.actual"
     stderr_file="$WORK_DIR/$name.stderr"
     status=AC
-    elapsed="-"
+    sysy_elapsed="-"
+    wall_elapsed="-"
 
     if [[ ! -f "$sy" ]]; then
         status=NOTFOUND
@@ -156,8 +160,21 @@ for name in "${CASES[@]}"; do
         fi
         rc=$?
         end_ns=$(date +%s%N)
-        elapsed=$(awk -v start="$start_ns" -v end="$end_ns" \
+        wall_elapsed=$(awk -v start="$start_ns" -v end="$end_ns" \
             'BEGIN { printf "%.4f", (end - start) / 1000000000 }')
+
+        # SysY performance cases delimit the measured region with
+        # starttime()/stoptime(). The runtime emits the accumulated interval
+        # as "TOTAL: <h>H-<m>M-<s>S-<us>us" on stderr at process exit.
+        total_line=$(grep '^TOTAL:' "$stderr_file" 2>/dev/null | tail -n 1)
+        if [[ "$total_line" =~ ^TOTAL:\ ([0-9]+)H-([0-9]+)M-([0-9]+)S-([0-9]+)us$ ]]; then
+            sysy_elapsed=$(awk \
+                -v hours="${BASH_REMATCH[1]}" \
+                -v minutes="${BASH_REMATCH[2]}" \
+                -v seconds="${BASH_REMATCH[3]}" \
+                -v micros="${BASH_REMATCH[4]}" \
+                'BEGIN { printf "%.6f", hours * 3600 + minutes * 60 + seconds + micros / 1000000 }')
+        fi
 
         if (( rc == 124 )); then
             status=TIMEOUT
@@ -180,10 +197,15 @@ for name in "${CASES[@]}"; do
         fi
     fi
 
-    if [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        TOTAL_SECONDS=$(awk -v total="$TOTAL_SECONDS" -v value="$elapsed" \
+    if [[ "$sysy_elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        TOTAL_SYSY_SECONDS=$(awk -v total="$TOTAL_SYSY_SECONDS" -v value="$sysy_elapsed" \
             'BEGIN { printf "%.6f", total + value }')
-        elapsed="${elapsed}s"
+        sysy_elapsed="${sysy_elapsed}s"
+    fi
+    if [[ "$wall_elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        TOTAL_WALL_SECONDS=$(awk -v total="$TOTAL_WALL_SECONDS" -v value="$wall_elapsed" \
+            'BEGIN { printf "%.6f", total + value }')
+        wall_elapsed="${wall_elapsed}s"
     fi
 
     if [[ "$status" == AC || "$status" == NO-OUT ]]; then
@@ -192,13 +214,14 @@ for name in "${CASES[@]}"; do
         ((FAIL+=1))
         FAILED_CASES+=("$name:$status")
     fi
-    printf '%-28s %-8s %12s\n' "$name" "$status" "$elapsed"
+    printf '%-28s %-8s %12s %12s\n' \
+        "$name" "$status" "$sysy_elapsed" "$wall_elapsed"
 done
 
-printf '\nSummary: %d passed, %d failed, QEMU total %.4fs\n' \
-    "$PASS" "$FAIL" "$TOTAL_SECONDS"
-echo "Note: QEMU wall time is only suitable for local correctness checks and rough A/B comparisons."
-echo "      It is not comparable to the official BOOM board time."
+printf '\nSummary: %d passed, %d failed, SysY total %.6fs, QEMU wall total %.4fs\n' \
+    "$PASS" "$FAIL" "$TOTAL_SYSY_SECONDS" "$TOTAL_WALL_SECONDS"
+echo "Note: SysY time excludes QEMU startup and is preferred for local A/B comparisons."
+echo "      Neither local timing column is comparable to the official BOOM board time."
 
 if (( FAIL > 0 )); then
     printf 'Failed:'
