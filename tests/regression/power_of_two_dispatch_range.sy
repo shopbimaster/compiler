@@ -1,0 +1,35 @@
+int scale_by_power(int value, int amount) {
+    if (amount == 2) return value * 4;
+    if (amount == 3) return value * 8;
+    if (amount == 4) return value * 16;
+    if (amount == 5) return value * 32;
+    return value;
+}
+
+int divide_by_power(int value, int amount) {
+    if (amount == 2) return value / 4;
+    if (amount == 3) return value / 8;
+    if (amount == 4) return value / 16;
+    if (amount == 5) return value / 32;
+    return value;
+}
+
+int main() {
+    putint(scale_by_power(3, 2));
+    putch(32);
+    putint(scale_by_power(3, 5));
+    putch(32);
+    putint(scale_by_power(3, 1));
+    putch(32);
+    putint(scale_by_power(3, 6));
+    putch(32);
+    putint(divide_by_power(-33, 2));
+    putch(32);
+    putint(divide_by_power(-33, 5));
+    putch(32);
+    putint(divide_by_power(-33, 1));
+    putch(32);
+    putint(divide_by_power(-33, 6));
+    putch(10);
+    return 0;
+}

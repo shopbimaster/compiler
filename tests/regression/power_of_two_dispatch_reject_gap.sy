@@ -1,0 +1,15 @@
+int sparse_scale(int value, int amount) {
+    if (amount == 2) return value * 4;
+    if (amount == 4) return value * 16;
+    return value;
+}
+
+int main() {
+    putint(sparse_scale(7, 2));
+    putch(32);
+    putint(sparse_scale(7, 3));
+    putch(32);
+    putint(sparse_scale(7, 4));
+    putch(10);
+    return 0;
+}

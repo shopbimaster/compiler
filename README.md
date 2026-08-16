@@ -152,7 +152,7 @@ flowchart TD
 | `repeatedDivRemToNative`           | `NativeLowering.cpp`                   | 完整无副作用循环闭包证明后的重复除余提取 → 原生位运算          |
 | `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 完整纯递归闭包与输入守卫证明后的模乘 → WIDE_SMOD_MUL           |
 | `bitOpPatternRecognition`          | `BitOpPatternRecognition.cpp`          | 完整局部状态与 CFG 闭包证明后的软件位运算循环 → 带符号守卫的原生位指令 |
-| `powerOfTwoDispatchSimplification` | `PowerOfTwoDispatch.cpp`               | 2 的幂次 switch 分派化简                                      |
+| `powerOfTwoDispatchSimplification` | `PowerOfTwoDispatch.cpp`               | 完整 CFG 闭包证明后的连续幂次乘除分派转换为动态移位            |
 | `tailRecursionElimination`         | `TailRecursionElimination.cpp`         | 尾递归 → 循环                                                 |
 | `earlyReturnToSelect`              | `EarlyReturnToSelect.cpp`              | if-else-RET → SELECT+RET（单 BB 化）                          |
 | `inlineExpansion`                  | `InlineExpansion.cpp`                  | 函数内联（热点循环内联 + 多 BB 克隆）                         |

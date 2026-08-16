@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <unordered_set>
+#include <vector>
 
 namespace Opt {
 namespace {
@@ -18,6 +19,12 @@ using Opcode = IR::Instruction::Opcode;
 enum class DispatchKind {
     LeftShift,
     SignedDivide,
+};
+
+struct DispatchMatch {
+    DispatchKind kind = DispatchKind::LeftShift;
+    int minimumAmount = 0;
+    int maximumAmount = 0;
 };
 
 bool isConstant(IR::Value* value, int64_t expected) {
@@ -78,7 +85,8 @@ IR::BasicBlock* skipEmptyTrampolines(
 }
 
 bool matchDispatchCondition(IR::BasicBlock* block, IR::Value* amountSlot,
-                            int64_t expected, IR::Instruction*& branch) {
+                            int& amount, IR::Instruction*& branch) {
+    if (!block) return false;
     branch = block ? block->getTerminator() : nullptr;
     if (!branch || branch->getOpcode() != Opcode::COND_BR ||
         branch->getNumOperands() != 3) {
@@ -92,10 +100,22 @@ bool matchDispatchCondition(IR::BasicBlock* block, IR::Value* amountSlot,
         return false;
     }
 
-    return (loadedPointer(compare->getOperand(0)) == amountSlot &&
-            isConstant(compare->getOperand(1), expected)) ||
-           (loadedPointer(compare->getOperand(1)) == amountSlot &&
-            isConstant(compare->getOperand(0), expected));
+    IR::ConstantInt* constant = nullptr;
+    IR::Instruction* load = nullptr;
+    if (loadedPointer(compare->getOperand(0)) == amountSlot) {
+        load = dynamic_cast<IR::Instruction*>(compare->getOperand(0));
+        constant = dynamic_cast<IR::ConstantInt*>(compare->getOperand(1));
+    } else if (loadedPointer(compare->getOperand(1)) == amountSlot) {
+        load = dynamic_cast<IR::Instruction*>(compare->getOperand(1));
+        constant = dynamic_cast<IR::ConstantInt*>(compare->getOperand(0));
+    }
+    if (!load || load->getParent() != block || !constant ||
+        constant->getValue() < 0 || constant->getValue() > 30) {
+        return false;
+    }
+
+    amount = static_cast<int>(constant->getValue());
+    return true;
 }
 
 bool matchOperationReturn(IR::BasicBlock* block, IR::Value* valueSlot,
@@ -166,7 +186,7 @@ bool matchDefaultReturn(IR::BasicBlock* block, IR::Value* valueSlot) {
            ret->getOperand(0) == load;
 }
 
-bool matchPowerOfTwoDispatch(IR::Function* function, DispatchKind& kind) {
+bool matchPowerOfTwoDispatch(IR::Function* function, DispatchMatch& match) {
     if (!function || function->isExternal() || function->getNumArgs() != 2) {
         return false;
     }
@@ -184,6 +204,7 @@ bool matchPowerOfTwoDispatch(IR::Function* function, DispatchKind& kind) {
     auto* amountSlot = findArgumentSlot(entry, function->getArg(1));
     if (!valueSlot || !amountSlot || valueSlot == amountSlot) return false;
 
+    int argumentStoreCount = 0;
     for (const auto& block : function->getBlocks()) {
         for (const auto& instruction : block->getInstructions()) {
             if (instruction->getOpcode() == Opcode::CALL) return false;
@@ -195,20 +216,56 @@ bool matchPowerOfTwoDispatch(IR::Function* function, DispatchKind& kind) {
                     instruction->getOperand(1) == amountSlot)))) {
                 return false;
             }
+            if (instruction->getOpcode() == Opcode::STORE) {
+                ++argumentStoreCount;
+            } else if (instruction->getOpcode() == Opcode::ALLOCA) {
+                if (instruction.get() != valueSlot &&
+                    instruction.get() != amountSlot) {
+                    return false;
+                }
+            } else if (instruction->getOpcode() == Opcode::LOAD) {
+                if (instruction->getNumOperands() != 1 ||
+                    (instruction->getOperand(0) != valueSlot &&
+                     instruction->getOperand(0) != amountSlot)) {
+                    return false;
+                }
+            } else if (instruction->getOpcode() != Opcode::ICMP &&
+                       instruction->getOpcode() != Opcode::MUL &&
+                       instruction->getOpcode() != Opcode::SDIV &&
+                       instruction->getOpcode() != Opcode::RET &&
+                       instruction->getOpcode() != Opcode::BR &&
+                       instruction->getOpcode() != Opcode::COND_BR) {
+                return false;
+            }
         }
     }
+    if (argumentStoreCount != 2) return false;
 
     bool kindInitialized = false;
+    DispatchKind kind = DispatchKind::LeftShift;
     std::unordered_set<IR::BasicBlock*> visited;
+    std::unordered_set<int> seenAmounts;
+    std::vector<int> amounts;
     IR::BasicBlock* current = entry;
 
-    for (int amount = 1; amount <= 8; ++amount) {
+    while (current && !matchDefaultReturn(current, valueSlot)) {
         if (!current || !visited.insert(current).second) return false;
 
+        // The entry additionally owns the two argument allocas and their
+        // initial stores. Every later condition block must contain exactly
+        // one load, one comparison, and one conditional branch. Together
+        // with the opcode closure above, this proves that no discarded
+        // computation or side effect is hidden in the dispatch chain.
+        const size_t expectedConditionSize = current == entry ? 7 : 3;
+        if (current->size() != expectedConditionSize) return false;
+
         IR::Instruction* branch = nullptr;
-        if (!matchDispatchCondition(current, amountSlot, amount, branch)) {
+        int amount = 0;
+        if (!matchDispatchCondition(current, amountSlot, amount, branch) ||
+            !seenAmounts.insert(amount).second) {
             return false;
         }
+        amounts.push_back(amount);
 
         auto* operationBlock = branchTarget(branch, 1);
         if (!operationBlock || !visited.insert(operationBlock).second ||
@@ -218,13 +275,24 @@ bool matchPowerOfTwoDispatch(IR::Function* function, DispatchKind& kind) {
         }
 
         current = skipEmptyTrampolines(branchTarget(branch, 2), visited);
+        if (amounts.size() > 31) return false;
     }
 
-    if (!kindInitialized || !current || !visited.insert(current).second ||
+    if (!kindInitialized || amounts.size() < 2 || !current ||
+        !visited.insert(current).second ||
         !matchDefaultReturn(current, valueSlot)) {
         return false;
     }
-    return visited.size() == function->getBlocks().size();
+    std::sort(amounts.begin(), amounts.end());
+    for (size_t index = 1; index < amounts.size(); ++index) {
+        if (amounts[index] != amounts[index - 1] + 1) return false;
+    }
+    if (visited.size() != function->getBlocks().size()) return false;
+
+    match.kind = kind;
+    match.minimumAmount = amounts.front();
+    match.maximumAmount = amounts.back();
+    return true;
 }
 
 void clearFunctionBody(IR::Function* function, IR::BasicBlock* entry) {
@@ -253,7 +321,7 @@ void clearFunctionBody(IR::Function* function, IR::BasicBlock* entry) {
         blocks.end());
 }
 
-void buildDynamicDispatch(IR::Function* function, DispatchKind kind) {
+void buildDynamicDispatch(IR::Function* function, const DispatchMatch& match) {
     auto* entry = function->getEntryBlock();
     clearFunctionBody(function, entry);
 
@@ -261,26 +329,27 @@ void buildDynamicDispatch(IR::Function* function, DispatchKind kind) {
     auto* amount = function->getArg(1);
     auto* i32 = IR::IntegerType::I32;
     auto* one = IR::ConstantInt::get(i32, 1);
-    auto* eight = IR::ConstantInt::get(i32, 8);
+    auto* minimum = IR::ConstantInt::get(i32, match.minimumAmount);
+    auto* maximum = IR::ConstantInt::get(i32, match.maximumAmount);
     auto* thirtyOne = IR::ConstantInt::get(i32, 31);
 
     auto* dynamicBlock = function->createBlock("pow2.dynamic");
     auto* defaultBlock = function->createBlock("pow2.default");
 
-    auto* atLeastOne = IR::Instruction::createCmp(
-        Opcode::ICMP, amount, one, "sge");
-    auto* atMostEight = IR::Instruction::createCmp(
-        Opcode::ICMP, amount, eight, "sle");
+    auto* atLeastMinimum = IR::Instruction::createCmp(
+        Opcode::ICMP, amount, minimum, "sge");
+    auto* atMostMaximum = IR::Instruction::createCmp(
+        Opcode::ICMP, amount, maximum, "sle");
     auto* inRange = IR::Instruction::createBinOp(
         Opcode::AND, IR::IntegerType::I1, "pow2.inrange",
-        atLeastOne, atMostEight);
-    entry->pushBack(atLeastOne);
-    entry->pushBack(atMostEight);
+        atLeastMinimum, atMostMaximum);
+    entry->pushBack(atLeastMinimum);
+    entry->pushBack(atMostMaximum);
     entry->pushBack(inRange);
     entry->pushBack(IR::Instruction::createCondBr(
         inRange, dynamicBlock, defaultBlock));
 
-    if (kind == DispatchKind::LeftShift) {
+    if (match.kind == DispatchKind::LeftShift) {
         auto* shifted = IR::Instruction::createBinOp(
             Opcode::SHL, i32, "pow2.shift", value, amount);
         dynamicBlock->pushBack(shifted);
@@ -315,9 +384,9 @@ void buildDynamicDispatch(IR::Function* function, DispatchKind kind) {
 bool powerOfTwoDispatchSimplification(IR::Module* module) {
     bool changed = false;
     for (auto& function : module->getFunctions()) {
-        DispatchKind kind;
-        if (!matchPowerOfTwoDispatch(function.get(), kind)) continue;
-        buildDynamicDispatch(function.get(), kind);
+        DispatchMatch match;
+        if (!matchPowerOfTwoDispatch(function.get(), match)) continue;
+        buildDynamicDispatch(function.get(), match);
         changed = true;
     }
     return changed;
