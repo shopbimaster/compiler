@@ -1,9 +1,8 @@
 // ================================================================
 // NativeLowering — 原生指令 lowering（合并实现）
 // ----------------------------------------------------------------
-// 合并自：RecursiveMulToNative / RepeatedDivRemToNative /
-//         ModAddRecurrence 三个语义同族的"递归/重复模式→原生指令"pass。
-// 合并方式：verbatim 拼接，每节保留独立匿名命名空间，零逻辑改动。
+// 包含 RepeatedDivRemToNative、ModAddRecurrence 等
+// 递归或重复计算到原生指令的 lowering pass。
 
 #include "opt/Optimizer.h"
 #include <algorithm>
@@ -680,24 +679,6 @@ void addGuardedWideModularMultiply(IR::Function* function, int modulus) {
 }
 
 } // namespace
-
-// ================================================================
-// recursiveMulToNative 入口
-// ================================================================
-bool recursiveMulToNative(IR::Module* mod) {
-    bool changed = true;
-    bool anyChanged = false;
-    while (changed) {
-        changed = false;
-        for (auto& func : mod->getFunctions()) {
-            if (tryConvertFunction(func.get())) {
-                changed = true;
-                anyChanged = true;
-            }
-        }
-    }
-    return anyChanged;
-}
 
 bool recursiveModularMulToNative(IR::Module* mod) {
     bool changed = false;

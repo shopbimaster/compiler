@@ -150,7 +150,6 @@ void runP3(IR::Module* mod);
 // ================================================================
 // P0 Pass — 语义级优化，返回 bool 表示是否修改了 IR
 // ================================================================
-bool recursiveMulToNative(IR::Module* mod);
 bool recursiveModularMulToNative(IR::Module* mod);
 bool repeatedDivRemToNative(IR::Module* mod);
 bool modAddRecurrenceStrengthReduce(IR::Module* mod);

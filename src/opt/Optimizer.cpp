@@ -646,14 +646,10 @@ void runO3(IR::Module* mod) {
 // ================================================================
 // P0：特殊模式识别
 //   重要：P0 后需要运行 InstCombine + SCCP 清理，因为
-//   bitOpPatternRecognition 和 recursiveMulToNative 会引入
-//   新的算术模式（native mul 替换递归，位运算模式替换函数调用）
+//   bitOpPatternRecognition 会引入新的位运算模式。
 // ================================================================
 void runP0(IR::Module* mod) {
     bool p0Changed = false;
-    if (recursiveMulToNative(mod)) {
-        p0Changed = true;
-    }
     if (bitOpPatternRecognition(mod)) {
         p0Changed = true;
     }

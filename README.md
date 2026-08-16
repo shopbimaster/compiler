@@ -224,7 +224,6 @@ flowchart TD
 
 | 入口函数                   | 文件                          | 职责                               |
 | -------------------------- | ----------------------------- | ---------------------------------- |
-| `recursiveMulToNative`     | `NativeLowering.cpp`          | 递归乘法 → 原生 MUL                |
 | `bitOpPatternRecognition`  | `BitOpPatternRecognition.cpp` | 位运算模式识别                     |
 | `hoistRecursiveCallGuards` | `RecursiveOpt.cpp`            | 递归调用守卫提升（base-case 短路） |
 
