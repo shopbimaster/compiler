@@ -356,12 +356,12 @@ namespace {
 
 using Opc = IR::Instruction::Opcode;
 
-// Table capacity: generic, not derived from any specific test case.
-// Large enough to cover typical small-state DP recursions (index-like
-// first argument, capacity-like second argument); out-of-range calls
-// simply skip memoization and recurse normally (still correct).
-constexpr unsigned kDim0 = 256;
-constexpr unsigned kDim1 = 20000;
+// Generic resource budget for dense two-dimensional memoization.  The
+// logical row count and stride are derived from the unique root call;
+// this power-of-two ceiling only bounds compiler-introduced storage.
+// Calls outside the proven root rectangle skip the cache and execute the
+// original recursion, so the budget never becomes a semantic assumption.
+constexpr unsigned kMemoEntryCapacity = 1u << 23;
 
 // ----------------------------------------------------------------
 // Matching
@@ -454,10 +454,9 @@ bool isSingleProgramRootCall(IR::Instruction* call) {
 // Returns true iff `function` is closed under self recursion and all state
 // contributing to its result remains stable for the cache lifetime. The
 // only distinguished symbol is the language-defined `main` entry, used to
-// prove a mutable-global-dependent recursion has one dynamic root call.
+// prove that the generated cache has one dynamic root configuration.
 bool isMemoizableSelfRecursive(
-        IR::Module* module, IR::Function* function,
-        IR::Instruction*& externalRootCall) {
+        IR::Function* function, IR::Instruction*& externalRootCall) {
     if (!function || function->isExternal()) return false;
     if (function->getNumArgs() != 2) return false;
 
@@ -472,9 +471,7 @@ bool isMemoizableSelfRecursive(
         return false;
     }
 
-    const auto readOnlyGlobals = readOnlyGlobalAnalysis(module);
     bool sawSelfCall = false;
-    bool readsMutableGlobal = false;
     for (auto& block : function->getBlocks()) {
         for (auto& owned : block->getInstructions()) {
             auto* instruction = owned.get();
@@ -520,10 +517,6 @@ bool isMemoizableSelfRecursive(
                 auto* global =
                     dynamic_cast<IR::GlobalVariable*>(access.root);
                 if (!global) return false;
-                if (!global->isConstant() &&
-                    !readOnlyGlobals.count(global)) {
-                    readsMutableGlobal = true;
-                }
                 break;
             }
             default:
@@ -553,13 +546,12 @@ bool isMemoizableSelfRecursive(
     }
     if (externalCallSites != 1) return false;
 
-    // A cache key contains only the two scalar arguments. Mutable globals
-    // are nevertheless stable during one pure self-recursive activation,
-    // because the function cannot write them or call other functions. In
-    // that case prove that the sole root call can execute at most once;
-    // otherwise entries could become stale between two root activations.
-    if (readsMutableGlobal &&
-        !isSingleProgramRootCall(externalRootCall)) {
+    // The generated dense layout is configured from the root arguments,
+    // and mutable globals read by the recursion are part of its implicit
+    // state.  Prove one dynamic root activation for every candidate so
+    // neither the layout nor an implicit global dependency can change
+    // during the cache lifetime.
+    if (!isSingleProgramRootCall(externalRootCall)) {
         return false;
     }
 
@@ -700,19 +692,104 @@ IR::Function* cloneAsFallback(
     return fallback;
 }
 
+bool insertBefore(
+        IR::Instruction* position, IR::Instruction* instruction) {
+    auto* block = position ? position->getParent() : nullptr;
+    if (!block || !instruction) return false;
+    for (auto iterator = block->begin(); iterator != block->end(); ++iterator) {
+        if (iterator->get() != position) continue;
+        block->insert(iterator, instruction);
+        return true;
+    }
+    return false;
+}
+
+// Configure a row-major cache rectangle from the sole dynamic root call.
+// For root arguments (A, B), caching is enabled only when both A+1 and B+1
+// are positive and (A+1)*(B+1) fits the generic entry budget.  Division is
+// performed with a selected non-zero stride, so rejected inputs cannot
+// introduce an invalid operation while evaluating the guard.
+bool configureMemoLayout(
+        IR::Instruction* rootCall,
+        IR::GlobalVariable* enabledGlobal,
+        IR::GlobalVariable* strideGlobal,
+        IR::GlobalVariable* maxAGlobal,
+        IR::GlobalVariable* maxBGlobal) {
+    if (!rootCall || rootCall->getOpcode() != Opc::CALL ||
+        rootCall->getNumOperands() != 3) {
+        return false;
+    }
+
+    auto* i32 = IR::IntegerType::I32;
+    auto* i1 = IR::IntegerType::I1;
+    auto* rootA = rootCall->getOperand(1);
+    auto* rootB = rootCall->getOperand(2);
+    auto* zero = IR::ConstantInt::get(i32, 0);
+    auto* one = IR::ConstantInt::get(i32, 1);
+    auto* maximumIncrementable =
+        IR::ConstantInt::get(i32, 2147483646LL);
+    auto* capacity = IR::ConstantInt::get(
+        i32, static_cast<int64_t>(kMemoEntryCapacity));
+
+    auto* aNonNegative = IR::Instruction::createCmp(
+        Opc::ICMP, rootA, zero, "sge");
+    auto* bNonNegative = IR::Instruction::createCmp(
+        Opc::ICMP, rootB, zero, "sge");
+    auto* aIncrementable = IR::Instruction::createCmp(
+        Opc::ICMP, rootA, maximumIncrementable, "sle");
+    auto* bIncrementable = IR::Instruction::createCmp(
+        Opc::ICMP, rootB, maximumIncrementable, "sle");
+    auto* validA = IR::Instruction::createBinOp(
+        Opc::AND, i1, "memo.config.valid.a",
+        aNonNegative, aIncrementable);
+    auto* validB = IR::Instruction::createBinOp(
+        Opc::AND, i1, "memo.config.valid.b",
+        bNonNegative, bIncrementable);
+    auto* rowCount = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "memo.config.rows", rootA, one);
+    auto* rawStride = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "memo.config.raw.stride", rootB, one);
+    auto* safeStride = IR::Instruction::createSelect(
+        validB, rawStride, one, "memo.config.stride");
+    auto* maximumRows = IR::Instruction::createBinOp(
+        Opc::SDIV, i32, "memo.config.max.rows", capacity, safeStride);
+    auto* fits = IR::Instruction::createCmp(
+        Opc::ICMP, rowCount, maximumRows, "sle");
+    auto* validArguments = IR::Instruction::createBinOp(
+        Opc::AND, i1, "memo.config.valid.args", validA, validB);
+    auto* enabled = IR::Instruction::createBinOp(
+        Opc::AND, i1, "memo.config.enabled", validArguments, fits);
+
+    std::vector<IR::Instruction*> configuration = {
+        aNonNegative, bNonNegative, aIncrementable, bIncrementable,
+        validA, validB, rowCount, rawStride, safeStride, maximumRows,
+        fits, validArguments, enabled,
+        IR::Instruction::createStore(safeStride, strideGlobal),
+        IR::Instruction::createStore(rootA, maxAGlobal),
+        IR::Instruction::createStore(rootB, maxBGlobal),
+        IR::Instruction::createStore(enabled, enabledGlobal),
+    };
+    for (auto* instruction : configuration) {
+        if (!insertBefore(rootCall, instruction)) return false;
+    }
+    return true;
+}
+
 // Builds the memoized wrapper for `original` in place: clones the
 // original body into a fresh internal fallback function, then
 // rebuilds `original` with:
-//   if (0 <= a < kDim0 && 0 <= b < kDim1) {
-//     if (hit[a][b]) return val[a][b];
+//   if (enabled && 0 <= a <= rootA && 0 <= b <= rootB) {
+//     index = a * (rootB + 1) + b;
+//     if (hit[index]) return val[index];
 //     result = fallback(a, b);
-//     val[a][b] = result; hit[a][b] = 1;
+//     val[index] = result; hit[index] = 1;
 //     return result;
 //   }
 //   return fallback(a, b);
 // Returns false (leaving `original` untouched) if cloning fails.
 bool buildMemoWrapper(
-        IR::Module* module, IR::Function* original, int uniqueId) {
+        IR::Module* module, IR::Function* original,
+        IR::Instruction* externalRootCall, int uniqueId) {
     auto* i32 = IR::IntegerType::I32;
     auto* i1 = IR::IntegerType::I1;
 
@@ -721,10 +798,8 @@ bool buildMemoWrapper(
         module, original, "__opt_memo_fallback_" + suffix);
     if (!fallback) return false;
 
-    auto* rowValueType = IR::ArrayType::get(i32, kDim1);
-    auto* valueTableType = IR::ArrayType::get(rowValueType, kDim0);
-    auto* rowHitType = IR::ArrayType::get(i1, kDim1);
-    auto* hitTableType = IR::ArrayType::get(rowHitType, kDim0);
+    auto* valueTableType = IR::ArrayType::get(i32, kMemoEntryCapacity);
+    auto* hitTableType = IR::ArrayType::get(i1, kMemoEntryCapacity);
 
     auto* valueTable = module->createGlobalVariable(
         IR::PointerType::get(valueTableType),
@@ -732,6 +807,24 @@ bool buildMemoWrapper(
     auto* hitTable = module->createGlobalVariable(
         IR::PointerType::get(hitTableType),
         "__opt_memo_hit_" + suffix, false);
+    auto* enabledGlobal = module->createGlobalVariable(
+        IR::PointerType::get(i1),
+        "__opt_memo_enabled_" + suffix, false);
+    auto* strideGlobal = module->createGlobalVariable(
+        IR::PointerType::get(i32),
+        "__opt_memo_stride_" + suffix, false);
+    auto* maxAGlobal = module->createGlobalVariable(
+        IR::PointerType::get(i32),
+        "__opt_memo_max_a_" + suffix, false);
+    auto* maxBGlobal = module->createGlobalVariable(
+        IR::PointerType::get(i32),
+        "__opt_memo_max_b_" + suffix, false);
+
+    if (!configureMemoLayout(
+            externalRootCall, enabledGlobal, strideGlobal,
+            maxAGlobal, maxBGlobal)) {
+        return false;
+    }
 
     original->getBlocks().clear();
 
@@ -744,48 +837,63 @@ bool buildMemoWrapper(
     auto* argA = original->getArg(0);
     auto* argB = original->getArg(1);
     auto* zero = IR::ConstantInt::get(i32, 0);
-    auto* dim0 = IR::ConstantInt::get(i32, static_cast<int64_t>(kDim0));
-    auto* dim1 = IR::ConstantInt::get(i32, static_cast<int64_t>(kDim1));
     auto* one = IR::ConstantInt::get(i32, 1);
 
+    auto* enabled = IR::Instruction::createLoad(
+        i1, enabledGlobal, "memo.enabled");
+    auto* maximumA = IR::Instruction::createLoad(
+        i32, maxAGlobal, "memo.maximum.a");
+    auto* maximumB = IR::Instruction::createLoad(
+        i32, maxBGlobal, "memo.maximum.b");
     auto* aGe0 = IR::Instruction::createCmp(Opc::ICMP, argA, zero, "sge");
-    auto* aLtDim0 = IR::Instruction::createCmp(Opc::ICMP, argA, dim0, "slt");
+    auto* aWithinRoot = IR::Instruction::createCmp(
+        Opc::ICMP, argA, maximumA, "sle");
     auto* bGe0 = IR::Instruction::createCmp(Opc::ICMP, argB, zero, "sge");
-    auto* bLtDim1 = IR::Instruction::createCmp(Opc::ICMP, argB, dim1, "slt");
+    auto* bWithinRoot = IR::Instruction::createCmp(
+        Opc::ICMP, argB, maximumB, "sle");
     auto* and1 = IR::Instruction::createBinOp(
-        Opc::AND, i1, "memo.and1", aGe0, aLtDim0);
+        Opc::AND, i1, "memo.and1", enabled, aGe0);
     auto* and2 = IR::Instruction::createBinOp(
-        Opc::AND, i1, "memo.and2", and1, bGe0);
+        Opc::AND, i1, "memo.and2", and1, aWithinRoot);
+    auto* and3 = IR::Instruction::createBinOp(
+        Opc::AND, i1, "memo.and3", and2, bGe0);
     auto* inRange = IR::Instruction::createBinOp(
-        Opc::AND, i1, "memo.inrange", and2, bLtDim1);
+        Opc::AND, i1, "memo.inrange", and3, bWithinRoot);
+    entry->pushBack(enabled);
+    entry->pushBack(maximumA);
+    entry->pushBack(maximumB);
     entry->pushBack(aGe0);
-    entry->pushBack(aLtDim0);
+    entry->pushBack(aWithinRoot);
     entry->pushBack(bGe0);
-    entry->pushBack(bLtDim1);
+    entry->pushBack(bWithinRoot);
     entry->pushBack(and1);
     entry->pushBack(and2);
+    entry->pushBack(and3);
     entry->pushBack(inRange);
     entry->pushBack(IR::Instruction::createCondBr(
         inRange, inBounds, fallbackOnly));
 
-    auto* hitRow = IR::Instruction::createGetElementPtr(
-        rowHitType, hitTable, {zero, argA}, "memo.hit.row");
+    auto* stride = IR::Instruction::createLoad(
+        i32, strideGlobal, "memo.stride");
+    auto* rowOffset = IR::Instruction::createBinOp(
+        Opc::MUL, i32, "memo.row.offset", argA, stride);
+    auto* index = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "memo.index", rowOffset, argB);
     auto* hitAddress = IR::Instruction::createGetElementPtr(
-        i1, hitRow, {zero, argB}, "memo.hit.addr");
+        hitTableType, hitTable, {zero, index}, "memo.hit.addr");
     auto* hitFlag = IR::Instruction::createLoad(
         i1, hitAddress, "memo.hit.flag");
-    inBounds->pushBack(hitRow);
+    inBounds->pushBack(stride);
+    inBounds->pushBack(rowOffset);
+    inBounds->pushBack(index);
     inBounds->pushBack(hitAddress);
     inBounds->pushBack(hitFlag);
     inBounds->pushBack(IR::Instruction::createCondBr(hitFlag, hit, miss));
 
-    auto* valueRow = IR::Instruction::createGetElementPtr(
-        rowValueType, valueTable, {zero, argA}, "memo.value.row");
     auto* valueAddress = IR::Instruction::createGetElementPtr(
-        i32, valueRow, {zero, argB}, "memo.value.addr");
+        valueTableType, valueTable, {zero, index}, "memo.value.addr");
     auto* cachedValue = IR::Instruction::createLoad(
         i32, valueAddress, "memo.value.cached");
-    hit->pushBack(valueRow);
     hit->pushBack(valueAddress);
     hit->pushBack(cachedValue);
     hit->pushBack(IR::Instruction::createRet(cachedValue));
@@ -793,19 +901,13 @@ bool buildMemoWrapper(
     auto* computed = IR::Instruction::createCall(
         fallback->getFunctionType(), fallback,
         {argA, argB}, "memo.computed");
-    auto* storeValueRow = IR::Instruction::createGetElementPtr(
-        rowValueType, valueTable, {zero, argA}, "memo.store.value.row");
     auto* storeValueAddress = IR::Instruction::createGetElementPtr(
-        i32, storeValueRow, {zero, argB}, "memo.store.value.addr");
-    auto* storeHitRow = IR::Instruction::createGetElementPtr(
-        rowHitType, hitTable, {zero, argA}, "memo.store.hit.row");
+        valueTableType, valueTable, {zero, index}, "memo.store.value.addr");
     auto* storeHitAddress = IR::Instruction::createGetElementPtr(
-        i1, storeHitRow, {zero, argB}, "memo.store.hit.addr");
+        hitTableType, hitTable, {zero, index}, "memo.store.hit.addr");
     miss->pushBack(computed);
-    miss->pushBack(storeValueRow);
     miss->pushBack(storeValueAddress);
     miss->pushBack(IR::Instruction::createStore(computed, storeValueAddress));
-    miss->pushBack(storeHitRow);
     miss->pushBack(storeHitAddress);
     miss->pushBack(IR::Instruction::createStore(one, storeHitAddress));
     miss->pushBack(IR::Instruction::createRet(computed));
@@ -821,20 +923,26 @@ bool buildMemoWrapper(
 } // namespace
 
 bool recursiveMemoization(IR::Module* module) {
-    std::vector<IR::Function*> candidates;
+    struct Candidate {
+        IR::Function* function;
+        IR::Instruction* rootCall;
+    };
+    std::vector<Candidate> candidates;
     for (auto& function : module->getFunctions()) {
         IR::Instruction* externalRootCall = nullptr;
         if (isMemoizableSelfRecursive(
-                module, function.get(), externalRootCall)) {
-            candidates.push_back(function.get());
+                function.get(), externalRootCall)) {
+            candidates.push_back({function.get(), externalRootCall});
         }
     }
     if (candidates.empty()) return false;
 
     static int uniqueCounter = 0;
     bool changed = false;
-    for (auto* function : candidates) {
-        if (buildMemoWrapper(module, function, uniqueCounter++)) {
+    for (const auto& candidate : candidates) {
+        if (buildMemoWrapper(
+                module, candidate.function, candidate.rootCall,
+                uniqueCounter++)) {
             changed = true;
         }
     }

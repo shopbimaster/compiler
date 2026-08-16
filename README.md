@@ -148,7 +148,7 @@ flowchart TD
 | `localMemoryAccessOptimization`    | `LocalMemoryAccessOptimization.cpp`    | 基本块内短距离 GEP 复用与带别名检查的内存转发               |
 | `redundantIterationElimination`    | `RedundantIterationElimination.cpp`    | 可证冗余的循环迭代消除                                        |
 | `dynamicIdempotentLoopElimination` | `DynamicIdempotentLoopElimination.cpp` | 动态幂等循环迭代消除                                          |
-| `recursiveMemoization`             | `RecursiveOpt.cpp`                     | 可证单次根调用且状态稳定的纯自递归函数 → 记忆化查表            |
+| `recursiveMemoization`             | `RecursiveOpt.cpp`                     | 可证单次根调用且状态稳定的纯自递归函数 → 根参数推导范围的记忆化查表 |
 | `repeatedDivRemToNative`           | `NativeLowering.cpp`                   | 完整无副作用循环闭包证明后的重复除余提取 → 原生位运算          |
 | `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 完整纯递归闭包与输入守卫证明后的模乘 → WIDE_SMOD_MUL           |
 | `bitOpPatternRecognition`          | `BitOpPatternRecognition.cpp`          | 完整局部状态与 CFG 闭包证明后的软件位运算循环 → 带符号守卫的原生位指令 |
