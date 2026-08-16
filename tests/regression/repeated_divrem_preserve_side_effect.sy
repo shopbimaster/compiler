@@ -1,0 +1,21 @@
+const int digit_base = 16;
+int observed_iterations;
+
+int extract_digit_with_effect(int value, int position) {
+    int index = 0;
+    while (index < position) {
+        value = value / digit_base;
+        observed_iterations = observed_iterations + 1;
+        index = index + 1;
+    }
+    return value % digit_base;
+}
+
+int main() {
+    observed_iterations = 0;
+    putint(extract_digit_with_effect(4660, 2));
+    putch(32);
+    putint(observed_iterations);
+    putch(10);
+    return 0;
+}

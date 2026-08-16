@@ -726,79 +726,35 @@ unsigned exactLog2(int64_t value) {
     return bits;
 }
 
-bool tracesToArgument(IR::Value* value, IR::Argument* argument,
-                      IR::Function* function) {
-    if (!value || !argument) return false;
-    if (value == argument) return true;
+IR::Instruction* digitInstruction(IR::Value* value, Opc opcode) {
+    auto* instruction = dynamic_cast<IR::Instruction*>(value);
+    return instruction && instruction->getOpcode() == opcode
+               ? instruction
+               : nullptr;
+}
 
-    auto* load = dynamic_cast<IR::Instruction*>(value);
-    if (!load || load->getOpcode() != Opc::LOAD ||
-        load->getNumOperands() != 1) {
+bool isEntryAlloca(IR::Value* value, IR::BasicBlock* entry) {
+    auto* instruction = digitInstruction(value, Opc::ALLOCA);
+    return instruction && instruction->getParent() == entry;
+}
+
+bool isBinaryWithConstant(IR::Instruction* instruction, Opc opcode,
+                          IR::Value* other, int64_t constant) {
+    if (!instruction || instruction->getOpcode() != opcode ||
+        instruction->getNumOperands() != 2) {
         return false;
     }
-    IR::Value* slot = load->getOperand(0);
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == Opc::STORE &&
-                inst->getNumOperands() == 2 &&
-                inst->getOperand(0) == argument &&
-                inst->getOperand(1) == slot) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// 注：isLoadFrom / isDirectlyReturned 已由第 1 节（RecursiveMulToNative）
-// 提供，C++ 匿名命名空间在同文件内合并，此处不再重复定义。
-
-bool hasStore(IR::Function* function, IR::Value* value, IR::Value* slot) {
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == Opc::STORE &&
-                inst->getNumOperands() == 2 &&
-                inst->getOperand(0) == value &&
-                inst->getOperand(1) == slot) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool hasStoreInBlock(IR::BasicBlock* block, IR::Value* value,
-                     IR::Value* slot) {
-    if (!block) return false;
-    for (auto& inst : block->getInstructions()) {
-        if (inst->getOpcode() == Opc::STORE &&
-            inst->getNumOperands() == 2 &&
-            inst->getOperand(0) == value &&
-            inst->getOperand(1) == slot) {
-            return true;
-        }
-    }
-    return false;
-}
-
-IR::Instruction* findControllingBranch(IR::Function* function,
-                                       IR::Instruction* condition) {
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == Opc::COND_BR &&
-                inst->getNumOperands() == 3 &&
-                inst->getOperand(0) == condition) {
-                return inst.get();
-            }
-        }
-    }
-    return nullptr;
+    return (instruction->getOperand(0) == other &&
+            isConstant(instruction->getOperand(1), constant)) ||
+           (instruction->getOperand(1) == other &&
+            isConstant(instruction->getOperand(0), constant));
 }
 
 bool matchRepeatedDivRem(IR::Function* function,
                          DigitExtractionMatch& match) {
     if (!function || function->isExternal() ||
         function->getNumArgs() != 2 ||
+        function->getBlocks().size() != 4 ||
         function->getFunctionType()->getReturnType() !=
             IR::IntegerType::I32 ||
         function->getArg(0)->getType() != IR::IntegerType::I32 ||
@@ -806,31 +762,89 @@ bool matchRepeatedDivRem(IR::Function* function,
         return false;
     }
 
-    std::vector<IR::Instruction*> divisions;
-    std::vector<IR::Instruction*> remainders;
-    std::vector<IR::Instruction*> additions;
-    std::vector<IR::Instruction*> comparisons;
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            switch (inst->getOpcode()) {
-            case Opc::SDIV: divisions.push_back(inst.get()); break;
-            case Opc::SREM: remainders.push_back(inst.get()); break;
-            case Opc::ADD: additions.push_back(inst.get()); break;
-            case Opc::ICMP: comparisons.push_back(inst.get()); break;
-            case Opc::CALL:
-            case Opc::PHI:
-            case Opc::SELECT:
-                return false;
-            default:
-                break;
-            }
-        }
-    }
-    if (divisions.size() != 1 || remainders.size() != 1)
+    auto* entry = function->getEntryBlock();
+    if (!entry || entry->empty()) return false;
+    auto* entryBranch = entry->getTerminator();
+    if (!entryBranch || entryBranch->getOpcode() != Opc::BR ||
+        entryBranch->getNumOperands() != 1) {
         return false;
+    }
+    auto* header = dynamic_cast<IR::BasicBlock*>(entryBranch->getOperand(0));
+    if (!header || header == entry || header->size() != 4) return false;
 
-    auto* division = divisions.front();
-    auto* remainder = remainders.front();
+    auto headerIt = header->getInstructions().begin();
+    auto* counterHeaderLoad = digitInstruction(headerIt++->get(), Opc::LOAD);
+    auto* boundLoad = digitInstruction(headerIt++->get(), Opc::LOAD);
+    auto* loopCondition = digitInstruction(headerIt++->get(), Opc::ICMP);
+    auto* loopBranch = digitInstruction(headerIt++->get(), Opc::COND_BR);
+    if (!counterHeaderLoad || counterHeaderLoad->getNumOperands() != 1 ||
+        !boundLoad || boundLoad->getNumOperands() != 1 ||
+        !loopCondition || loopCondition->getName() != "slt" ||
+        loopCondition->getNumOperands() != 2 ||
+        loopCondition->getOperand(0) != counterHeaderLoad ||
+        loopCondition->getOperand(1) != boundLoad ||
+        !loopBranch || loopBranch->getNumOperands() != 3 ||
+        loopBranch->getOperand(0) != loopCondition) {
+        return false;
+    }
+
+    auto* loopBody = dynamic_cast<IR::BasicBlock*>(loopBranch->getOperand(1));
+    auto* exit = dynamic_cast<IR::BasicBlock*>(loopBranch->getOperand(2));
+    if (!loopBody || !exit || loopBody == entry || loopBody == header ||
+        exit == entry || exit == header || exit == loopBody ||
+        loopBody->size() != 7 || exit->size() != 3) {
+        return false;
+    }
+
+    auto bodyIt = loopBody->getInstructions().begin();
+    auto* divisionInput = digitInstruction(bodyIt++->get(), Opc::LOAD);
+    auto* division = digitInstruction(bodyIt++->get(), Opc::SDIV);
+    auto* valueStore = digitInstruction(bodyIt++->get(), Opc::STORE);
+    auto* counterBodyLoad = digitInstruction(bodyIt++->get(), Opc::LOAD);
+    auto* increment = digitInstruction(bodyIt++->get(), Opc::ADD);
+    auto* counterStore = digitInstruction(bodyIt++->get(), Opc::STORE);
+    auto* bodyBranch = digitInstruction(bodyIt++->get(), Opc::BR);
+    if (!divisionInput || divisionInput->getNumOperands() != 1 ||
+        !division || division->getNumOperands() != 2 ||
+        division->getOperand(0) != divisionInput ||
+        !valueStore || valueStore->getNumOperands() != 2 ||
+        valueStore->getOperand(0) != division ||
+        !counterBodyLoad || counterBodyLoad->getNumOperands() != 1 ||
+        !isBinaryWithConstant(increment, Opc::ADD, counterBodyLoad, 1) ||
+        !counterStore || counterStore->getNumOperands() != 2 ||
+        counterStore->getOperand(0) != increment ||
+        !bodyBranch || bodyBranch->getNumOperands() != 1 ||
+        bodyBranch->getOperand(0) != header) {
+        return false;
+    }
+
+    auto exitIt = exit->getInstructions().begin();
+    auto* remainderInput = digitInstruction(exitIt++->get(), Opc::LOAD);
+    auto* remainder = digitInstruction(exitIt++->get(), Opc::SREM);
+    auto* returnInstruction = digitInstruction(exitIt++->get(), Opc::RET);
+    if (!remainderInput || remainderInput->getNumOperands() != 1 ||
+        !remainder || remainder->getNumOperands() != 2 ||
+        remainder->getOperand(0) != remainderInput ||
+        !returnInstruction || returnInstruction->getNumOperands() != 1 ||
+        returnInstruction->getOperand(0) != remainder) {
+        return false;
+    }
+
+    IR::Value* valueSlot = divisionInput->getOperand(0);
+    IR::Value* counterSlot = counterBodyLoad->getOperand(0);
+    IR::Value* boundSlot = boundLoad->getOperand(0);
+    if (remainderInput->getOperand(0) != valueSlot ||
+        valueStore->getOperand(1) != valueSlot ||
+        counterHeaderLoad->getOperand(0) != counterSlot ||
+        counterStore->getOperand(1) != counterSlot ||
+        valueSlot == counterSlot || valueSlot == boundSlot ||
+        counterSlot == boundSlot ||
+        !isEntryAlloca(valueSlot, entry) ||
+        !isEntryAlloca(counterSlot, entry) ||
+        !isEntryAlloca(boundSlot, entry)) {
+        return false;
+    }
+
     auto* divisor =
         dynamic_cast<IR::ConstantInt*>(division->getOperand(1));
     auto* remainderDivisor =
@@ -840,95 +854,40 @@ bool matchRepeatedDivRem(IR::Function* function,
         !isPowerOfTwo(divisor->getValue())) {
         return false;
     }
-
     unsigned bits = exactLog2(divisor->getValue());
-    if (bits == 0 || bits >= 32 || 32 % bits != 0)
-        return false;
+    if (bits == 0 || bits >= 32 || 32 % bits != 0) return false;
 
-    auto* divisionInput =
-        dynamic_cast<IR::Instruction*>(division->getOperand(0));
-    auto* remainderInput =
-        dynamic_cast<IR::Instruction*>(remainder->getOperand(0));
-    if (!divisionInput || divisionInput->getOpcode() != Opc::LOAD ||
-        !remainderInput || remainderInput->getOpcode() != Opc::LOAD) {
-        return false;
-    }
-    IR::Value* valueSlot = divisionInput->getOperand(0);
-    if (remainderInput->getOperand(0) != valueSlot ||
-        !hasStore(function, function->getArg(0), valueSlot) ||
-        !hasStore(function, division, valueSlot) ||
-        !isDirectlyReturned(function, remainder)) {
-        return false;
-    }
-
-    IR::Value* counterSlot = nullptr;
-    IR::Instruction* increment = nullptr;
-    for (auto* addition : additions) {
-        IR::Value* loadedCounter = nullptr;
-        if (isConstant(addition->getOperand(0), 1))
-            loadedCounter = addition->getOperand(1);
-        else if (isConstant(addition->getOperand(1), 1))
-            loadedCounter = addition->getOperand(0);
-        else
-            continue;
-
-        auto* load = dynamic_cast<IR::Instruction*>(loadedCounter);
-        if (!load || load->getOpcode() != Opc::LOAD) continue;
-        IR::Value* candidateSlot = load->getOperand(0);
-        if (!hasStore(function, addition, candidateSlot) ||
-            !hasStore(function,
-                      IR::ConstantInt::get(IR::IntegerType::I32, 0),
-                      candidateSlot)) {
+    // Replacing the whole function is only valid after accounting for every
+    // entry instruction. Required state is initialized exactly once. Extra
+    // front-end temporaries may only be write-only local constants.
+    std::unordered_set<IR::Value*> allocas;
+    std::unordered_map<IR::Value*, IR::Value*> initialValues;
+    for (const auto& owned : entry->getInstructions()) {
+        auto* instruction = owned.get();
+        if (instruction == entryBranch) continue;
+        if (instruction->getOpcode() == Opc::ALLOCA) {
+            allocas.insert(instruction);
             continue;
         }
-        if (increment) return false;
-        increment = addition;
-        counterSlot = candidateSlot;
+        if (instruction->getOpcode() != Opc::STORE ||
+            instruction->getNumOperands() != 2 ||
+            !allocas.count(instruction->getOperand(1)) ||
+            initialValues.count(instruction->getOperand(1))) {
+            return false;
+        }
+        initialValues.emplace(instruction->getOperand(1),
+                              instruction->getOperand(0));
     }
-    if (!increment || !counterSlot || counterSlot == valueSlot)
+    if (allocas.size() != initialValues.size() ||
+        initialValues[valueSlot] != function->getArg(0) ||
+        initialValues[boundSlot] != function->getArg(1) ||
+        !isConstant(initialValues[counterSlot], 0)) {
         return false;
-
-    IR::Instruction* loopCondition = nullptr;
-    IR::Instruction* loopBranch = nullptr;
-    for (auto* comparison : comparisons) {
-        if (comparison->getName() != "slt" ||
-            comparison->getNumOperands() != 2) {
+    }
+    for (IR::Value* slot : allocas) {
+        if (slot == valueSlot || slot == boundSlot || slot == counterSlot)
             continue;
-        }
-        auto* controllingBranch =
-            findControllingBranch(function, comparison);
-        if (!controllingBranch) continue;
-        bool counterFirst =
-            isLoadFrom(comparison->getOperand(0), counterSlot) &&
-            tracesToArgument(comparison->getOperand(1),
-                             function->getArg(1), function);
-        if (counterFirst) {
-            loopCondition = comparison;
-            loopBranch = controllingBranch;
-            break;
-        }
-    }
-    if (!loopCondition || !loopBranch ||
-        increment->getParent() != division->getParent()) {
-        return false;
-    }
-
-    auto* loopBody = division->getParent();
-    auto* trueTarget =
-        dynamic_cast<IR::BasicBlock*>(loopBranch->getOperand(1));
-    auto* falseTarget =
-        dynamic_cast<IR::BasicBlock*>(loopBranch->getOperand(2));
-    if (trueTarget != loopBody || !falseTarget ||
-        remainder->getParent() != falseTarget ||
-        !hasStoreInBlock(loopBody, division, valueSlot) ||
-        !hasStoreInBlock(loopBody, increment, counterSlot)) {
-        return false;
-    }
-    auto* bodyTerminator = loopBody->getTerminator();
-    if (!bodyTerminator || bodyTerminator->getOpcode() != Opc::BR ||
-        bodyTerminator->getNumOperands() != 1 ||
-        bodyTerminator->getOperand(0) != loopCondition->getParent()) {
-        return false;
+        if (!dynamic_cast<IR::ConstantInt*>(initialValues[slot])) return false;
     }
 
     match.bitsPerDigit = bits;

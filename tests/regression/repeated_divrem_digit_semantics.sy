@@ -1,0 +1,33 @@
+const int digit_base = 16;
+
+int extract_digit(int value, int position) {
+    int unused_local = 7;
+    int index = 0;
+    while (index < position) {
+        value = value / digit_base;
+        index = index + 1;
+    }
+    return value % digit_base;
+}
+
+int main() {
+    putint(extract_digit(4660, 0));
+    putch(32);
+    putint(extract_digit(4660, 1));
+    putch(32);
+    putint(extract_digit(4660, 2));
+    putch(32);
+    putint(extract_digit(4660, 3));
+    putch(32);
+    putint(extract_digit(4660, 9));
+    putch(32);
+    putint(extract_digit(-4660, 0));
+    putch(32);
+    putint(extract_digit(-4660, 1));
+    putch(32);
+    putint(extract_digit(-4660, -3));
+    putch(32);
+    putint(extract_digit(-2147483647 - 1, 7));
+    putch(10);
+    return 0;
+}
