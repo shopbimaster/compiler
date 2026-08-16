@@ -436,79 +436,35 @@ bool tryConvertFunction(IR::Function* func) {
     return false;
 }
 
-bool isConstantValue(IR::Value* value, int expected) {
+bool isConstantValue(IR::Value* value, int64_t expected) {
     auto* constant = dynamic_cast<IR::ConstantInt*>(value);
     return constant && constant->getValue() == expected;
 }
 
-bool isLoadFrom(IR::Value* value, IR::Value* pointer) {
-    auto* load = dynamic_cast<IR::Instruction*>(value);
-    return load && load->getOpcode() == IR::Instruction::Opcode::LOAD &&
-           load->getNumOperands() == 1 && load->getOperand(0) == pointer;
+IR::Instruction* modularInstructionAt(
+    IR::BasicBlock* block, size_t index, IR::Instruction::Opcode opcode) {
+    if (!block || index >= block->getInstructions().size()) return nullptr;
+    auto* instruction = block->getInstructions()[index].get();
+    return instruction->getOpcode() == opcode ? instruction : nullptr;
 }
 
-bool isStoredTo(IR::Function* function, IR::Value* value, IR::Value* pointer) {
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == IR::Instruction::Opcode::STORE &&
-                inst->getNumOperands() == 2 &&
-                inst->getOperand(0) == value &&
-                inst->getOperand(1) == pointer) {
-                return true;
-            }
-        }
+bool isEqualityWithConstant(IR::Instruction* comparison, IR::Value* value,
+                            int64_t constant) {
+    if (!comparison ||
+        comparison->getOpcode() != IR::Instruction::Opcode::ICMP ||
+        comparison->getName() != "eq" ||
+        comparison->getNumOperands() != 2) {
+        return false;
     }
-    return false;
+    return (comparison->getOperand(0) == value &&
+            isConstantValue(comparison->getOperand(1), constant)) ||
+           (comparison->getOperand(1) == value &&
+            isConstantValue(comparison->getOperand(0), constant));
 }
 
-bool isDirectlyReturned(IR::Function* function, IR::Value* value) {
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == IR::Instruction::Opcode::RET &&
-                inst->getNumOperands() == 1 &&
-                inst->getOperand(0) == value) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool hasEqualityTest(IR::Function* function, IR::Value* value, int constant) {
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() != IR::Instruction::Opcode::ICMP ||
-                inst->getName() != "eq" || inst->getNumOperands() != 2) {
-                continue;
-            }
-            if ((inst->getOperand(0) == value &&
-                 isConstantValue(inst->getOperand(1), constant)) ||
-                (inst->getOperand(1) == value &&
-                 isConstantValue(inst->getOperand(0), constant))) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool hasArgumentEqualityTest(IR::Function* function, IR::Argument* argument,
-                             int constant) {
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() != IR::Instruction::Opcode::ICMP ||
-                inst->getName() != "eq" || inst->getNumOperands() != 2) {
-                continue;
-            }
-            if ((tracesToArg(inst->getOperand(0), argument, function) &&
-                 isConstantValue(inst->getOperand(1), constant)) ||
-                (tracesToArg(inst->getOperand(1), argument, function) &&
-                 isConstantValue(inst->getOperand(0), constant))) {
-                return true;
-            }
-        }
-    }
-    return false;
+bool isBranchTo(IR::Instruction* branch, IR::BasicBlock* target) {
+    return branch && branch->getOpcode() == IR::Instruction::Opcode::BR &&
+           branch->getNumOperands() == 1 && branch->getOperand(0) == target;
 }
 
 // Recognize the overflow-safe recursive modular multiplication:
@@ -523,122 +479,215 @@ bool hasArgumentEqualityTest(IR::Function* function, IR::Argument* argument,
 // recursion whose i32 overflow behavior could differ.
 bool matchRecursiveModularMultiply(IR::Function* function, int& modulus) {
     using Opc = IR::Instruction::Opcode;
-    if (function->isExternal() || function->getNumArgs() != 2 ||
+    if (!function || function->isExternal() || function->getNumArgs() != 2 ||
         function->getFunctionType()->getReturnType() != IR::IntegerType::I32 ||
         function->getArg(0)->getType() != IR::IntegerType::I32 ||
         function->getArg(1)->getType() != IR::IntegerType::I32) {
         return false;
     }
 
-    std::vector<IR::Instruction*> calls;
-    std::vector<IR::Instruction*> remainders;
-    bool returnsZero = false;
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == Opc::CALL) calls.push_back(inst.get());
-            if (inst->getOpcode() == Opc::SREM) remainders.push_back(inst.get());
-            if (inst->getOpcode() == Opc::WIDE_SMOD_MUL) return false;
-            if (inst->getOpcode() == Opc::RET && inst->getNumOperands() == 1 &&
-                isConstantValue(inst->getOperand(0), 0)) {
-                returnsZero = true;
-            }
-        }
+    auto* entry = function->getEntryBlock();
+    if (!entry || entry->size() != 7) return false;
+    auto* firstSlot = modularInstructionAt(entry, 0, Opc::ALLOCA);
+    auto* firstInit = modularInstructionAt(entry, 1, Opc::STORE);
+    auto* secondSlot = modularInstructionAt(entry, 2, Opc::ALLOCA);
+    auto* secondInit = modularInstructionAt(entry, 3, Opc::STORE);
+    auto* secondZeroLoad = modularInstructionAt(entry, 4, Opc::LOAD);
+    auto* zeroComparison = modularInstructionAt(entry, 5, Opc::ICMP);
+    auto* zeroBranch = modularInstructionAt(entry, 6, Opc::COND_BR);
+    if (!firstSlot || !firstInit || firstInit->getNumOperands() != 2 ||
+        firstInit->getOperand(0) != function->getArg(0) ||
+        firstInit->getOperand(1) != firstSlot ||
+        !secondSlot || secondSlot == firstSlot ||
+        !secondInit || secondInit->getNumOperands() != 2 ||
+        secondInit->getOperand(0) != function->getArg(1) ||
+        secondInit->getOperand(1) != secondSlot ||
+        !secondZeroLoad || secondZeroLoad->getNumOperands() != 1 ||
+        secondZeroLoad->getOperand(0) != secondSlot ||
+        !isEqualityWithConstant(zeroComparison, secondZeroLoad, 0) ||
+        !zeroBranch || zeroBranch->getNumOperands() != 3 ||
+        zeroBranch->getOperand(0) != zeroComparison) {
+        return false;
     }
-    if (calls.size() != 1 || remainders.size() != 4 || !returnsZero) return false;
 
-    auto* selfCall = calls.front();
-    if (selfCall->getNumOperands() != 3 ||
+    auto* zeroReturnBlock =
+        dynamic_cast<IR::BasicBlock*>(zeroBranch->getOperand(1));
+    auto* zeroFallthrough =
+        dynamic_cast<IR::BasicBlock*>(zeroBranch->getOperand(2));
+    auto* zeroReturn = modularInstructionAt(zeroReturnBlock, 0, Opc::RET);
+    auto* zeroNext = modularInstructionAt(zeroFallthrough, 0, Opc::BR);
+    if (!zeroReturnBlock || zeroReturnBlock->size() != 1 ||
+        !zeroReturn || zeroReturn->getNumOperands() != 1 ||
+        !isConstantValue(zeroReturn->getOperand(0), 0) ||
+        !zeroFallthrough || zeroFallthrough->size() != 1 || !zeroNext) {
+        return false;
+    }
+
+    auto* oneTest = zeroNext && zeroNext->getNumOperands() == 1
+        ? dynamic_cast<IR::BasicBlock*>(zeroNext->getOperand(0))
+        : nullptr;
+    if (!isBranchTo(zeroNext, oneTest) || !oneTest || oneTest->size() != 3)
+        return false;
+    auto* secondOneLoad = modularInstructionAt(oneTest, 0, Opc::LOAD);
+    auto* oneComparison = modularInstructionAt(oneTest, 1, Opc::ICMP);
+    auto* oneBranch = modularInstructionAt(oneTest, 2, Opc::COND_BR);
+    if (!secondOneLoad || secondOneLoad->getNumOperands() != 1 ||
+        secondOneLoad->getOperand(0) != secondSlot ||
+        !isEqualityWithConstant(oneComparison, secondOneLoad, 1) ||
+        !oneBranch || oneBranch->getNumOperands() != 3 ||
+        oneBranch->getOperand(0) != oneComparison) {
+        return false;
+    }
+
+    auto* oneReturnBlock =
+        dynamic_cast<IR::BasicBlock*>(oneBranch->getOperand(1));
+    auto* oneFallthrough =
+        dynamic_cast<IR::BasicBlock*>(oneBranch->getOperand(2));
+    if (!oneReturnBlock || oneReturnBlock->size() != 3 ||
+        !oneFallthrough || oneFallthrough->size() != 1) {
+        return false;
+    }
+    auto* firstBaseLoad = modularInstructionAt(oneReturnBlock, 0, Opc::LOAD);
+    auto* baseRemainder = modularInstructionAt(oneReturnBlock, 1, Opc::SREM);
+    auto* baseReturn = modularInstructionAt(oneReturnBlock, 2, Opc::RET);
+    if (!firstBaseLoad || firstBaseLoad->getNumOperands() != 1 ||
+        firstBaseLoad->getOperand(0) != firstSlot ||
+        !baseRemainder || baseRemainder->getNumOperands() != 2 ||
+        baseRemainder->getOperand(0) != firstBaseLoad ||
+        !baseReturn || baseReturn->getNumOperands() != 1 ||
+        baseReturn->getOperand(0) != baseRemainder) {
+        return false;
+    }
+
+    auto* recursiveBranch =
+        modularInstructionAt(oneFallthrough, 0, Opc::BR);
+    auto* recursiveBlock = recursiveBranch &&
+                           recursiveBranch->getNumOperands() == 1
+        ? dynamic_cast<IR::BasicBlock*>(recursiveBranch->getOperand(0))
+        : nullptr;
+    if (!isBranchTo(recursiveBranch, recursiveBlock) || !recursiveBlock ||
+        recursiveBlock->size() != 14) {
+        return false;
+    }
+
+    auto* currentSlot = modularInstructionAt(recursiveBlock, 0, Opc::ALLOCA);
+    auto* firstRecursiveLoad = modularInstructionAt(recursiveBlock, 1, Opc::LOAD);
+    auto* secondRecursiveLoad = modularInstructionAt(recursiveBlock, 2, Opc::LOAD);
+    auto* half = modularInstructionAt(recursiveBlock, 3, Opc::SDIV);
+    auto* selfCall = modularInstructionAt(recursiveBlock, 4, Opc::CALL);
+    auto* callStore = modularInstructionAt(recursiveBlock, 5, Opc::STORE);
+    auto* currentDoubleLoad = modularInstructionAt(recursiveBlock, 6, Opc::LOAD);
+    auto* doubled = modularInstructionAt(recursiveBlock, 7, Opc::ADD);
+    auto* doubleRemainder = modularInstructionAt(recursiveBlock, 8, Opc::SREM);
+    auto* doubleStore = modularInstructionAt(recursiveBlock, 9, Opc::STORE);
+    auto* secondParityLoad = modularInstructionAt(recursiveBlock, 10, Opc::LOAD);
+    auto* parityRemainder = modularInstructionAt(recursiveBlock, 11, Opc::SREM);
+    auto* parityComparison = modularInstructionAt(recursiveBlock, 12, Opc::ICMP);
+    auto* parityBranch = modularInstructionAt(recursiveBlock, 13, Opc::COND_BR);
+    if (!currentSlot || currentSlot == firstSlot || currentSlot == secondSlot ||
+        !firstRecursiveLoad || firstRecursiveLoad->getNumOperands() != 1 ||
+        firstRecursiveLoad->getOperand(0) != firstSlot ||
+        !secondRecursiveLoad || secondRecursiveLoad->getNumOperands() != 1 ||
+        secondRecursiveLoad->getOperand(0) != secondSlot ||
+        !half || half->getNumOperands() != 2 ||
+        half->getOperand(0) != secondRecursiveLoad ||
+        !isConstantValue(half->getOperand(1), 2) ||
+        !selfCall || selfCall->getNumOperands() != 3 ||
         selfCall->getOperand(0) != static_cast<IR::Value*>(function) ||
-        !tracesToArg(selfCall->getOperand(1), function->getArg(0), function)) {
-        return false;
-    }
-    auto* half = dynamic_cast<IR::Instruction*>(selfCall->getOperand(2));
-    if (!half || half->getOpcode() != Opc::SDIV ||
-        half->getNumOperands() != 2 ||
-        !tracesToArg(half->getOperand(0), function->getArg(1), function) ||
-        !isConstantValue(half->getOperand(1), 2)) {
-        return false;
-    }
-
-    IR::Value* currentSlot = nullptr;
-    for (auto& block : function->getBlocks()) {
-        for (auto& inst : block->getInstructions()) {
-            if (inst->getOpcode() == Opc::STORE &&
-                inst->getNumOperands() == 2 &&
-                inst->getOperand(0) == selfCall) {
-                if (currentSlot) return false;
-                currentSlot = inst->getOperand(1);
-            }
-        }
-    }
-    auto* currentAlloca = dynamic_cast<IR::Instruction*>(currentSlot);
-    if (!currentAlloca || currentAlloca->getOpcode() != Opc::ALLOCA) return false;
-
-    IR::Instruction* parityRemainder = nullptr;
-    std::vector<IR::Instruction*> modularRemainders;
-    int detectedModulus = 0;
-    for (auto* remainder : remainders) {
-        auto* divisor = dynamic_cast<IR::ConstantInt*>(remainder->getOperand(1));
-        if (!divisor) return false;
-        int64_t value = divisor->getValue();
-        if (value == 2 &&
-            tracesToArg(remainder->getOperand(0), function->getArg(1), function)) {
-            if (parityRemainder) return false;
-            parityRemainder = remainder;
-            continue;
-        }
-        if (value <= 1 || value > std::numeric_limits<int>::max() / 2)
-            return false;
-        if (detectedModulus == 0) detectedModulus = static_cast<int>(value);
-        if (detectedModulus != value) return false;
-        modularRemainders.push_back(remainder);
-    }
-    if (!parityRemainder || modularRemainders.size() != 3 ||
-        !hasEqualityTest(function, parityRemainder, 1) ||
-        !hasArgumentEqualityTest(function, function->getArg(1), 0) ||
-        !hasArgumentEqualityTest(function, function->getArg(1), 1)) {
+        selfCall->getOperand(1) != firstRecursiveLoad ||
+        selfCall->getOperand(2) != half ||
+        !callStore || callStore->getNumOperands() != 2 ||
+        callStore->getOperand(0) != selfCall ||
+        callStore->getOperand(1) != currentSlot ||
+        !currentDoubleLoad || currentDoubleLoad->getNumOperands() != 1 ||
+        currentDoubleLoad->getOperand(0) != currentSlot ||
+        !doubled || doubled->getNumOperands() != 2 ||
+        doubled->getOperand(0) != currentDoubleLoad ||
+        doubled->getOperand(1) != currentDoubleLoad ||
+        !doubleRemainder || doubleRemainder->getNumOperands() != 2 ||
+        doubleRemainder->getOperand(0) != doubled ||
+        !doubleStore || doubleStore->getNumOperands() != 2 ||
+        doubleStore->getOperand(0) != doubleRemainder ||
+        doubleStore->getOperand(1) != currentSlot ||
+        !secondParityLoad || secondParityLoad->getNumOperands() != 1 ||
+        secondParityLoad->getOperand(0) != secondSlot ||
+        !parityRemainder || parityRemainder->getNumOperands() != 2 ||
+        parityRemainder->getOperand(0) != secondParityLoad ||
+        !isConstantValue(parityRemainder->getOperand(1), 2) ||
+        !isEqualityWithConstant(parityComparison, parityRemainder, 1) ||
+        !parityBranch || parityBranch->getNumOperands() != 3 ||
+        parityBranch->getOperand(0) != parityComparison) {
         return false;
     }
 
-    bool foundBase = false;
-    bool foundDouble = false;
-    bool foundOdd = false;
-    for (auto* remainder : modularRemainders) {
-        IR::Value* dividend = remainder->getOperand(0);
-        if (tracesToArg(dividend, function->getArg(0), function) &&
-            isDirectlyReturned(function, remainder)) {
-            foundBase = true;
-            continue;
-        }
-
-        auto* add = dynamic_cast<IR::Instruction*>(dividend);
-        if (!add || add->getOpcode() != Opc::ADD ||
-            add->getNumOperands() != 2) {
-            return false;
-        }
-        if (isLoadFrom(add->getOperand(0), currentSlot) &&
-            isLoadFrom(add->getOperand(1), currentSlot) &&
-            isStoredTo(function, remainder, currentSlot)) {
-            foundDouble = true;
-            continue;
-        }
-
-        bool lhsCurrent = isLoadFrom(add->getOperand(0), currentSlot);
-        bool rhsCurrent = isLoadFrom(add->getOperand(1), currentSlot);
-        bool lhsArgument =
-            tracesToArg(add->getOperand(0), function->getArg(0), function);
-        bool rhsArgument =
-            tracesToArg(add->getOperand(1), function->getArg(0), function);
-        if (((lhsCurrent && rhsArgument) || (rhsCurrent && lhsArgument)) &&
-            isDirectlyReturned(function, remainder)) {
-            foundOdd = true;
-            continue;
-        }
+    auto* oddBlock = dynamic_cast<IR::BasicBlock*>(parityBranch->getOperand(1));
+    auto* evenTarget = dynamic_cast<IR::BasicBlock*>(parityBranch->getOperand(2));
+    IR::BasicBlock* evenBridge = nullptr;
+    IR::BasicBlock* evenBlock = evenTarget;
+    if (evenTarget && evenTarget->size() == 1) {
+        auto* bridgeBranch = modularInstructionAt(evenTarget, 0, Opc::BR);
+        if (!bridgeBranch || bridgeBranch->getNumOperands() != 1) return false;
+        evenBridge = evenTarget;
+        evenBlock = dynamic_cast<IR::BasicBlock*>(bridgeBranch->getOperand(0));
+        if (!isBranchTo(bridgeBranch, evenBlock)) return false;
+    }
+    if (!oddBlock || oddBlock->size() != 5 ||
+        !evenBlock || evenBlock->size() != 2) {
         return false;
     }
-    if (!foundBase || !foundDouble || !foundOdd) return false;
+    auto* currentOddLoad = modularInstructionAt(oddBlock, 0, Opc::LOAD);
+    auto* firstOddLoad = modularInstructionAt(oddBlock, 1, Opc::LOAD);
+    auto* oddAdd = modularInstructionAt(oddBlock, 2, Opc::ADD);
+    auto* oddRemainder = modularInstructionAt(oddBlock, 3, Opc::SREM);
+    auto* oddReturn = modularInstructionAt(oddBlock, 4, Opc::RET);
+    if (!currentOddLoad || currentOddLoad->getNumOperands() != 1 ||
+        currentOddLoad->getOperand(0) != currentSlot ||
+        !firstOddLoad || firstOddLoad->getNumOperands() != 1 ||
+        firstOddLoad->getOperand(0) != firstSlot ||
+        !oddAdd || oddAdd->getNumOperands() != 2 ||
+        !((oddAdd->getOperand(0) == currentOddLoad &&
+           oddAdd->getOperand(1) == firstOddLoad) ||
+          (oddAdd->getOperand(1) == currentOddLoad &&
+           oddAdd->getOperand(0) == firstOddLoad)) ||
+        !oddRemainder || oddRemainder->getNumOperands() != 2 ||
+        oddRemainder->getOperand(0) != oddAdd ||
+        !oddReturn || oddReturn->getNumOperands() != 1 ||
+        oddReturn->getOperand(0) != oddRemainder) {
+        return false;
+    }
+    auto* currentEvenLoad = modularInstructionAt(evenBlock, 0, Opc::LOAD);
+    auto* evenReturn = modularInstructionAt(evenBlock, 1, Opc::RET);
+    if (!currentEvenLoad || currentEvenLoad->getNumOperands() != 1 ||
+        currentEvenLoad->getOperand(0) != currentSlot ||
+        !evenReturn || evenReturn->getNumOperands() != 1 ||
+        evenReturn->getOperand(0) != currentEvenLoad) {
+        return false;
+    }
 
-    modulus = detectedModulus;
+    auto* baseModulus =
+        dynamic_cast<IR::ConstantInt*>(baseRemainder->getOperand(1));
+    auto* doubleModulus =
+        dynamic_cast<IR::ConstantInt*>(doubleRemainder->getOperand(1));
+    auto* oddModulus =
+        dynamic_cast<IR::ConstantInt*>(oddRemainder->getOperand(1));
+    if (!baseModulus || !doubleModulus || !oddModulus ||
+        baseModulus->getValue() != doubleModulus->getValue() ||
+        baseModulus->getValue() != oddModulus->getValue() ||
+        baseModulus->getValue() <= 1 ||
+        baseModulus->getValue() > std::numeric_limits<int>::max() / 2) {
+        return false;
+    }
+
+    std::unordered_set<IR::BasicBlock*> accounted = {
+        entry, zeroReturnBlock, zeroFallthrough, oneTest, oneReturnBlock,
+        oneFallthrough, recursiveBlock, oddBlock, evenBlock};
+    if (evenBridge) accounted.insert(evenBridge);
+    if (accounted.size() != (evenBridge ? 10u : 9u)) return false;
+    for (const auto& block : function->getBlocks()) {
+        if (!accounted.count(block.get()) && !block->empty()) return false;
+    }
+
+    modulus = static_cast<int>(baseModulus->getValue());
     return true;
 }
 

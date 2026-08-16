@@ -150,7 +150,7 @@ flowchart TD
 | `dynamicIdempotentLoopElimination` | `DynamicIdempotentLoopElimination.cpp` | 动态幂等循环迭代消除                                          |
 | `recursiveMemoization`             | `RecursiveOpt.cpp`                     | 纯自递归函数 → 记忆化查表                                     |
 | `repeatedDivRemToNative`           | `NativeLowering.cpp`                   | 完整无副作用循环闭包证明后的重复除余提取 → 原生位运算          |
-| `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 递归模乘 → WIDE_SMOD_MUL 指令                                 |
+| `recursiveModularMulToNative`      | `NativeLowering.cpp`                   | 完整纯递归闭包与输入守卫证明后的模乘 → WIDE_SMOD_MUL           |
 | `bitOpPatternRecognition`          | `BitOpPatternRecognition.cpp`          | 位运算函数调用 → 原生位指令                                   |
 | `powerOfTwoDispatchSimplification` | `PowerOfTwoDispatch.cpp`               | 2 的幂次 switch 分派化简                                      |
 | `tailRecursionElimination`         | `TailRecursionElimination.cpp`         | 尾递归 → 循环                                                 |

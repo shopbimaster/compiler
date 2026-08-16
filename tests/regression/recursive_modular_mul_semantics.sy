@@ -1,0 +1,22 @@
+const int modulus = 1000000007;
+
+int modular_multiply(int first, int second) {
+    if (second == 0) return 0;
+    if (second == 1) return first % modulus;
+    int current = modular_multiply(first, second / 2);
+    current = (current + current) % modulus;
+    if (second % 2 == 1) return (current + first) % modulus;
+    return current;
+}
+
+int main() {
+    putint(modular_multiply(123456789, 987654321));
+    putch(32);
+    putint(modular_multiply(-3, 5));
+    putch(32);
+    putint(modular_multiply(1000000009, 3));
+    putch(32);
+    putint(modular_multiply(7, -1));
+    putch(10);
+    return 0;
+}

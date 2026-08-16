@@ -1,0 +1,21 @@
+const int modulus = 1000000007;
+int observed_calls;
+
+int modular_multiply_with_effect(int first, int second) {
+    observed_calls = observed_calls + 1;
+    if (second == 0) return 0;
+    if (second == 1) return first % modulus;
+    int current = modular_multiply_with_effect(first, second / 2);
+    current = (current + current) % modulus;
+    if (second % 2 == 1) return (current + first) % modulus;
+    return current;
+}
+
+int main() {
+    observed_calls = 0;
+    putint(modular_multiply_with_effect(7, 5));
+    putch(32);
+    putint(observed_calls);
+    putch(10);
+    return 0;
+}
