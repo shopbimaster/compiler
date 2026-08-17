@@ -1,0 +1,14 @@
+// SIMD 链式向量表达式：vec d = a + b + c;
+// 预期输出: 8 8 8 8
+// a={1,2,3,4}, b={4,3,2,1}, c={3,3,3,3} → a+b+c = {8,8,8,8}
+int main() {
+    vec a = {1, 2, 3, 4};
+    vec b = {4, 3, 2, 1};
+    vec c = {3, 3, 3, 3};
+    vec d = a + b + c;
+    putint(d[0]); putch(32);
+    putint(d[1]); putch(32);
+    putint(d[2]); putch(32);
+    putint(d[3]); putch(10);
+    return 0;
+}

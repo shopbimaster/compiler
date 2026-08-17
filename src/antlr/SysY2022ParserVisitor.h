@@ -1,5 +1,5 @@
 
-// Generated from grammar/SysY2022Parser.g4 by ANTLR 4.13.1
+// Generated from /mnt/d/VSCodeProjects/compiler/grammar/SysY2022Parser.g4 by ANTLR 4.13.1
 
 #pragma once
 
@@ -22,6 +22,10 @@ public:
     virtual std::any visitCompilationUnit(SysY2022Parser::CompilationUnitContext *context) = 0;
 
     virtual std::any visitDecl(SysY2022Parser::DeclContext *context) = 0;
+
+    virtual std::any visitVecDecl(SysY2022Parser::VecDeclContext *context) = 0;
+
+    virtual std::any visitVecInit(SysY2022Parser::VecInitContext *context) = 0;
 
     virtual std::any visitConstDecl(SysY2022Parser::ConstDeclContext *context) = 0;
 

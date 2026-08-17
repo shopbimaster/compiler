@@ -1,0 +1,10 @@
+// SIMD 默认长度向量：vec a; 应分配 [4 x i32] 并零初始化
+// 预期输出: 0 0 0 0
+int main() {
+    vec a;
+    putint(a[0]); putch(32);
+    putint(a[1]); putch(32);
+    putint(a[2]); putch(32);
+    putint(a[3]); putch(10);
+    return 0;
+}

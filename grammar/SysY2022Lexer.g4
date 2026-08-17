@@ -10,6 +10,7 @@ INT:      'int';
 FLOAT:    'float';
 VOID:     'void';
 CONST:    'const';
+VEC:      'vec';   // 《前端+定长》 SIMD 向量关键字（SSE 风格定长，仅前端词法扩展）
 IF:       'if';
 ELSE:     'else';
 WHILE:    'while';

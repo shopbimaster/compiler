@@ -1,0 +1,14 @@
+// SIMD 向量声明后赋值：vec c; c = a + b;
+// 预期输出: 5 5 5 5
+// 验证 visitStmt 的向量赋值路径（visitVecDecl 的 Case 3 之外）
+int main() {
+    vec a = {1, 2, 3, 4};
+    vec b = {4, 3, 2, 1};
+    vec c;
+    c = a + b;
+    putint(c[0]); putch(32);
+    putint(c[1]); putch(32);
+    putint(c[2]); putch(32);
+    putint(c[3]); putch(10);
+    return 0;
+}

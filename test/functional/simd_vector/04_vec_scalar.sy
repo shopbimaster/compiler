@@ -1,0 +1,35 @@
+// SIMD 标量广播运算：vec a * k 与 k + vec a
+// 预期输出:
+//   2 4 6 8       (a * 2)
+//   5 6 7 8       (3 + a)
+//   10 20 30 40   (a * 10)
+//   9 8 7 6       (10 - a)
+int main() {
+    vec a = {1, 2, 3, 4};
+
+    vec b = a * 2;
+    putint(b[0]); putch(32);
+    putint(b[1]); putch(32);
+    putint(b[2]); putch(32);
+    putint(b[3]); putch(10);
+
+    vec c = 3 + a;
+    putint(c[0]); putch(32);
+    putint(c[1]); putch(32);
+    putint(c[2]); putch(32);
+    putint(c[3]); putch(10);
+
+    vec d = a * 10;
+    putint(d[0]); putch(32);
+    putint(d[1]); putch(32);
+    putint(d[2]); putch(32);
+    putint(d[3]); putch(10);
+
+    vec e = 10 - a;
+    putint(e[0]); putch(32);
+    putint(e[1]); putch(32);
+    putint(e[2]); putch(32);
+    putint(e[3]); putch(10);
+
+    return 0;
+}
