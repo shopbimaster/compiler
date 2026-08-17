@@ -31,6 +31,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitVecfDecl(SysY2022Parser::VecfDeclContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitConstDecl(SysY2022Parser::ConstDeclContext *ctx) override {
     return visitChildren(ctx);
   }

@@ -1,0 +1,19 @@
+// 《前端+变长》 浮点向量扩展：vecf 标量广播（vecf * k、k + vecf、vecf * 10、k - vecf）
+// 预期输出:
+//   2 4 6 8        (a * 2.0)
+//   4 5 6 7        (3.0 + a)
+//   10 20 30 40    (a * 10.0)
+//   0 -1 -2 -3     (1.0 - a)
+// a = {1.0,2.0,3.0,4.0}
+int main() {
+    vecf a = {1.0, 2.0, 3.0, 4.0};
+    vecf b = a * 2.0;
+    vecf c = 3.0 + a;
+    vecf d = a * 10.0;
+    vecf e = 1.0 - a;
+    putint(b[0]); putch(32); putint(b[1]); putch(32); putint(b[2]); putch(32); putint(b[3]); putch(10);
+    putint(c[0]); putch(32); putint(c[1]); putch(32); putint(c[2]); putch(32); putint(c[3]); putch(10);
+    putint(d[0]); putch(32); putint(d[1]); putch(32); putint(d[2]); putch(32); putint(d[3]); putch(10);
+    putint(e[0]); putch(32); putint(e[1]); putch(32); putint(e[2]); putch(32); putint(e[3]); putch(10);
+    return 0;
+}

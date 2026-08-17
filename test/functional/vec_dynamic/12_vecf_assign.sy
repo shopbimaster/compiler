@@ -1,0 +1,14 @@
+// 《前端+变长》 浮点向量扩展：vecf 声明后赋值（运行时逐元素拷贝）
+// 预期输出: 5 6 7 8
+// f 初始为空 vecf（长度 0），赋值后长度由 src 决定
+int main() {
+    vecf a = {1.0, 2.0, 3.0, 4.0};
+    vecf b = {4.0, 4.0, 4.0, 4.0};
+    vecf f;
+    f = a + b;
+    putint(f[0]); putch(32);
+    putint(f[1]); putch(32);
+    putint(f[2]); putch(32);
+    putint(f[3]); putch(10);
+    return 0;
+}

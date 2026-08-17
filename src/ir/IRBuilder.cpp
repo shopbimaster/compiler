@@ -81,6 +81,10 @@ std::any IRBuilder::visitDecl(SysY2022Parser::DeclContext* ctx) {
     if (ctx->vecDecl()) {
         return visitVecDecl(ctx->vecDecl());
     }
+    // 《前端+变长》 浮点向量扩展：变长浮点向量声明分发
+    if (ctx->vecfDecl()) {
+        return visitVecfDecl(ctx->vecfDecl());
+    }
     return visitVarDecl(ctx->varDecl());
 }
 
@@ -468,6 +472,288 @@ void IRBuilder::emitVecCopy(Value* dst, Value* src) {
 }
 
 // ================================================================
+// 《前端+变长》 浮点向量扩展实现（vecf，FADD/FSUB/FMUL/FDIV 运行时循环）
+// vecf 表示为 alloca [VECF_MAX+1 x float]：[0]=运行时长度，[1..len]=float 数据
+// 与整数向量同骨架，差异仅 FloatType + 浮点 opcode
+// ================================================================
+
+// 浮点向量声明（与 visitVecDecl 对称，区别：FloatType + FADD/FSUB/FMUL/FDIV）
+std::any IRBuilder::visitVecfDecl(SysY2022Parser::VecfDeclContext* ctx) {
+    std::string name = ctx->IDENTIFIER()->getText();
+
+    // ---------- Case 1：无初始化，空浮点向量（长度 0）----------
+    if (!ctx->ASSIGN()) {
+        Value* alloca = emitVecfAlloca(0);
+        declare(name, alloca);
+        return {};
+    }
+
+    // ---------- Case 2：列表初始化 vecf a = { e1, e2, ... }; ----------
+    if (ctx->vecInit()) {
+        auto elems = ctx->vecInit()->exp();
+        unsigned n = static_cast<unsigned>(elems.size());
+        Value* alloca = emitVecfAlloca(n);
+        declare(name, alloca);
+
+        for (unsigned i = 0; i < n; ++i) {
+            Value* val = valFrom(visitExp(elems[i]));
+            val = implConvert(val, FloatType::get());
+            Value* idx = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
+            Value* elemPtr = emitVecfElemPtr(alloca, idx);
+            currentBB->pushBack(Instruction::createStore(val, elemPtr));
+        }
+        return {};
+    }
+
+    // ---------- Case 3：表达式初始化 vecf c = a + b; ----------
+    Value* rhs = valFrom(visitExp(ctx->exp()));
+    if (!rhs || !isVecfValue(rhs)) {
+        // rhs 非浮点向量：回退到空向量
+        Value* alloca = emitVecfAlloca(0);
+        declare(name, alloca);
+        return {};
+    }
+    // rhs 是浮点向量：按 rhs 运行时长度分配 lhs，逐元素拷贝
+    Value* rhsLen = emitVecfLen(rhs);
+    unsigned n = 0;
+    if (auto* ci = dynamic_cast<ConstantInt*>(rhsLen)) {
+        n = static_cast<unsigned>(ci->getValue());
+    }
+    Value* alloca = emitVecfAlloca(n);
+    // 若 rhsLen 非常量，用运行时 store 覆盖长度
+    if (n == 0) {
+        auto* arrTy = ArrayType::get(FloatType::get(), VECF_MAX + 1);
+        auto* gep0 = Instruction::createGetElementPtr(
+            arrTy, alloca,
+            {ConstantInt::get(IntegerType::I32, 0),
+             ConstantInt::get(IntegerType::I32, 0)}, newTempName());
+        currentBB->pushBack(gep0);
+        currentBB->pushBack(Instruction::createStore(rhsLen, gep0));
+    }
+    declare(name, alloca);
+    emitVecfCopy(alloca, rhs);
+    return {};
+}
+
+// 判断 Value 是否为变长浮点向量（通过 vecfAllocas 侧集合识别）
+bool IRBuilder::isVecfValue(Value* v) {
+    return v && vecfAllocas.count(v) > 0;
+}
+
+// 获取 vecf 第 idx 个数据元素的地址（即 vecfPtr[0, idx+1]，跳过 [0] 长度）
+Value* IRBuilder::emitVecfElemPtr(Value* vecfPtr, Value* idx) {
+    Value* one = ConstantInt::get(IntegerType::I32, 1);
+    auto* adjIdx = Instruction::createBinOp(
+        Instruction::Opcode::ADD, IntegerType::I32, newTempName(), idx, one);
+    currentBB->pushBack(adjIdx);
+    auto* arrTy = ArrayType::get(FloatType::get(), VECF_MAX + 1);
+    std::vector<Value*> indices = {
+        ConstantInt::get(IntegerType::I32, 0),
+        adjIdx
+    };
+    auto* gep = Instruction::createGetElementPtr(arrTy, vecfPtr, indices, newTempName());
+    currentBB->pushBack(gep);
+    return gep;
+}
+
+// 分配 vecf alloca [VECF_MAX+1 x float] 并设运行时长度 n
+Value* IRBuilder::emitVecfAlloca(unsigned n) {
+    auto* arrTy = ArrayType::get(FloatType::get(), VECF_MAX + 1);
+    auto* alloca = Instruction::createAlloca(arrTy, newTempName());
+    currentBB->pushBack(alloca);
+    vecfAllocas.insert(alloca);
+    // store 长度 n 到 [0]（[0] 槽用 i32 存长度，与 vec 一致）
+    std::vector<Value*> idx0 = {
+        ConstantInt::get(IntegerType::I32, 0),
+        ConstantInt::get(IntegerType::I32, 0)
+    };
+    auto* gep0 = Instruction::createGetElementPtr(arrTy, alloca, idx0, newTempName());
+    currentBB->pushBack(gep0);
+    auto* storeLen = Instruction::createStore(
+        ConstantInt::get(IntegerType::I32, static_cast<int64_t>(n)), gep0);
+    currentBB->pushBack(storeLen);
+    return alloca;
+}
+
+// 运行时长度读取：load vecfPtr[0]（i32 长度值，与 vec 一致）
+Value* IRBuilder::emitVecfLen(Value* vecfPtr) {
+    auto* arrTy = ArrayType::get(FloatType::get(), VECF_MAX + 1);
+    std::vector<Value*> idx0 = {
+        ConstantInt::get(IntegerType::I32, 0),
+        ConstantInt::get(IntegerType::I32, 0)
+    };
+    auto* gep0 = Instruction::createGetElementPtr(arrTy, vecfPtr, idx0, newTempName());
+    currentBB->pushBack(gep0);
+    auto* load = Instruction::createLoad(IntegerType::I32, gep0, newTempName());
+    currentBB->pushBack(load);
+    return load;
+}
+
+// 浮点向量二元运算（运行时循环）：left op right，返回结果 vecf alloca
+Value* IRBuilder::emitVecfBinOp(Instruction::Opcode op, Value* left, Value* right) {
+    Value* len = emitVecfLen(left);
+    Value* result = emitVecfAlloca(0);
+    auto* arrTy = ArrayType::get(FloatType::get(), VECF_MAX + 1);
+    std::vector<Value*> idx0 = {
+        ConstantInt::get(IntegerType::I32, 0),
+        ConstantInt::get(IntegerType::I32, 0)
+    };
+    auto* gep0 = Instruction::createGetElementPtr(arrTy, result, idx0, newTempName());
+    currentBB->pushBack(gep0);
+    currentBB->pushBack(Instruction::createStore(len, gep0));
+
+    auto* iAlloca = Instruction::createAlloca(IntegerType::I32, newTempName());
+    currentBB->pushBack(iAlloca);
+    currentBB->pushBack(Instruction::createStore(
+        ConstantInt::get(IntegerType::I32, 0), iAlloca));
+
+    BasicBlock* condBB = createBlock("vfop_cond");
+    BasicBlock* bodyBB = createBlock("vfop_body");
+    BasicBlock* endBB  = createBlock("vfop_end");
+
+    currentBB->pushBack(Instruction::createBr(condBB));
+    currentBB = condBB;
+    Value* iVal = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal));
+    auto* cmp = Instruction::createCmp(Instruction::Opcode::ICMP, iVal, len, "slt");
+    currentBB->pushBack(cmp);
+    currentBB->pushBack(Instruction::createCondBr(cmp, bodyBB, endBB));
+
+    currentBB = bodyBB;
+    Value* lElemPtr = emitVecfElemPtr(left, iVal);
+    Value* lElem = Instruction::createLoad(FloatType::get(), lElemPtr, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(lElem));
+    Value* rElemPtr = emitVecfElemPtr(right, iVal);
+    Value* rElem = Instruction::createLoad(FloatType::get(), rElemPtr, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(rElem));
+    auto* binOp = Instruction::createBinOp(op, FloatType::get(), newTempName(), lElem, rElem);
+    currentBB->pushBack(binOp);
+    Value* iVal2 = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal2));
+    Value* dElemPtr = emitVecfElemPtr(result, iVal2);
+    currentBB->pushBack(Instruction::createStore(binOp, dElemPtr));
+    Value* iVal3 = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal3));
+    auto* iNext = Instruction::createBinOp(
+        Instruction::Opcode::ADD, IntegerType::I32, newTempName(), iVal3,
+        ConstantInt::get(IntegerType::I32, 1));
+    currentBB->pushBack(iNext);
+    currentBB->pushBack(Instruction::createStore(iNext, iAlloca));
+    currentBB->pushBack(Instruction::createBr(condBB));
+
+    currentBB = endBB;
+    return result;
+}
+
+// 浮点标量广播运算（运行时循环）：scalar op vecf
+Value* IRBuilder::emitVecfScalarOp(Instruction::Opcode op, Value* scalar,
+                                      Value* vecf, bool scalarOnLeft) {
+    Value* len = emitVecfLen(vecf);
+    Value* result = emitVecfAlloca(0);
+    auto* arrTy = ArrayType::get(FloatType::get(), VECF_MAX + 1);
+    std::vector<Value*> idx0 = {
+        ConstantInt::get(IntegerType::I32, 0),
+        ConstantInt::get(IntegerType::I32, 0)
+    };
+    auto* gep0 = Instruction::createGetElementPtr(arrTy, result, idx0, newTempName());
+    currentBB->pushBack(gep0);
+    currentBB->pushBack(Instruction::createStore(len, gep0));
+
+    auto* iAlloca = Instruction::createAlloca(IntegerType::I32, newTempName());
+    currentBB->pushBack(iAlloca);
+    currentBB->pushBack(Instruction::createStore(
+        ConstantInt::get(IntegerType::I32, 0), iAlloca));
+
+    BasicBlock* condBB = createBlock("vfsop_cond");
+    BasicBlock* bodyBB = createBlock("vfsop_body");
+    BasicBlock* endBB  = createBlock("vfsop_end");
+
+    currentBB->pushBack(Instruction::createBr(condBB));
+    currentBB = condBB;
+    Value* iVal = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal));
+    auto* cmp = Instruction::createCmp(Instruction::Opcode::ICMP, iVal, len, "slt");
+    currentBB->pushBack(cmp);
+    currentBB->pushBack(Instruction::createCondBr(cmp, bodyBB, endBB));
+
+    currentBB = bodyBB;
+    Value* vElemPtr = emitVecfElemPtr(vecf, iVal);
+    Value* vElem = Instruction::createLoad(FloatType::get(), vElemPtr, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(vElem));
+    // 标量侧转 float 后参与运算
+    Value* s = implConvert(scalar, FloatType::get());
+    Value* lhs = scalarOnLeft ? s : vElem;
+    Value* rhs = scalarOnLeft ? vElem : s;
+    auto* binOp = Instruction::createBinOp(op, FloatType::get(), newTempName(), lhs, rhs);
+    currentBB->pushBack(binOp);
+    Value* iVal2 = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal2));
+    Value* dElemPtr = emitVecfElemPtr(result, iVal2);
+    currentBB->pushBack(Instruction::createStore(binOp, dElemPtr));
+    Value* iVal3 = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal3));
+    auto* iNext = Instruction::createBinOp(
+        Instruction::Opcode::ADD, IntegerType::I32, newTempName(), iVal3,
+        ConstantInt::get(IntegerType::I32, 1));
+    currentBB->pushBack(iNext);
+    currentBB->pushBack(Instruction::createStore(iNext, iAlloca));
+    currentBB->pushBack(Instruction::createBr(condBB));
+
+    currentBB = endBB;
+    return result;
+}
+
+// 浮点向量逐元素拷贝（运行时循环）：dst = src
+void IRBuilder::emitVecfCopy(Value* dst, Value* src) {
+    Value* len = emitVecfLen(src);
+    // 也更新 dst 的长度
+    auto* arrTy = ArrayType::get(FloatType::get(), VECF_MAX + 1);
+    std::vector<Value*> idx0 = {
+        ConstantInt::get(IntegerType::I32, 0),
+        ConstantInt::get(IntegerType::I32, 0)
+    };
+    auto* dGep0 = Instruction::createGetElementPtr(arrTy, dst, idx0, newTempName());
+    currentBB->pushBack(dGep0);
+    currentBB->pushBack(Instruction::createStore(len, dGep0));
+
+    auto* iAlloca = Instruction::createAlloca(IntegerType::I32, newTempName());
+    currentBB->pushBack(iAlloca);
+    currentBB->pushBack(Instruction::createStore(
+        ConstantInt::get(IntegerType::I32, 0), iAlloca));
+
+    BasicBlock* condBB = createBlock("vfcpy_cond");
+    BasicBlock* bodyBB = createBlock("vfcpy_body");
+    BasicBlock* endBB  = createBlock("vfcpy_end");
+
+    currentBB->pushBack(Instruction::createBr(condBB));
+    currentBB = condBB;
+    Value* iVal = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal));
+    auto* cmp = Instruction::createCmp(Instruction::Opcode::ICMP, iVal, len, "slt");
+    currentBB->pushBack(cmp);
+    currentBB->pushBack(Instruction::createCondBr(cmp, bodyBB, endBB));
+
+    currentBB = bodyBB;
+    Value* sElemPtr = emitVecfElemPtr(src, iVal);
+    Value* sElem = Instruction::createLoad(FloatType::get(), sElemPtr, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(sElem));
+    Value* iVal2 = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal2));
+    Value* dElemPtr = emitVecfElemPtr(dst, iVal2);
+    currentBB->pushBack(Instruction::createStore(sElem, dElemPtr));
+    Value* iVal3 = Instruction::createLoad(IntegerType::I32, iAlloca, newTempName());
+    currentBB->pushBack(static_cast<Instruction*>(iVal3));
+    auto* iNext = Instruction::createBinOp(
+        Instruction::Opcode::ADD, IntegerType::I32, newTempName(), iVal3,
+        ConstantInt::get(IntegerType::I32, 1));
+    currentBB->pushBack(iNext);
+    currentBB->pushBack(Instruction::createStore(iNext, iAlloca));
+    currentBB->pushBack(Instruction::createBr(condBB));
+
+    currentBB = endBB;
+}
+
+// ================================================================
 // varDecl: bType varDef (COMMA varDef)* SEMICOLON
 // ================================================================
 std::any IRBuilder::visitVarDecl(SysY2022Parser::VarDeclContext* ctx) {
@@ -732,6 +1018,11 @@ std::any IRBuilder::visitStmt(SysY2022Parser::StmtContext* ctx) {
                 emitVecCopy(lhsPtr, rhs);
                 return {};
             }
+            // 《前端+变长》 浮点向量扩展：变长浮点向量赋值 c = a + b; 或 c = a;
+            if (isVecfValue(lhsPtr) && isVecfValue(rhs)) {
+                emitVecfCopy(lhsPtr, rhs);
+                return {};
+            }
             auto* ptrTy = dynamic_cast<PointerType*>(lhsPtr->getType());
             if (ptrTy) {
                 rhs = implConvert(rhs, ptrTy->getPointeeType());
@@ -893,6 +1184,13 @@ std::any IRBuilder::visitLVal(SysY2022Parser::LValContext* ctx) {
         Value* elemPtr = emitVecElemPtr(ptr, idx);
         return std::any(static_cast<Value*>(elemPtr));
     }
+    // 《前端+变长》 浮点向量扩展：vecf[i] 跳过 [0] 长度槽，访问 [i+1]
+    // 用 emitVecfElemPtr 处理第一维，结果直接是 float 元素指针
+    if (isVecfValue(ptr) && ctx->L_BRACKET().size() == 1) {
+        Value* idx = valFrom(visitExp(ctx->exp(0)));
+        Value* elemPtr = emitVecfElemPtr(ptr, idx);
+        return std::any(static_cast<Value*>(elemPtr));
+    }
 
     // Array access: compute GETELEMENTPTR for each dimension separately.
     PointerType* ptrTy = static_cast<PointerType*>(ptr->getType());
@@ -956,6 +1254,10 @@ std::any IRBuilder::visitPrimaryExp(SysY2022Parser::PrimaryExpContext* ctx) {
             // 《前端+变长》 变长向量裸名：不衰减，直接返回 alloca 指针，
             // 让 visitAddExp/visitMulExp 识别为向量并做运行时循环运算
             if (isVecValue(ptr)) {
+                return std::any(static_cast<Value*>(ptr));
+            }
+            // 《前端+变长》 浮点向量扩展：vecf 裸名同样不衰减，交由 visitAddExp/visitMulExp
+            if (isVecfValue(ptr)) {
                 return std::any(static_cast<Value*>(ptr));
             }
             PointerType* ptrTy = static_cast<PointerType*>(ptr->getType());
@@ -1216,6 +1518,23 @@ std::any IRBuilder::visitMulExp(SysY2022Parser::MulExpContext* ctx) {
             i += 2;
             continue;
         }
+        // 《前端+变长》 浮点向量扩展：vecf 运算去语法糖分支（FADD/FSUB/FMUL/FDIV）
+        bool leftIsVecf  = isVecfValue(left);
+        bool rightIsVecf = isVecfValue(rightVal);
+        if (leftIsVecf || rightIsVecf) {
+            if (opText == "*")      op = Instruction::Opcode::FMUL;
+            else if (opText == "/") op = Instruction::Opcode::FDIV;
+            else                    op = Instruction::Opcode::SREM; // vecf 不支持 %，占位
+            if (leftIsVecf && rightIsVecf) {
+                result = std::any(emitVecfBinOp(op, left, rightVal));
+            } else if (leftIsVecf && !rightIsVecf) {
+                result = std::any(emitVecfScalarOp(op, rightVal, left, /*scalarOnLeft=*/false));
+            } else {
+                result = std::any(emitVecfScalarOp(op, left, rightVal, /*scalarOnLeft=*/true));
+            }
+            i += 2;
+            continue;
+        }
 
         // ===== 标量路径 =====
         // Determine result type: float wins if either operand is float
@@ -1275,6 +1594,23 @@ std::any IRBuilder::visitAddExp(SysY2022Parser::AddExpContext* ctx) {
                 result = std::any(emitVecScalarOp(op, rightVal, left, /*scalarOnLeft=*/false));
             } else {
                 result = std::any(emitVecScalarOp(op, left, rightVal, /*scalarOnLeft=*/true));
+            }
+            i += 2;
+            continue;
+        }
+        // 《前端+变长》 浮点向量扩展：vecf 加减法去语法糖分支（FADD/FSUB）
+        bool leftIsVecf  = isVecfValue(left);
+        bool rightIsVecf = isVecfValue(rightVal);
+        if (leftIsVecf || rightIsVecf) {
+            Instruction::Opcode op = (opText == "+")
+                ? Instruction::Opcode::FADD
+                : Instruction::Opcode::FSUB;
+            if (leftIsVecf && rightIsVecf) {
+                result = std::any(emitVecfBinOp(op, left, rightVal));
+            } else if (leftIsVecf && !rightIsVecf) {
+                result = std::any(emitVecfScalarOp(op, rightVal, left, /*scalarOnLeft=*/false));
+            } else {
+                result = std::any(emitVecfScalarOp(op, left, rightVal, /*scalarOnLeft=*/true));
             }
             i += 2;
             continue;

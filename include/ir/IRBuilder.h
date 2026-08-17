@@ -27,6 +27,8 @@ public:
     // 《前端+变长》 变长向量声明访问器（运行时长度，仅前端扩展）
     std::any visitVecDecl(SysY2022Parser::VecDeclContext* ctx) override;
     std::any visitVecInit(SysY2022Parser::VecInitContext* ctx) override;
+    // 《前端+变长》 浮点向量扩展：变长浮点向量声明访问器（运行时长度，float 元素）
+    std::any visitVecfDecl(SysY2022Parser::VecfDeclContext* ctx) override;
     std::any visitVarDef(SysY2022Parser::VarDefContext* ctx) override;
     std::any visitInitVal(SysY2022Parser::InitValContext* ctx) override;
     std::any visitFuncDef(SysY2022Parser::FuncDefContext* ctx) override;
@@ -110,6 +112,26 @@ private:
     // 向量逐元素拷贝（运行时循环）：dst = src
     void   emitVecCopy(Value* dst, Value* src);
 
+    // ===== 《前端+变长》 浮点向量扩展（FADD/FSUB/FMUL/FDIV，运行时循环） =====
+    // vecf 表示为 alloca [VECF_MAX+1 x float]：[0]=运行时长度，[1..len]=数据
+    // 与整数向量同骨架，差异仅 FloatType + 浮点 opcode
+    static constexpr unsigned VECF_MAX = 1024;   // 单个 vecf 最大元素数
+    // 判断 Value 是否为变长浮点向量 alloca（通过 vecfAllocas 侧集合识别）
+    bool   isVecfValue(Value* v);
+    // 获取 vecf 指针的第 i+1 个元素地址（跳过 [0] 长度，float 元素）
+    Value* emitVecfElemPtr(Value* vecfPtr, Value* idx);
+    // 分配 vecf alloca [VECF_MAX+1 x float] 并设运行时长度 n
+    Value* emitVecfAlloca(unsigned n);
+    // 运行时长度读取：load vecfPtr[0]
+    Value* emitVecfLen(Value* vecfPtr);
+    // 浮点向量二元运算（运行时循环）：left op right，返回结果 vecf alloca
+    Value* emitVecfBinOp(Instruction::Opcode op, Value* left, Value* right);
+    // 浮点标量广播运算（运行时循环）：scalar op vecf，返回结果 vecf alloca
+    Value* emitVecfScalarOp(Instruction::Opcode op, Value* scalar,
+                             Value* vecf, bool scalarOnLeft);
+    // 浮点向量逐元素拷贝（运行时循环）：dst = src
+    void   emitVecfCopy(Value* dst, Value* src);
+
     // ===== 常数表达式编译期求值 =====
     Value* constEval(SysY2022Parser::AddExpContext* ctx);
     Value* constEvalMul(SysY2022Parser::MulExpContext* ctx);
@@ -149,6 +171,10 @@ private:
     // 《前端+变长》 变长向量 alloca 侧集合：记录哪些 alloca 是 vec
     // （vec 类型与普通 [N x i32] 数组类型相同，靠此集合区分）
     std::unordered_set<Value*> vecAllocas;
+
+    // 《前端+变长》 浮点向量扩展：变长浮点向量 alloca 侧集合
+    // （vecf 类型与普通 [N x float] 数组类型相同，靠此集合区分）
+    std::unordered_set<Value*> vecfAllocas;
 };
 
 } // namespace IR

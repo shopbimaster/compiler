@@ -11,6 +11,7 @@ FLOAT:    'float';
 VOID:     'void';
 CONST:    'const';
 VEC:      'vec';   // 《前端+变长》 变长向量关键字（运行时长度，仅前端词法扩展）
+VECF:     'vecf';  // 《前端+变长》 浮点向量扩展：变长浮点向量关键字（运行时长度，float 元素）
 IF:       'if';
 ELSE:     'else';
 WHILE:    'while';
