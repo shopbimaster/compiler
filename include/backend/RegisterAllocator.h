@@ -9,6 +9,12 @@
 
 namespace Backend {
 
+enum class RegClass {
+    Integer,
+    Float,
+    Vector,
+};
+
 struct LiveInterval {
     IR::Value* value;
     int start;

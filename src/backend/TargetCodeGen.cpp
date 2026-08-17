@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <set>
+#include <utility>
 
 namespace Backend {
 
@@ -63,8 +64,8 @@ static bool isArgReg(const std::string& reg) {
     return false;
 }
 
-TargetCodeGen::TargetCodeGen()
-    : stackSize(0), labelCounter(0) {}
+TargetCodeGen::TargetCodeGen(TargetSimdCaps simdCaps)
+    : simdEmitter(std::move(simdCaps)), stackSize(0), labelCounter(0) {}
 
 std::string TargetCodeGen::generate(IR::Module& module) {
     emitter = CodeEmitter();

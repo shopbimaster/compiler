@@ -2,6 +2,7 @@
 
 #include "ir/IR.h"
 #include "backend/RegisterAllocator.h"
+#include "backend/SimdEmitter.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -33,11 +34,15 @@ private:
 
 class TargetCodeGen {
 public:
-    TargetCodeGen();
+    explicit TargetCodeGen(
+        TargetSimdCaps simdCaps = TargetSimdCaps::disabled());
     std::string generate(IR::Module& module);
 
 private:
     CodeEmitter emitter;
+    // The emitter is the only backend boundary for future target SIMD. It is
+    // fail-closed until an official ISA profile and encoder are supplied.
+    SimdEmitter simdEmitter;
     IR::Function* currentFunc = nullptr;
     IR::BasicBlock* currentBB = nullptr;
     // Fall-through 优化：当前块物理上的下一个块（BOOM 分支友好布局）

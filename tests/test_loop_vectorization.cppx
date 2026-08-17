@@ -1,0 +1,365 @@
+#include "ir/IR.h"
+#include "opt/VectorPlan.h"
+
+#include <iostream>
+#include <memory>
+#include <string>
+
+namespace {
+
+using Opc = IR::Instruction::Opcode;
+
+struct Fixture {
+    std::unique_ptr<IR::Module> module;
+    IR::Function* function = nullptr;
+    IR::GlobalVariable* first = nullptr;
+    IR::GlobalVariable* second = nullptr;
+    IR::BasicBlock* body = nullptr;
+    IR::Instruction* induction = nullptr;
+};
+
+Fixture makeLoop(int64_t step, bool pointerArguments = false) {
+    Fixture fixture;
+    fixture.module = std::make_unique<IR::Module>();
+    auto* i32 = IR::IntegerType::I32;
+    auto* pointer = IR::PointerType::get(i32);
+    std::vector<IR::Type*> parameters;
+    if (pointerArguments) parameters = {pointer, pointer};
+    fixture.function = fixture.module->createFunction(
+        IR::FunctionType::get(i32, parameters), "vector_loop");
+    if (!pointerArguments) {
+        fixture.first = fixture.module->createGlobalVariable(
+            pointer, "first", false);
+        fixture.second = fixture.module->createGlobalVariable(
+            pointer, "second", false);
+    }
+
+    auto* entry = fixture.function->createBlock("entry");
+    auto* header = fixture.function->createBlock("loop.header");
+    fixture.body = fixture.function->createBlock("loop.body");
+    auto* latch = fixture.function->createBlock("loop.latch");
+    auto* exit = fixture.function->createBlock("exit");
+
+    auto* next = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "i.next", nullptr,
+        IR::ConstantInt::get(i32, step));
+    fixture.induction = IR::Instruction::createPhi(i32, "i", 4);
+    fixture.induction->addOperand(IR::ConstantInt::get(i32, 0));
+    fixture.induction->addOperand(entry);
+    fixture.induction->addOperand(next);
+    fixture.induction->addOperand(latch);
+    next->setOperand(0, fixture.induction);
+
+    entry->pushBack(IR::Instruction::createBr(header));
+    header->pushBack(fixture.induction);
+    auto* compare = IR::Instruction::createCmp(
+        Opc::ICMP, fixture.induction,
+        IR::ConstantInt::get(i32, 64), "slt");
+    header->pushBack(compare);
+    header->pushBack(IR::Instruction::createCondBr(
+        compare, fixture.body, exit));
+    latch->pushBack(next);
+    latch->pushBack(IR::Instruction::createBr(header));
+    exit->pushBack(IR::Instruction::createRet(
+        IR::ConstantInt::get(i32, 0)));
+    return fixture;
+}
+
+IR::Value* firstRoot(const Fixture& fixture) {
+    return fixture.first ? static_cast<IR::Value*>(fixture.first)
+                         : static_cast<IR::Value*>(fixture.function->getArg(0));
+}
+
+IR::Value* secondRoot(const Fixture& fixture) {
+    return fixture.second
+               ? static_cast<IR::Value*>(fixture.second)
+               : static_cast<IR::Value*>(fixture.function->getArg(1));
+}
+
+IR::Instruction* appendPointer(
+        Fixture& fixture, IR::Value* root, IR::Value* index,
+        const std::string& name) {
+    auto* pointer = IR::Instruction::createGetElementPtr(
+        IR::IntegerType::I32, root, {index}, name);
+    fixture.body->pushBack(pointer);
+    return pointer;
+}
+
+void finishBody(Fixture& fixture) {
+    auto* latch = fixture.function->getBlocks()[3].get();
+    fixture.body->pushBack(IR::Instruction::createBr(latch));
+}
+
+bool expectReason(
+        Fixture& fixture, Opt::VectorRejectReason expected,
+        const char* description) {
+    auto reports =
+        Opt::analyzeVectorizationCandidates(fixture.function);
+    if (reports.size() != 1 || reports.front().reason != expected) {
+        std::cerr << description << ": expected "
+                  << Opt::vectorRejectReasonName(expected) << ", got ";
+        if (reports.empty()) {
+            std::cerr << "no report\n";
+        } else {
+            std::cerr << Opt::formatVectorizationReport(reports.front())
+                      << '\n';
+        }
+        return false;
+    }
+    return true;
+}
+
+bool testFillCandidate() {
+    auto fixture = makeLoop(1);
+    auto* destination = appendPointer(
+        fixture, firstRoot(fixture), fixture.induction, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 7), destination));
+    finishBody(fixture);
+
+    auto reports =
+        Opt::analyzeVectorizationCandidates(fixture.function);
+    if (reports.size() != 1 || !reports.front().accepted()) return false;
+    const auto& plan = reports.front().plan;
+    return plan.kind == Opt::VectorPlanKind::Fill &&
+           plan.memoryAccesses.size() == 1 &&
+           plan.constantTripCount == 64 &&
+           Opt::formatVectorizationReport(reports.front()) ==
+               "vector_loop:loop.header: accepted (fill)";
+}
+
+bool testNonUnitStep() {
+    auto fixture = makeLoop(2);
+    auto* destination = appendPointer(
+        fixture, firstRoot(fixture), fixture.induction, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 1), destination));
+    finishBody(fixture);
+    return expectReason(
+        fixture, Opt::VectorRejectReason::NonUnitStep,
+        "non-unit induction");
+}
+
+bool testCallRejected() {
+    auto fixture = makeLoop(1);
+    auto* externalType = IR::FunctionType::get(IR::VoidType::get(), {});
+    auto* external = fixture.module->createFunction(
+        externalType, "opaque_effect", true);
+    fixture.body->pushBack(IR::Instruction::createCall(
+        externalType, external, {}, ""));
+    auto* destination = appendPointer(
+        fixture, firstRoot(fixture), fixture.induction, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 1), destination));
+    finishBody(fixture);
+    return expectReason(
+        fixture, Opt::VectorRejectReason::CallInLoop,
+        "call in loop");
+}
+
+bool testStridedAccessRejected() {
+    auto fixture = makeLoop(1);
+    auto* scaled = IR::Instruction::createBinOp(
+        Opc::MUL, IR::IntegerType::I32, "scaled",
+        fixture.induction,
+        IR::ConstantInt::get(IR::IntegerType::I32, 2));
+    fixture.body->pushBack(scaled);
+    auto* destination = appendPointer(
+        fixture, firstRoot(fixture), scaled, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 1), destination));
+    finishBody(fixture);
+    return expectReason(
+        fixture, Opt::VectorRejectReason::NonContiguousMemoryAccess,
+        "strided access");
+}
+
+bool testLoopCarriedDependenceRejected() {
+    auto fixture = makeLoop(1);
+    auto* previousIndex = IR::Instruction::createBinOp(
+        Opc::SUB, IR::IntegerType::I32, "previous.index",
+        fixture.induction,
+        IR::ConstantInt::get(IR::IntegerType::I32, 1));
+    fixture.body->pushBack(previousIndex);
+    auto* source = appendPointer(
+        fixture, firstRoot(fixture), previousIndex, "source");
+    auto* value = IR::Instruction::createLoad(
+        IR::IntegerType::I32, source, "value");
+    fixture.body->pushBack(value);
+    auto* destination = appendPointer(
+        fixture, firstRoot(fixture), fixture.induction, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        value, destination));
+    finishBody(fixture);
+    return expectReason(
+        fixture, Opt::VectorRejectReason::LoopCarriedDependence,
+        "shifted read-after-write dependence");
+}
+
+bool testPointerAliasRejected() {
+    auto fixture = makeLoop(1, true);
+    auto* source = appendPointer(
+        fixture, firstRoot(fixture), fixture.induction, "source");
+    auto* value = IR::Instruction::createLoad(
+        IR::IntegerType::I32, source, "value");
+    fixture.body->pushBack(value);
+    auto* destination = appendPointer(
+        fixture, secondRoot(fixture), fixture.induction, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        value, destination));
+    finishBody(fixture);
+    return expectReason(
+        fixture, Opt::VectorRejectReason::PossibleAlias,
+        "unqualified pointer arguments");
+}
+
+bool testAllocaInductionCandidate() {
+    Fixture fixture;
+    fixture.module = std::make_unique<IR::Module>();
+    auto* i32 = IR::IntegerType::I32;
+    auto* pointer = IR::PointerType::get(i32);
+    fixture.first = fixture.module->createGlobalVariable(
+        pointer, "first", false);
+    fixture.function = fixture.module->createFunction(
+        IR::FunctionType::get(i32, {}), "alloca_loop");
+    auto* entry = fixture.function->createBlock("entry");
+    auto* header = fixture.function->createBlock("loop.header");
+    fixture.body = fixture.function->createBlock("loop.body");
+    auto* latch = fixture.function->createBlock("loop.latch");
+    auto* exit = fixture.function->createBlock("exit");
+
+    auto* storage = IR::Instruction::createAlloca(i32, "i.addr");
+    entry->pushBack(storage);
+    entry->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(i32, 0), storage));
+    entry->pushBack(IR::Instruction::createBr(header));
+
+    auto* compareIndex = IR::Instruction::createLoad(
+        i32, storage, "i.compare");
+    header->pushBack(compareIndex);
+    auto* compare = IR::Instruction::createCmp(
+        Opc::ICMP, compareIndex,
+        IR::ConstantInt::get(i32, 64), "slt");
+    header->pushBack(compare);
+    header->pushBack(IR::Instruction::createCondBr(
+        compare, fixture.body, exit));
+
+    auto* bodyIndex = IR::Instruction::createLoad(
+        i32, storage, "i.body");
+    fixture.body->pushBack(bodyIndex);
+    auto* destination = appendPointer(
+        fixture, fixture.first, bodyIndex, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(i32, 3), destination));
+    fixture.body->pushBack(IR::Instruction::createBr(latch));
+
+    auto* updateIndex = IR::Instruction::createLoad(
+        i32, storage, "i.update");
+    latch->pushBack(updateIndex);
+    auto* next = IR::Instruction::createBinOp(
+        Opc::ADD, i32, "i.next", updateIndex,
+        IR::ConstantInt::get(i32, 1));
+    latch->pushBack(next);
+    latch->pushBack(IR::Instruction::createStore(next, storage));
+    latch->pushBack(IR::Instruction::createBr(header));
+    exit->pushBack(IR::Instruction::createRet(
+        IR::ConstantInt::get(i32, 0)));
+
+    auto reports =
+        Opt::analyzeVectorizationCandidates(fixture.function);
+    const bool accepted =
+        reports.size() == 1 && reports.front().accepted() &&
+        reports.front().plan.inductionStorage == storage &&
+        reports.front().plan.kind == Opt::VectorPlanKind::Fill;
+
+    auto beforeBranch = latch->end();
+    --beforeBranch;
+    latch->insert(beforeBranch, IR::Instruction::createLoad(
+        i32, storage, "i.after.update"));
+    return accepted && expectReason(
+        fixture, Opt::VectorRejectReason::LoopCarriedDependence,
+        "induction reload after update");
+}
+
+bool testHeaderWorkRejected() {
+    auto fixture = makeLoop(1);
+    auto* header = fixture.function->getBlocks()[1].get();
+    auto beforeBranch = header->end();
+    --beforeBranch;
+    header->insert(beforeBranch, IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 9),
+        firstRoot(fixture)));
+    auto* destination = appendPointer(
+        fixture, firstRoot(fixture), fixture.induction, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 1), destination));
+    finishBody(fixture);
+    return expectReason(
+        fixture, Opt::VectorRejectReason::UnsupportedControlFlow,
+        "non-control work in loop header");
+}
+
+bool testInclusiveBoundRejected() {
+    auto fixture = makeLoop(1);
+    auto* header = fixture.function->getBlocks()[1].get();
+    header->getInstructions()[1]->setName("sle");
+    auto* destination = appendPointer(
+        fixture, firstRoot(fixture), fixture.induction, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 1), destination));
+    finishBody(fixture);
+    return expectReason(
+        fixture, Opt::VectorRejectReason::PotentialInductionOverflow,
+        "inclusive bound without no-wrap proof");
+}
+
+bool testUnknownStoreRejected() {
+    auto fixture = makeLoop(1);
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 1),
+        firstRoot(fixture)));
+    finishBody(fixture);
+    return expectReason(
+        fixture, Opt::VectorRejectReason::UnanalyzableMemoryAccess,
+        "store without auditable GEP");
+}
+
+bool testMultipleExitsRejected() {
+    auto fixture = makeLoop(1);
+    auto* destination = appendPointer(
+        fixture, firstRoot(fixture), fixture.induction, "destination");
+    fixture.body->pushBack(IR::Instruction::createStore(
+        IR::ConstantInt::get(IR::IntegerType::I32, 1), destination));
+    auto* latch = fixture.function->getBlocks()[3].get();
+    auto* secondExit = fixture.function->createBlock("second.exit");
+    fixture.body->pushBack(IR::Instruction::createCondBr(
+        IR::ConstantInt::get(IR::IntegerType::I1, 1),
+        latch, secondExit));
+    secondExit->pushBack(IR::Instruction::createRet(
+        IR::ConstantInt::get(IR::IntegerType::I32, 0)));
+    return expectReason(
+        fixture, Opt::VectorRejectReason::MultipleExits,
+        "multiple exits");
+}
+
+} // namespace
+
+int main() {
+    if (!testFillCandidate()) {
+        std::cerr << "valid fill loop was not accepted\n";
+        return 1;
+    }
+    if (!testNonUnitStep() || !testCallRejected() ||
+        !testStridedAccessRejected() ||
+        !testLoopCarriedDependenceRejected() ||
+        !testPointerAliasRejected() ||
+        !testAllocaInductionCandidate() ||
+        !testHeaderWorkRejected() ||
+        !testInclusiveBoundRejected() ||
+        !testUnknownStoreRejected() ||
+        !testMultipleExitsRejected()) {
+        return 1;
+    }
+    std::cout << "loop vectorization analysis tests passed\n";
+    return 0;
+}

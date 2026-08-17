@@ -93,6 +93,7 @@ add_library(sysy_backend STATIC
     src/backend/TargetCodeGen.cpp
     src/backend/RegisterAllocator.cpp
     src/backend/PostRAScheduler.cpp
+    src/backend/SimdEmitter.cpp
 )
 target_include_directories(sysy_backend PUBLIC include)
 target_link_libraries(sysy_backend PUBLIC sysy_ir_core)
@@ -110,6 +111,7 @@ add_library(sysy_opt STATIC
     src/opt/SCCP.cpp
     src/opt/LoopFind.cpp
     src/opt/LoopAnalysis.cpp
+    src/opt/LoopVectorization.cpp
     src/opt/MemoryAccessAnalysis.cpp
     src/opt/SCEVAnalysis.cpp
     src/opt/LoopStrengthReduce.cpp
@@ -198,6 +200,23 @@ set_source_files_properties(tests/test_peephole.cppx PROPERTIES LANGUAGE CXX)
 target_include_directories(test_peephole PRIVATE include)
 target_link_libraries(test_peephole PRIVATE sysy_opt)
 
+# SIMD stays fail-closed until an official target profile and emitter exist.
+# This test validates the capability boundary without requiring target tools.
+add_executable(test_simd
+    tests/test_simd.cppx
+)
+set_source_files_properties(tests/test_simd.cppx PROPERTIES LANGUAGE CXX)
+target_include_directories(test_simd PRIVATE include)
+target_link_libraries(test_simd PRIVATE sysy_backend sysy_opt)
+
+add_executable(test_loop_vectorization
+    tests/test_loop_vectorization.cppx
+)
+set_source_files_properties(
+    tests/test_loop_vectorization.cppx PROPERTIES LANGUAGE CXX)
+target_include_directories(test_loop_vectorization PRIVATE include)
+target_link_libraries(test_loop_vectorization PRIVATE sysy_opt)
+
 # Focused legality/trigger checks for the cache-local in-place matrix kernel.
 add_executable(test_matrix_blocking
     tests/test_matrix_blocking.cppx
@@ -233,8 +252,11 @@ if(BUILD_TESTING)
     add_test(NAME ir_unit COMMAND test_ir)
     add_test(NAME compiler_integration COMMAND test_integration)
     add_test(NAME peephole_unit COMMAND test_peephole)
+    add_test(NAME simd_unit COMMAND test_simd)
+    add_test(NAME loop_vectorization_unit COMMAND test_loop_vectorization)
     add_test(NAME matrix_blocking_unit COMMAND test_matrix_blocking)
-    set_tests_properties(ir_unit compiler_integration peephole_unit
+    set_tests_properties(ir_unit compiler_integration peephole_unit simd_unit
+                         loop_vectorization_unit
                          matrix_blocking_unit PROPERTIES
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )

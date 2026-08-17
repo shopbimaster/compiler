@@ -15,6 +15,7 @@ AI 辅助说明：项目开发使用 OpenAI Codex 辅助合规审计、通用优
 - [测试体系](#测试体系)
 - [注释规范](#注释规范)
 - [构建与测试命令](#构建与测试命令)
+- [SIMD 离线适配手册](docs/SIMD_OFFLINE_RUNBOOK.md)
 
 ---
 
@@ -99,8 +100,8 @@ graph TD
 | `sysy_ir_core`    | `src/ir/IR.cpp`                          | 无                      |
 | `sysy_ir_builder` | `src/ir/IRBuilder.cpp`                   | `sysy_ir_core` + ANTLR4 |
 | `sysy_compiler`   | `src/Compiler.cpp`                       | `sysy_ir_builder`       |
-| `sysy_opt`        | `src/opt/*.cpp`（64 个 Pass + 基础设施） | `sysy_ir_core`          |
-| `sysy_backend`    | `src/backend/*.cpp`（3 个）              | `sysy_ir_core`          |
+| `sysy_opt`        | `src/opt/*.cpp`（标量 Pass + 向量候选分析） | `sysy_ir_core`        |
+| `sysy_backend`    | `src/backend/*.cpp`（代码生成、分配与 SIMD 能力边界） | `sysy_ir_core` |
 
 `compiler` 可执行文件链接：`sysy_compiler` + `sysy_backend` + `sysy_opt` + ANTLR4。
 
@@ -579,6 +580,9 @@ make -j$(nproc)
 | `ROT_ALLOCA_OFF=1`     | 禁用 alloca-IV 循环旋转路径                                        | —                                                                  |
 | `NO_PEEPHOLE=1`        | 禁用窥孔优化                                                       | —                                                                  |
 | `DEBUG_LOWER_PHI=1`    | 启用 PHI 降级（调试）                                              | —                                                                  |
+| `SIMD_MODE=off`        | 保持默认标量 RV64GC 输出（默认行为）                              | —                                                                  |
+| `SIMD_MODE=analyze`    | 只报告可证明的向量化候选，不改变 IR 或汇编                        | —                                                                  |
+| `SIMD_MODE=on`         | 请求目标 SIMD；目标能力未配置时自动回退标量                        | —                                                                  |
 | `DUMP_PEEPHOLE_PRE=1`  | 输出窥孔优化前汇编到 `/tmp/peep_pre.S`                             | —                                                                  |
 | `DUMP_PEEPHOLE_POST=1` | 输出窥孔优化后汇编到 `/tmp/peep_post.S`                            | —                                                                  |
 

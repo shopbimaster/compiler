@@ -1,0 +1,163 @@
+#include "backend/RegisterAllocator.h"
+#include "backend/SimdEmitter.h"
+#include "backend/SimdTargetInfo.h"
+
+#include <array>
+#include <iostream>
+#include <string>
+
+namespace {
+
+bool expect(bool condition, const char* message) {
+    if (condition) return true;
+    std::cerr << "FAILED: " << message << '\n';
+    return false;
+}
+
+bool expectFailure(const Backend::SimdEmitter& emitter,
+                   const Backend::SimdInstructionRequest& request,
+                   const char* message) {
+    const Backend::SimdEmissionResult result = emitter.emit(request);
+    return expect(!emitter.canEmit(request) && !result.success &&
+                      result.assembly.empty() && !result.reason.empty(),
+                  message);
+}
+
+} // namespace
+
+int main() {
+    using Backend::RegClass;
+    using Backend::SimdElementType;
+    using Backend::SimdEmitter;
+    using Backend::SimdInstructionRequest;
+    using Backend::SimdMode;
+    using Backend::SimdMemoryForm;
+    using Backend::SimdOperation;
+    using Backend::SimdShape;
+    using Backend::TargetSimdCaps;
+
+    bool passed = true;
+
+    passed &= expect(Backend::parseSimdMode("") == SimdMode::Off,
+                     "empty SIMD mode did not default to off");
+    passed &= expect(Backend::parseSimdMode("off") == SimdMode::Off,
+                     "off SIMD mode was not parsed");
+    passed &= expect(Backend::parseSimdMode("ANALYZE") == SimdMode::Analyze,
+                     "analyze SIMD mode was not parsed case-insensitively");
+    passed &= expect(Backend::parseSimdMode("On") == SimdMode::On,
+                     "on SIMD mode was not parsed case-insensitively");
+    passed &= expect(Backend::parseSimdMode("enabled") == SimdMode::Off,
+                     "invalid SIMD mode did not fail closed");
+
+    const TargetSimdCaps disabled = TargetSimdCaps::disabled();
+    passed &= expect(disabled.mode == SimdMode::Off &&
+                         disabled.shape == SimdShape::Disabled &&
+                         !disabled.isConfigured() && !disabled.isEnabled(),
+                     "disabled capabilities were configured or enabled");
+
+    const TargetSimdCaps unconfigured =
+        TargetSimdCaps::unconfigured(SimdMode::On);
+    passed &= expect(unconfigured.mode == SimdMode::On &&
+                         unconfigured.shape == SimdShape::Disabled &&
+                         !unconfigured.isConfigured() &&
+                         !unconfigured.isEnabled(),
+                     "unconfigured capabilities were treated as usable");
+
+    TargetSimdCaps fixed = TargetSimdCaps::fixedWidth(SimdMode::On, 128);
+    passed &= expect(fixed.shape == SimdShape::FixedWidth &&
+                         fixed.fixedVectorBits == 128 &&
+                         fixed.isConfigured() && fixed.isEnabled(),
+                     "fixed-width capabilities were not configured");
+    passed &= expect(!TargetSimdCaps::fixedWidth(SimdMode::Off, 128)
+                          .isConfigured(),
+                     "off fixed-width capabilities were configured");
+    passed &= expect(!TargetSimdCaps::fixedWidth(SimdMode::On, 0)
+                          .isConfigured(),
+                     "zero-width fixed capabilities were configured");
+
+    TargetSimdCaps scalable =
+        TargetSimdCaps::scalable(SimdMode::Analyze, 256, 64);
+    passed &= expect(scalable.shape == SimdShape::Scalable &&
+                         scalable.vlenBits == 256 &&
+                         scalable.elenBits == 64 &&
+                         scalable.isConfigured() && !scalable.isEnabled(),
+                     "scalable analysis capabilities were misconfigured");
+    passed &= expect(!TargetSimdCaps::scalable(SimdMode::On, 0, 64)
+                          .isConfigured() &&
+                         !TargetSimdCaps::scalable(SimdMode::On, 256, 0)
+                              .isConfigured(),
+                     "zero-width scalable capabilities were configured");
+
+    fixed.enableCapability(SimdElementType::I32, SimdOperation::Load,
+                           SimdMemoryForm::Contiguous);
+    passed &= expect(fixed.supports(SimdElementType::I32,
+                                    SimdOperation::Load,
+                                    SimdMemoryForm::Contiguous),
+                     "declared fixed-width capability was rejected");
+    passed &= expect(!fixed.supports(SimdElementType::I32,
+                                     SimdOperation::Mul),
+                     "undeclared operation was accepted");
+    passed &= expect(!fixed.supports(SimdElementType::F32,
+                                     SimdOperation::Load,
+                                     SimdMemoryForm::Contiguous),
+                     "undeclared element type was accepted");
+    passed &= expect(!fixed.supports(SimdElementType::I32,
+                                     SimdOperation::Load),
+                     "load without a memory form was accepted");
+    fixed.enableCapability(SimdElementType::I32, SimdOperation::Gather,
+                           SimdMemoryForm::GatherScatter);
+    passed &= expect(fixed.supports(SimdElementType::I32,
+                                    SimdOperation::Gather,
+                                    SimdMemoryForm::GatherScatter),
+                     "gather capability with explicit form was rejected");
+    passed &= expect(!fixed.supports(SimdElementType::I32,
+                                     SimdOperation::Gather),
+                     "gather without a memory form was accepted");
+
+    TargetSimdCaps narrowFixed =
+        TargetSimdCaps::fixedWidth(SimdMode::On, 32);
+    narrowFixed.enableCapability(SimdElementType::I64, SimdOperation::Add);
+    passed &= expect(!narrowFixed.supports(SimdElementType::I64,
+                                           SimdOperation::Add),
+                     "element wider than fixed vector was accepted");
+
+    TargetSimdCaps narrowScalable =
+        TargetSimdCaps::scalable(SimdMode::On, 128, 32);
+    narrowScalable.enableCapability(SimdElementType::F64, SimdOperation::Mul);
+    passed &= expect(!narrowScalable.supports(SimdElementType::F64,
+                                              SimdOperation::Mul),
+                     "element wider than scalable ELEN was accepted");
+    passed &= expect(!unconfigured.supports(SimdElementType::I32,
+                                            SimdOperation::Load),
+                     "unconfigured target accepted a capability");
+
+    const SimdInstructionRequest loadI32{
+        SimdOperation::Load, SimdElementType::I32,
+        SimdMemoryForm::Contiguous, {"v0", "0(a0)"}};
+    passed &= expectFailure(SimdEmitter(TargetSimdCaps::disabled()), loadI32,
+                            "off emitter did not fail closed");
+    passed &= expectFailure(
+        SimdEmitter(TargetSimdCaps::unconfigured(SimdMode::Analyze)),
+        loadI32, "analysis emitter did not fail closed");
+    passed &= expectFailure(
+        SimdEmitter(TargetSimdCaps::unconfigured(SimdMode::On)), loadI32,
+        "unconfigured on emitter did not fail closed");
+    passed &= expectFailure(SimdEmitter(fixed), loadI32,
+                            "configured on emitter guessed an encoding");
+
+    const SimdInstructionRequest unsupported{
+        SimdOperation::Fma, SimdElementType::F64, SimdMemoryForm::None,
+        {"v0", "v1", "v2"}};
+    passed &= expectFailure(SimdEmitter(fixed), unsupported,
+                            "unsupported operation did not fail closed");
+
+    constexpr std::array<RegClass, 3> classes = {
+        RegClass::Integer, RegClass::Float, RegClass::Vector};
+    passed &= expect(classes[0] != classes[1] && classes[0] != classes[2] &&
+                         classes[1] != classes[2],
+                     "register classes are not distinct");
+
+    if (!passed) return 1;
+    std::cout << "SIMD scaffold tests passed\n";
+    return 0;
+}
