@@ -26,6 +26,8 @@ public:
     // 《前端+定长》 SIMD 向量声明访问器（仅前端扩展，编译期定长）
     std::any visitVecDecl(SysY2022Parser::VecDeclContext* ctx) override;
     std::any visitVecInit(SysY2022Parser::VecInitContext* ctx) override;
+    // 《前端+定长》 浮点向量扩展：定长浮点向量声明访问器（编译期定长，float 元素）
+    std::any visitVecfDecl(SysY2022Parser::VecfDeclContext* ctx) override;
     std::any visitVarDef(SysY2022Parser::VarDefContext* ctx) override;
     std::any visitInitVal(SysY2022Parser::InitValContext* ctx) override;
     std::any visitFuncDef(SysY2022Parser::FuncDefContext* ctx) override;
@@ -92,11 +94,15 @@ private:
     // ===== 《前端+定长》 SSE 向量运算辅助（仅前端 IR 生成扩展，编译期定长） =====
     // 判断 Value 是否为向量（指向 ArrayType 的指针，即 alloca [N x i32]）
     bool   isVecValue(Value* v);
+    // 《前端+定长》 浮点向量扩展：判断 Value 是否为浮点向量（指向 [N x float] 的指针）
+    bool   isVecfValue(Value* v);
     // 向量二元运算去语法糖：逐元素标量运算，返回结果向量 alloca
+    // 通用：elemTy 从 left 数组类型提取，对 vec (i32) / vecf (float) 都适用
     Value* emitVecBinOp(Instruction::Opcode op, Value* left, Value* right);
     // 向量标量广播运算：标量 op 向量，返回结果向量 alloca
+    // 通用：标量侧会 implConvert 到 elemTy，对 vecf 标量（如 2.0 / 3）自动转 float
     Value* emitVecScalarOp(Instruction::Opcode op, Value* scalar, Value* vec, bool scalarOnLeft);
-    // 向量逐元素拷贝：dst = src（两者须同型同长 [N x i32]）
+    // 向量逐元素拷贝：dst = src（两者须同型同长 [N x T]）
     void   emitVecCopy(Value* dst, Value* src);
 
     // ===== 常数表达式编译期求值 =====

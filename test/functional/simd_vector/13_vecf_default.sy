@@ -1,0 +1,11 @@
+// 《前端+定长》 浮点向量扩展：vecf 默认初始化（定长版独有：长度 4，零初始化）
+// 预期输出: 0 0 0 0
+// 定长版 vecf a; 默认长度 4，元素为 0.0；变长版默认长度 0
+int main() {
+    vecf a;
+    putint(a[0]); putch(32);
+    putint(a[1]); putch(32);
+    putint(a[2]); putch(32);
+    putint(a[3]); putch(10);
+    return 0;
+}

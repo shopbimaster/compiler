@@ -27,6 +27,8 @@ public:
 
     virtual std::any visitVecInit(SysY2022Parser::VecInitContext *context) = 0;
 
+    virtual std::any visitVecfDecl(SysY2022Parser::VecfDeclContext *context) = 0;
+
     virtual std::any visitConstDecl(SysY2022Parser::ConstDeclContext *context) = 0;
 
     virtual std::any visitBType(SysY2022Parser::BTypeContext *context) = 0;

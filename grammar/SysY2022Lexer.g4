@@ -11,6 +11,7 @@ FLOAT:    'float';
 VOID:     'void';
 CONST:    'const';
 VEC:      'vec';   // 《前端+定长》 SIMD 向量关键字（SSE 风格定长，仅前端词法扩展）
+VECF:     'vecf';  // 《前端+定长》 浮点向量扩展：定长浮点向量关键字（float 元素）
 IF:       'if';
 ELSE:     'else';
 WHILE:    'while';

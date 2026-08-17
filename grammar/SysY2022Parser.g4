@@ -8,8 +8,8 @@ options {
 compilationUnit: (decl | funcDef)* EOF;
 
 // 声明
-// 《前端+定长》 在原 SysY 声明基础上新增 vecDecl 分支
-decl: constDecl | varDecl | vecDecl;
+// 《前端+定长》 在原 SysY 声明基础上新增 vecDecl / vecfDecl 分支
+decl: constDecl | varDecl | vecDecl | vecfDecl;
 
 // 《前端+定长》 SIMD 风格向量声明（仅前端语法扩展，编译期定长）：
 //   vec name = { e1, e2, ... };   列表初始化（定长，长度=元素数）
@@ -22,6 +22,11 @@ vecDecl: VEC IDENTIFIER (ASSIGN (vecInit | exp))? SEMICOLON;
 
 // 《前端+定长》 向量初值（列表形式）
 vecInit: L_BRACE exp (COMMA exp)* R_BRACE;
+
+// 《前端+定长》 浮点向量扩展：定长浮点向量声明（编译期定长，float 元素）
+// 语法与 vecDecl 对称，区别仅在 VECF 关键字（float 元素）。
+// 语义在 IRBuilder 阶段去语法糖为标量 [N x float] alloca + 逐元素 FADD/FSUB/FMUL/FDIV。
+vecfDecl: VECF IDENTIFIER (ASSIGN (vecInit | exp))? SEMICOLON;
 
 // 常量声明
 constDecl: CONST bType constDef (COMMA constDef)* SEMICOLON;

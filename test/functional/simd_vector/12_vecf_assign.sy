@@ -1,0 +1,14 @@
+// 《前端+定长》 浮点向量扩展：vecf 声明后赋值（逐元素深拷贝）
+// 预期输出: 5 6 7 8
+// 定长版 vecf c; 默认长度 4，零初始化；c = a + b; 逐元素覆盖
+int main() {
+    vecf a = {1.0, 2.0, 3.0, 4.0};
+    vecf b = {4.0, 4.0, 4.0, 4.0};
+    vecf c;
+    c = a + b;
+    putint(c[0]); putch(32);
+    putint(c[1]); putch(32);
+    putint(c[2]); putch(32);
+    putint(c[3]); putch(10);
+    return 0;
+}

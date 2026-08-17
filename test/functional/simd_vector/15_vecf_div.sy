@@ -1,0 +1,13 @@
+// 《前端+定长》 浮点向量扩展：vecf 除法（FDIV，编译期展开为 4 个标量除法）
+// 预期输出: 1 2 3 4
+// g = {2.0,4.0,6.0,8.0}; g / 2.0 = {1.0,2.0,3.0,4.0}
+// putint 截断后正好是 1 2 3 4
+int main() {
+    vecf g = {2.0, 4.0, 6.0, 8.0};
+    vecf h = g / 2.0;
+    putint(h[0]); putch(32);
+    putint(h[1]); putch(32);
+    putint(h[2]); putch(32);
+    putint(h[3]); putch(10);
+    return 0;
+}
