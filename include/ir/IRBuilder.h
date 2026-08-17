@@ -23,6 +23,9 @@ public:
     std::any visitConstDecl(SysY2022Parser::ConstDeclContext* ctx) override;
     std::any visitBType(SysY2022Parser::BTypeContext* ctx) override;
     std::any visitVarDecl(SysY2022Parser::VarDeclContext* ctx) override;
+    // 《前端+显式长度》 显式长度向量声明访问器（vec4/vec8/...，仅前端扩展）
+    std::any visitVecDecl(SysY2022Parser::VecDeclContext* ctx) override;
+    std::any visitVecInit(SysY2022Parser::VecInitContext* ctx) override;
     std::any visitVarDef(SysY2022Parser::VarDefContext* ctx) override;
     std::any visitInitVal(SysY2022Parser::InitValContext* ctx) override;
     std::any visitFuncDef(SysY2022Parser::FuncDefContext* ctx) override;
@@ -85,6 +88,21 @@ private:
                                   const std::vector<SysY2022Parser::ConstInitValContext*>& children,
                                   std::vector<uint32_t>& outData);
     Value*          zeroForType(Type* ty);
+
+    // ===== 《前端+显式长度》 显式长度向量运算辅助（仅前端 IR 生成扩展） =====
+    // vecN 表示为 alloca [N x i32]：长度从关键字 N 提取（编译期常量）
+    // 运算编译期展开为 N 个标量 load/op/store（同定长版，非运行时循环）
+    // 判断 Value 是否为显式长度向量（PointerToArrayOfI32）
+    bool   isVecValue(Value* v);
+    // 从 VEC_N token 文本提取长度（"vec4" → 4）
+    unsigned extractVecLen(antlr4::tree::TerminalNode* vecToken);
+    // 向量二元运算（编译期展开）：left op right，返回结果 alloca [N x i32]
+    Value* emitVecBinOp(Instruction::Opcode op, Value* left, Value* right);
+    // 标量广播运算（编译期展开）：scalar op vec，返回结果 alloca [N x i32]
+    Value* emitVecScalarOp(Instruction::Opcode op, Value* scalar,
+                           Value* vec, bool scalarOnLeft);
+    // 向量逐元素拷贝（编译期展开）：dst = src
+    void   emitVecCopy(Value* dst, Value* src);
 
     // ===== 常数表达式编译期求值 =====
     Value* constEval(SysY2022Parser::AddExpContext* ctx);

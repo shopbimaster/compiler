@@ -76,6 +76,10 @@ std::any IRBuilder::visitDecl(SysY2022Parser::DeclContext* ctx) {
     if (ctx->constDecl()) {
         return visitConstDecl(ctx->constDecl());
     }
+    // 《前端+显式长度》 显式长度向量声明分支
+    if (ctx->vecDecl()) {
+        return visitVecDecl(ctx->vecDecl());
+    }
     return visitVarDecl(ctx->varDecl());
 }
 
@@ -385,6 +389,173 @@ std::any IRBuilder::visitBlock(SysY2022Parser::BlockContext* ctx) {
 }
 
 // ================================================================
+// 《前端+显式长度》 vecDecl: VEC_N IDENTIFIER (ASSIGN (vecInit | exp))? SEMICOLON
+// 显式长度向量声明（长度从 VEC_N 关键字提取，编译期常量）：
+//   vec4 a;              → alloca [4 x i32]，4 个 0 零初始化
+//   vec4 a = {1,2,3,4};  → alloca [4 x i32]，逐元素 store
+//   vec4 c = a + b;      → 求 rhs 得 vec alloca，alloca [4 x i32]，emitVecCopy
+// vec 表示为 alloca [N x i32]，N 从关键字提取；运算编译期展开
+// ================================================================
+std::any IRBuilder::visitVecDecl(SysY2022Parser::VecDeclContext* ctx) {
+    std::string name = ctx->IDENTIFIER()->getText();
+    unsigned len = extractVecLen(ctx->VEC_N());
+    auto* arrTy = ArrayType::get(IntegerType::I32, len);
+    auto* alloca = Instruction::createAlloca(arrTy, name);
+    currentBB->pushBack(alloca);
+    declare(name, alloca);
+
+    // ---------- Case 1：无初始化，默认零初始化 ----------
+    if (!ctx->ASSIGN()) {
+        for (unsigned i = 0; i < len; ++i) {
+            std::vector<Value*> idx = {
+                ConstantInt::get(IntegerType::I32, 0),
+                ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i))
+            };
+            auto* gep = Instruction::createGetElementPtr(arrTy, alloca, idx, newTempName());
+            currentBB->pushBack(gep);
+            auto* store = Instruction::createStore(
+                ConstantInt::get(IntegerType::I32, 0), gep);
+            currentBB->pushBack(store);
+        }
+        return {};
+    }
+
+    // ---------- Case 2：列表初始化 vec4 a = { e1, e2, ... }; ----------
+    if (ctx->vecInit()) {
+        auto elems = ctx->vecInit()->exp();
+        for (unsigned i = 0; i < len; ++i) {
+            std::vector<Value*> idx = {
+                ConstantInt::get(IntegerType::I32, 0),
+                ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i))
+            };
+            auto* gep = Instruction::createGetElementPtr(arrTy, alloca, idx, newTempName());
+            currentBB->pushBack(gep);
+            Value* val;
+            if (i < elems.size()) {
+                val = valFrom(visitExp(elems[i]));
+                val = implConvert(val, IntegerType::I32);
+            } else {
+                val = ConstantInt::get(IntegerType::I32, 0);
+            }
+            auto* store = Instruction::createStore(val, gep);
+            currentBB->pushBack(store);
+        }
+        return {};
+    }
+
+    // ---------- Case 3：表达式初始化 vec4 c = a + b; ----------
+    Value* rhs = valFrom(visitExp(ctx->exp()));
+    if (rhs && isVecValue(rhs)) {
+        emitVecCopy(alloca, rhs);
+    }
+    return {};
+}
+
+// 《前端+显式长度》 vecInit 由 visitVecDecl 内联处理，此处保留空实现满足 Visitor 接口
+std::any IRBuilder::visitVecInit(SysY2022Parser::VecInitContext* /*ctx*/) {
+    return {};
+}
+
+// ================================================================
+// 《前端+显式长度》 显式长度向量辅助方法实现
+// ================================================================
+
+// 判断 Value 是否为显式长度向量：PointerToArrayOfI32
+bool IRBuilder::isVecValue(Value* v) {
+    if (!v) return false;
+    auto* ptrTy = dynamic_cast<PointerType*>(v->getType());
+    if (!ptrTy) return false;
+    auto* arrTy = dynamic_cast<ArrayType*>(ptrTy->getPointeeType());
+    if (!arrTy) return false;
+    return arrTy->getElementType()->isInteger();
+}
+
+// 从 VEC_N token 文本提取长度（"vec4" → 4, "vec8" → 8, "vec16" → 16）
+unsigned IRBuilder::extractVecLen(tree::TerminalNode* vecToken) {
+    std::string text = vecToken->getText();   // "vec4"
+    return static_cast<unsigned>(std::stoul(text.substr(3)));
+}
+
+// 向量二元运算（编译期展开）：left op right → alloca [N x i32]
+Value* IRBuilder::emitVecBinOp(Instruction::Opcode op, Value* left, Value* right) {
+    auto* lPtrTy = dynamic_cast<PointerType*>(left->getType());
+    auto* arrTy = dynamic_cast<ArrayType*>(lPtrTy->getPointeeType());
+    unsigned len = arrTy->getNumElements();
+    auto* result = Instruction::createAlloca(arrTy, newTempName());
+    currentBB->pushBack(result);
+
+    for (unsigned i = 0; i < len; ++i) {
+        auto* idxVal = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
+        // load left[i]
+        std::vector<Value*> li = {ConstantInt::get(IntegerType::I32, 0), idxVal};
+        auto* lGep = Instruction::createGetElementPtr(arrTy, left, li, newTempName());
+        currentBB->pushBack(lGep);
+        auto* lLoad = Instruction::createLoad(IntegerType::I32, lGep, newTempName());
+        currentBB->pushBack(static_cast<Instruction*>(lLoad));
+        // load right[i]
+        auto* rGep = Instruction::createGetElementPtr(arrTy, right, li, newTempName());
+        currentBB->pushBack(rGep);
+        auto* rLoad = Instruction::createLoad(IntegerType::I32, rGep, newTempName());
+        currentBB->pushBack(static_cast<Instruction*>(rLoad));
+        // op
+        auto* binOp = Instruction::createBinOp(op, IntegerType::I32, newTempName(), lLoad, rLoad);
+        currentBB->pushBack(binOp);
+        // store result[i]
+        auto* dGep = Instruction::createGetElementPtr(arrTy, result, li, newTempName());
+        currentBB->pushBack(dGep);
+        currentBB->pushBack(Instruction::createStore(binOp, dGep));
+    }
+    return result;
+}
+
+// 标量广播运算（编译期展开）：scalar op vec → alloca [N x i32]
+Value* IRBuilder::emitVecScalarOp(Instruction::Opcode op, Value* scalar,
+                                   Value* vec, bool scalarOnLeft) {
+    auto* vPtrTy = dynamic_cast<PointerType*>(vec->getType());
+    auto* arrTy = dynamic_cast<ArrayType*>(vPtrTy->getPointeeType());
+    unsigned len = arrTy->getNumElements();
+    auto* result = Instruction::createAlloca(arrTy, newTempName());
+    currentBB->pushBack(result);
+    Value* s = implConvert(scalar, IntegerType::I32);
+
+    for (unsigned i = 0; i < len; ++i) {
+        auto* idxVal = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
+        std::vector<Value*> vi = {ConstantInt::get(IntegerType::I32, 0), idxVal};
+        auto* vGep = Instruction::createGetElementPtr(arrTy, vec, vi, newTempName());
+        currentBB->pushBack(vGep);
+        auto* vLoad = Instruction::createLoad(IntegerType::I32, vGep, newTempName());
+        currentBB->pushBack(static_cast<Instruction*>(vLoad));
+        Value* l = scalarOnLeft ? s : vLoad;
+        Value* r = scalarOnLeft ? vLoad : s;
+        auto* binOp = Instruction::createBinOp(op, IntegerType::I32, newTempName(), l, r);
+        currentBB->pushBack(binOp);
+        auto* dGep = Instruction::createGetElementPtr(arrTy, result, vi, newTempName());
+        currentBB->pushBack(dGep);
+        currentBB->pushBack(Instruction::createStore(binOp, dGep));
+    }
+    return result;
+}
+
+// 向量逐元素拷贝（编译期展开）：dst = src
+void IRBuilder::emitVecCopy(Value* dst, Value* src) {
+    auto* sPtrTy = dynamic_cast<PointerType*>(src->getType());
+    auto* arrTy = dynamic_cast<ArrayType*>(sPtrTy->getPointeeType());
+    unsigned len = arrTy->getNumElements();
+
+    for (unsigned i = 0; i < len; ++i) {
+        auto* idxVal = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
+        std::vector<Value*> vi = {ConstantInt::get(IntegerType::I32, 0), idxVal};
+        auto* sGep = Instruction::createGetElementPtr(arrTy, src, vi, newTempName());
+        currentBB->pushBack(sGep);
+        auto* sLoad = Instruction::createLoad(IntegerType::I32, sGep, newTempName());
+        currentBB->pushBack(static_cast<Instruction*>(sLoad));
+        auto* dGep = Instruction::createGetElementPtr(arrTy, dst, vi, newTempName());
+        currentBB->pushBack(dGep);
+        currentBB->pushBack(Instruction::createStore(sLoad, dGep));
+    }
+}
+
+// ================================================================
 // blockItem: decl | stmt
 // ================================================================
 std::any IRBuilder::visitBlockItem(SysY2022Parser::BlockItemContext* ctx) {
@@ -416,6 +587,12 @@ std::any IRBuilder::visitStmt(SysY2022Parser::StmtContext* ctx) {
         Value* lhsPtr = valFrom(visitLVal(ctx->lVal())); // get pointer (alloca)
         Value* rhs = valFrom(visitExp(ctx->exp()));
         if (lhsPtr && rhs) {
+            // 《前端+显式长度》 显式长度向量赋值：c = a + b; 或 c = a;
+            // → 逐元素编译期展开拷贝（emitVecCopy）
+            if (isVecValue(lhsPtr) && isVecValue(rhs)) {
+                emitVecCopy(lhsPtr, rhs);
+                return {};
+            }
             auto* ptrTy = dynamic_cast<PointerType*>(lhsPtr->getType());
             if (ptrTy) {
                 rhs = implConvert(rhs, ptrTy->getPointeeType());
@@ -629,6 +806,11 @@ std::any IRBuilder::visitPrimaryExp(SysY2022Parser::PrimaryExpContext* ctx) {
     if (ctx->lVal()) {
         Value* ptr = valFrom(visitLVal(ctx->lVal()));
         if (ptr) {
+            // 《前端+显式长度》 显式长度向量裸名不衰减，直接返回 alloca 指针，
+            // 让 visitAddExp/visitMulExp 识别为向量并做编译期展开运算
+            if (isVecValue(ptr)) {
+                return std::any(static_cast<Value*>(ptr));
+            }
             PointerType* ptrTy = static_cast<PointerType*>(ptr->getType());
             Type* pointee = ptrTy->getPointeeType();
             if (pointee->isArray()) {
@@ -867,6 +1049,25 @@ std::any IRBuilder::visitMulExp(SysY2022Parser::MulExpContext* ctx) {
         if (dynamic_cast<tree::TerminalNode*>(opNode)) {
             opText = static_cast<tree::TerminalNode*>(opNode)->getSymbol()->getText();
         }
+
+        // 《前端+显式长度》 显式长度向量运算去语法糖分支
+        bool leftIsVec  = isVecValue(left);
+        bool rightIsVec = isVecValue(rightVal);
+        if (leftIsVec || rightIsVec) {
+            if (opText == "*")      op = Instruction::Opcode::MUL;
+            else if (opText == "/") op = Instruction::Opcode::SDIV;
+            else                    op = Instruction::Opcode::SREM;
+            if (leftIsVec && rightIsVec) {
+                result = std::any(emitVecBinOp(op, left, rightVal));
+            } else if (leftIsVec && !rightIsVec) {
+                result = std::any(emitVecScalarOp(op, rightVal, left, /*scalarOnLeft=*/false));
+            } else {
+                result = std::any(emitVecScalarOp(op, left, rightVal, /*scalarOnLeft=*/true));
+            }
+            i += 2;
+            continue;
+        }
+
         // Determine result type: float wins if either operand is float
         Type* resultTy = left->getType();
         bool isFloatOp = left->getType()->isFloat() || rightVal->getType()->isFloat();
@@ -908,6 +1109,24 @@ std::any IRBuilder::visitAddExp(SysY2022Parser::AddExpContext* ctx) {
         std::string opText;
         if (dynamic_cast<tree::TerminalNode*>(opNode)) {
             opText = static_cast<tree::TerminalNode*>(opNode)->getSymbol()->getText();
+        }
+
+        // 《前端+显式长度》 显式长度向量运算去语法糖分支
+        bool leftIsVec  = isVecValue(left);
+        bool rightIsVec = isVecValue(rightVal);
+        if (leftIsVec || rightIsVec) {
+            Instruction::Opcode op = (opText == "+")
+                ? Instruction::Opcode::ADD
+                : Instruction::Opcode::SUB;
+            if (leftIsVec && rightIsVec) {
+                result = std::any(emitVecBinOp(op, left, rightVal));
+            } else if (leftIsVec && !rightIsVec) {
+                result = std::any(emitVecScalarOp(op, rightVal, left, /*scalarOnLeft=*/false));
+            } else {
+                result = std::any(emitVecScalarOp(op, left, rightVal, /*scalarOnLeft=*/true));
+            }
+            i += 2;
+            continue;
         }
 
         // Determine result type: float wins if either operand is float

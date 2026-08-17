@@ -1,0 +1,19 @@
+// vec4 标量广播：vec4 * k、k + vec4、vec4 * 10、k - vec4（编译期展开）
+// 预期输出:
+//   2 4 6 8        (a * 2)
+//   4 5 6 7        (3 + a)
+//   10 20 30 40    (a * 10)
+//   0 -1 -2 -3     (1 - a)
+// a = {1,2,3,4}
+int main() {
+    vec4 a = {1, 2, 3, 4};
+    vec4 b = a * 2;
+    vec4 c = 3 + a;
+    vec4 d = a * 10;
+    vec4 e = 1 - a;
+    putint(b[0]); putch(32); putint(b[1]); putch(32); putint(b[2]); putch(32); putint(b[3]); putch(10);
+    putint(c[0]); putch(32); putint(c[1]); putch(32); putint(c[2]); putch(32); putint(c[3]); putch(10);
+    putint(d[0]); putch(32); putint(d[1]); putch(32); putint(d[2]); putch(32); putint(d[3]); putch(10);
+    putint(e[0]); putch(32); putint(e[1]); putch(32); putint(e[2]); putch(32); putint(e[3]); putch(10);
+    return 0;
+}

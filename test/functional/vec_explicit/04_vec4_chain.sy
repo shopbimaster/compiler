@@ -1,0 +1,14 @@
+// vec4 链式运算 + 索引访问：a + b + c（emitVecBinOp 返回临时 vec4 再做 +）
+// 预期输出: 8 8 8 8
+// a = {1,1,1,1}, b = {2,2,2,2}, c = {5,5,5,5}, a + b + c = {8,8,8,8}
+int main() {
+    vec4 a = {1, 1, 1, 1};
+    vec4 b = {2, 2, 2, 2};
+    vec4 c = {5, 5, 5, 5};
+    vec4 d = a + b + c;
+    putint(d[0]); putch(32);
+    putint(d[1]); putch(32);
+    putint(d[2]); putch(32);
+    putint(d[3]); putch(10);
+    return 0;
+}

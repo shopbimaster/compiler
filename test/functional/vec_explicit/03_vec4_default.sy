@@ -1,0 +1,12 @@
+// vec4 默认零初始化 + 声明后赋值：vec4 a;（零初始化 4 个 0）→ a = b（emitVecCopy）
+// 预期输出:
+//   0 0 0 0        (a 初始)
+//   4 3 2 1        (a = a + b 后，{0+4,0+3,0+2,0+1})
+int main() {
+    vec4 a;
+    putint(a[0]); putch(32); putint(a[1]); putch(32); putint(a[2]); putch(32); putint(a[3]); putch(10);
+    vec4 b = {4, 3, 2, 1};
+    a = a + b;
+    putint(a[0]); putch(32); putint(a[1]); putch(32); putint(a[2]); putch(32); putint(a[3]); putch(10);
+    return 0;
+}

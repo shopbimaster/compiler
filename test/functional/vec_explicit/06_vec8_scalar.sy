@@ -1,0 +1,15 @@
+// vec8 标量广播 + 默认零初始化：验证 vec8 长度关键字提取 + 编译期展开 8 次
+// 预期输出:
+//   2 2 2 2 2 2 2 2   (a * 2, a 初始全 1)
+//   1 1 1 1 1 1 1 1   (vec8 b; 零初始化 + b = a 后)
+int main() {
+    vec8 a = {1, 1, 1, 1, 1, 1, 1, 1};
+    vec8 c = a * 2;
+    putint(c[0]); putch(32); putint(c[1]); putch(32); putint(c[2]); putch(32); putint(c[3]); putch(32);
+    putint(c[4]); putch(32); putint(c[5]); putch(32); putint(c[6]); putch(32); putint(c[7]); putch(10);
+    vec8 b;
+    b = a;
+    putint(b[0]); putch(32); putint(b[1]); putch(32); putint(b[2]); putch(32); putint(b[3]); putch(32);
+    putint(b[4]); putch(32); putint(b[5]); putch(32); putint(b[6]); putch(32); putint(b[7]); putch(10);
+    return 0;
+}

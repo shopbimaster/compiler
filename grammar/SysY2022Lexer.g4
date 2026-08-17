@@ -17,6 +17,13 @@ BREAK:    'break';
 CONTINUE: 'continue';
 RETURN:   'return';
 
+// 《前端+显式长度》 显式长度向量关键字（vec4/vec8/vec16/...）
+// 放在 IDENTIFIER 前：max munch 下 'vec4' 长度 4 == IDENTIFIER 长度 4，
+// 平局由规则顺序决定 → VEC_N 胜（成为关键字）；'vec4x' 长度 5 > VEC_N 的 4
+// → IDENTIFIER 胜（避免误吞 vec4x 变量名）。长度任意正整数，无需为每个长度
+// 新增关键字。
+VEC_N:    'vec' DIGIT+;
+
 // ===== 分隔符 =====
 L_PAREN:    '(';
 R_PAREN:    ')';

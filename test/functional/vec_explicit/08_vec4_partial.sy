@@ -1,0 +1,11 @@
+// vec4 部分初始化：列表元素数 < 长度时，剩余元素零初始化
+// 预期输出: 1 2 0 0
+// vec4 a = {1, 2}; → a[0]=1, a[1]=2, a[2]=0, a[3]=0
+int main() {
+    vec4 a = {1, 2};
+    putint(a[0]); putch(32);
+    putint(a[1]); putch(32);
+    putint(a[2]); putch(32);
+    putint(a[3]); putch(10);
+    return 0;
+}

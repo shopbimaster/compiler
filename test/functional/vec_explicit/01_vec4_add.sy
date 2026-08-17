@@ -1,0 +1,13 @@
+// vec4 加法：vec4 a + vec4 b → vec4 c（编译期展开 4 次标量加法）
+// 预期输出: 5 5 5 5
+// a = {1,2,3,4}, b = {4,3,2,1}, c = a + b = {5,5,5,5}
+int main() {
+    vec4 a = {1, 2, 3, 4};
+    vec4 b = {4, 3, 2, 1};
+    vec4 c = a + b;
+    putint(c[0]); putch(32);
+    putint(c[1]); putch(32);
+    putint(c[2]); putch(32);
+    putint(c[3]); putch(10);
+    return 0;
+}
