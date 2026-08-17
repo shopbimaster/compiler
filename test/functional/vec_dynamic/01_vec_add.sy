@@ -1,0 +1,13 @@
+// 变长向量加法：vec a + vec b → vec c（运行时循环，非编译期展开）
+// 预期输出: 5 5 5 5
+// a = {1,2,3,4}, b = {4,3,2,1}, c = a + b = {5,5,5,5}
+int main() {
+    vec a = {1, 2, 3, 4};
+    vec b = {4, 3, 2, 1};
+    vec c = a + b;
+    putint(c[0]); putch(32);
+    putint(c[1]); putch(32);
+    putint(c[2]); putch(32);
+    putint(c[3]); putch(10);
+    return 0;
+}

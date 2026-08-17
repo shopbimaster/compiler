@@ -1,5 +1,5 @@
 
-// Generated from grammar/SysY2022Parser.g4 by ANTLR 4.13.1
+// Generated from /mnt/d/VSCodeProjects/compiler/grammar/SysY2022Parser.g4 by ANTLR 4.13.1
 
 #pragma once
 
@@ -20,6 +20,14 @@ public:
   }
 
   virtual std::any visitDecl(SysY2022Parser::DeclContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitVecDecl(SysY2022Parser::VecDeclContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitVecInit(SysY2022Parser::VecInitContext *ctx) override {
     return visitChildren(ctx);
   }
 

@@ -1,0 +1,12 @@
+// 变长向量空声明 + 赋值：vec a;（长度 0）→ a = b（emitVecCopy 覆盖长度为 3）
+// 预期输出: 1 2 3
+// 这是变长版独有路径：声明时空向量，赋值后长度由 rhs 决定（运行时长度写入 [0]）
+int main() {
+    vec a;
+    vec b = {1, 2, 3};
+    a = b;
+    putint(a[0]); putch(32);
+    putint(a[1]); putch(32);
+    putint(a[2]); putch(10);
+    return 0;
+}

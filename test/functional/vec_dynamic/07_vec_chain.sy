@@ -1,0 +1,16 @@
+// 变长向量链式运算：a + b + c（result of emitVecBinOp 再做 +）
+// 预期输出: 8 8 8 8
+// a = {1,1,1,1}, b = {2,2,2,2}, c = {5,5,5,5}, a + b + c = {8,8,8,8}
+// 关键：第一次 emitVecBinOp 返回临时 vec alloca（长度=4），第二次再做 +，
+// isVecValue 必须能识别该临时 alloca 为向量（vecAllocas 侧集合覆盖）
+int main() {
+    vec a = {1, 1, 1, 1};
+    vec b = {2, 2, 2, 2};
+    vec c = {5, 5, 5, 5};
+    vec d = a + b + c;
+    putint(d[0]); putch(32);
+    putint(d[1]); putch(32);
+    putint(d[2]); putch(32);
+    putint(d[3]); putch(10);
+    return 0;
+}

@@ -10,6 +10,7 @@ INT:      'int';
 FLOAT:    'float';
 VOID:     'void';
 CONST:    'const';
+VEC:      'vec';   // 《前端+变长》 变长向量关键字（运行时长度，仅前端词法扩展）
 IF:       'if';
 ELSE:     'else';
 WHILE:    'while';

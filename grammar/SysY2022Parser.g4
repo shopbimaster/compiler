@@ -8,7 +8,21 @@ options {
 compilationUnit: (decl | funcDef)* EOF;
 
 // 声明
-decl: constDecl | varDecl;
+// 《前端+变长》 在原 SysY 声明基础上新增 vecDecl 分支
+decl: constDecl | varDecl | vecDecl;
+
+// 《前端+变长》 变长向量声明（运行时长度，仅前端语法扩展）：
+//   vec name = { e1, e2, ... };   列表初始化（长度=元素数，运行时存储）
+//   vec name = exp;               表达式初始化（exp 须为向量，如 a + b）
+//   vec name;                     空向量（长度 0）
+// vecInit 以 L_BRACE 起首，exp 以 L_PAREN/IDENTIFIER/number/unaryOp 起首，
+// 两者首 token 互斥，ANTLR LL(*) 无歧义。
+// 不引入新 IR 类型；vec 表示为 alloca [VEC_MAX+1 x i32]，
+// [0] 存运行时长度，[1..len] 存数据；运算用运行时循环（非编译期展开）。
+vecDecl: VEC IDENTIFIER (ASSIGN (vecInit | exp))? SEMICOLON;
+
+// 《前端+变长》 向量初值（列表形式）
+vecInit: L_BRACE exp (COMMA exp)* R_BRACE;
 
 // 常量声明
 constDecl: CONST bType constDef (COMMA constDef)* SEMICOLON;

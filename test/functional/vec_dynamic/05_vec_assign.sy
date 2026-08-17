@@ -1,0 +1,14 @@
+// 变长向量声明后赋值：vec c; c = a + b;（visitStmt 路径 + emitVecCopy 运行时拷贝）
+// 预期输出: 5 5 5 5
+// 关键：c 声明时长度 0，赋值后长度被 emitVecCopy 用 src 长度覆盖为 4
+int main() {
+    vec a = {1, 2, 3, 4};
+    vec b = {4, 3, 2, 1};
+    vec c;
+    c = a + b;
+    putint(c[0]); putch(32);
+    putint(c[1]); putch(32);
+    putint(c[2]); putch(32);
+    putint(c[3]); putch(10);
+    return 0;
+}
