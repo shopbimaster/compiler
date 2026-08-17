@@ -1,0 +1,14 @@
+// 《前端+显式长度》 浮点向量扩展：vecf4 加法（vecf4 + vecf4 → vecf4，FADD 编译期展开）
+// 预期输出: 5 5 5 5
+// a = {1.0,2.0,3.0,4.0}, b = {4.0,3.0,2.0,1.0}, c = a + b = {5.0,5.0,5.0,5.0}
+// putint 接受 float 参数（f→i 隐式转换），整数值的 float 输出为整数形式。
+int main() {
+    vecf4 a = {1.0, 2.0, 3.0, 4.0};
+    vecf4 b = {4.0, 3.0, 2.0, 1.0};
+    vecf4 c = a + b;
+    putint(c[0]); putch(32);
+    putint(c[1]); putch(32);
+    putint(c[2]); putch(32);
+    putint(c[3]); putch(10);
+    return 0;
+}

@@ -13,12 +13,13 @@ class  SysY2022Lexer : public antlr4::Lexer {
 public:
   enum {
     INT = 1, FLOAT = 2, VOID = 3, CONST = 4, IF = 5, ELSE = 6, WHILE = 7, 
-    BREAK = 8, CONTINUE = 9, RETURN = 10, VEC_N = 11, L_PAREN = 12, R_PAREN = 13, 
-    L_BRACKET = 14, R_BRACKET = 15, L_BRACE = 16, R_BRACE = 17, COMMA = 18, 
-    SEMICOLON = 19, QUESTION = 20, COLON = 21, PLUS = 22, MINUS = 23, STAR = 24, 
-    DIV = 25, MOD = 26, NOT = 27, AND = 28, OR = 29, LT = 30, GT = 31, LE = 32, 
-    GE = 33, EQ = 34, NE = 35, ASSIGN = 36, IDENTIFIER = 37, INTCONST = 38, 
-    FLOATCONST = 39, WHITESPACE = 40, LINE_COMMENT = 41, BLOCK_COMMENT = 42
+    BREAK = 8, CONTINUE = 9, RETURN = 10, VEC_N = 11, VECF_N = 12, L_PAREN = 13, 
+    R_PAREN = 14, L_BRACKET = 15, R_BRACKET = 16, L_BRACE = 17, R_BRACE = 18, 
+    COMMA = 19, SEMICOLON = 20, QUESTION = 21, COLON = 22, PLUS = 23, MINUS = 24, 
+    STAR = 25, DIV = 26, MOD = 27, NOT = 28, AND = 29, OR = 30, LT = 31, 
+    GT = 32, LE = 33, GE = 34, EQ = 35, NE = 36, ASSIGN = 37, IDENTIFIER = 38, 
+    INTCONST = 39, FLOATCONST = 40, WHITESPACE = 41, LINE_COMMENT = 42, 
+    BLOCK_COMMENT = 43
   };
 
   explicit SysY2022Lexer(antlr4::CharStream *input);

@@ -1,0 +1,14 @@
+// 《前端+显式长度》 浮点向量扩展：vecf4 链式运算 + 索引访问（emitVecfBinOp 返回临时 vecf4 再做 +）
+// 预期输出: 8 8 8 8
+// a = {1,1,1,1}, b = {2,2,2,2}, c = {5,5,5,5}, a + b + c = {8,8,8,8}
+int main() {
+    vecf4 a = {1.0, 1.0, 1.0, 1.0};
+    vecf4 b = {2.0, 2.0, 2.0, 2.0};
+    vecf4 c = {5.0, 5.0, 5.0, 5.0};
+    vecf4 d = a + b + c;
+    putint(d[0]); putch(32);
+    putint(d[1]); putch(32);
+    putint(d[2]); putch(32);
+    putint(d[3]); putch(10);
+    return 0;
+}

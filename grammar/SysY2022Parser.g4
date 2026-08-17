@@ -9,7 +9,8 @@ compilationUnit: (decl | funcDef)* EOF;
 
 // 声明
 // 《前端+显式长度》 在原 SysY 声明基础上新增 vecDecl 分支
-decl: constDecl | varDecl | vecDecl;
+// 浮点向量扩展：新增 vecfDecl 分支
+decl: constDecl | varDecl | vecDecl | vecfDecl;
 
 // 《前端+显式长度》 显式长度向量声明（vec4/vec8/vec16/...，长度从关键字提取）：
 //   vec4 name = { e1, e2, e3, e4 };   列表初始化（长度由关键字决定，非列表元素数）
@@ -23,6 +24,11 @@ vecDecl: VEC_N IDENTIFIER (ASSIGN (vecInit | exp))? SEMICOLON;
 
 // 《前端+显式长度》 向量初值（列表形式）
 vecInit: L_BRACE exp (COMMA exp)* R_BRACE;
+
+// 《前端+显式长度》 浮点向量扩展：显式长度浮点向量声明（vecf4/vecf8/...）
+// 语法与 vecDecl 对称，区别仅在 VECF_N 关键字（float 元素）。
+// vecfN 表示为 alloca [N x float]，运算用 FADD/FSUB/FMUL/FDIV。
+vecfDecl: VECF_N IDENTIFIER (ASSIGN (vecInit | exp))? SEMICOLON;
 
 // 常量声明
 constDecl: CONST bType constDef (COMMA constDef)* SEMICOLON;

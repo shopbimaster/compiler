@@ -28,6 +28,9 @@ public:
   virtual void enterVecInit(SysY2022Parser::VecInitContext * /*ctx*/) override { }
   virtual void exitVecInit(SysY2022Parser::VecInitContext * /*ctx*/) override { }
 
+  virtual void enterVecfDecl(SysY2022Parser::VecfDeclContext * /*ctx*/) override { }
+  virtual void exitVecfDecl(SysY2022Parser::VecfDeclContext * /*ctx*/) override { }
+
   virtual void enterConstDecl(SysY2022Parser::ConstDeclContext * /*ctx*/) override { }
   virtual void exitConstDecl(SysY2022Parser::ConstDeclContext * /*ctx*/) override { }
 

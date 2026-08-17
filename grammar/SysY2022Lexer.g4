@@ -24,6 +24,10 @@ RETURN:   'return';
 // 新增关键字。
 VEC_N:    'vec' DIGIT+;
 
+// 《前端+显式长度》 浮点向量扩展：显式长度浮点向量关键字（vecf4/vecf8/...）
+// 'vecf' 前缀 + DIGIT+，与 VEC_N 互斥（'vecf4' 的 'f' 非 DIGIT，VEC_N 不匹配）。
+VECF_N:   'vecf' DIGIT+;
+
 // ===== 分隔符 =====
 L_PAREN:    '(';
 R_PAREN:    ')';

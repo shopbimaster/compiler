@@ -1,0 +1,11 @@
+// 《前端+显式长度》 浮点向量扩展：vecf8 加法（验证 vecf8 长度关键字提取 + 编译期展开 8 次）
+// 预期输出: 9 9 9 9 9 9 9 9
+// a = {1,1,1,1,1,1,1,1}, b = {8,8,8,8,8,8,8,8}, c = a + b = {9,9,9,9,9,9,9,9}
+int main() {
+    vecf8 a = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    vecf8 b = {8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0};
+    vecf8 c = a + b;
+    putint(c[0]); putch(32); putint(c[1]); putch(32); putint(c[2]); putch(32); putint(c[3]); putch(32);
+    putint(c[4]); putch(32); putint(c[5]); putch(32); putint(c[6]); putch(32); putint(c[7]); putch(10);
+    return 0;
+}

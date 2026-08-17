@@ -26,6 +26,9 @@ public:
   virtual void enterVecInit(SysY2022Parser::VecInitContext *ctx) = 0;
   virtual void exitVecInit(SysY2022Parser::VecInitContext *ctx) = 0;
 
+  virtual void enterVecfDecl(SysY2022Parser::VecfDeclContext *ctx) = 0;
+  virtual void exitVecfDecl(SysY2022Parser::VecfDeclContext *ctx) = 0;
+
   virtual void enterConstDecl(SysY2022Parser::ConstDeclContext *ctx) = 0;
   virtual void exitConstDecl(SysY2022Parser::ConstDeclContext *ctx) = 0;
 

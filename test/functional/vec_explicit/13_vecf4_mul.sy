@@ -1,0 +1,14 @@
+// 《前端+显式长度》 浮点向量扩展：vecf4 减法 + 乘法混合（FSUB/FMUL，编译期展开）
+// 预期输出:
+//   -3 -1 1 3       (a - b)
+//   4 6 6 4         (a * b)
+// a = {1.0,2.0,3.0,4.0}, b = {4.0,3.0,2.0,1.0}
+int main() {
+    vecf4 a = {1.0, 2.0, 3.0, 4.0};
+    vecf4 b = {4.0, 3.0, 2.0, 1.0};
+    vecf4 c = a - b;
+    vecf4 d = a * b;
+    putint(c[0]); putch(32); putint(c[1]); putch(32); putint(c[2]); putch(32); putint(c[3]); putch(10);
+    putint(d[0]); putch(32); putint(d[1]); putch(32); putint(d[2]); putch(32); putint(d[3]); putch(10);
+    return 0;
+}

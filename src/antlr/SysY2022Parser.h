@@ -13,23 +13,25 @@ class  SysY2022Parser : public antlr4::Parser {
 public:
   enum {
     INT = 1, FLOAT = 2, VOID = 3, CONST = 4, IF = 5, ELSE = 6, WHILE = 7, 
-    BREAK = 8, CONTINUE = 9, RETURN = 10, VEC_N = 11, L_PAREN = 12, R_PAREN = 13, 
-    L_BRACKET = 14, R_BRACKET = 15, L_BRACE = 16, R_BRACE = 17, COMMA = 18, 
-    SEMICOLON = 19, QUESTION = 20, COLON = 21, PLUS = 22, MINUS = 23, STAR = 24, 
-    DIV = 25, MOD = 26, NOT = 27, AND = 28, OR = 29, LT = 30, GT = 31, LE = 32, 
-    GE = 33, EQ = 34, NE = 35, ASSIGN = 36, IDENTIFIER = 37, INTCONST = 38, 
-    FLOATCONST = 39, WHITESPACE = 40, LINE_COMMENT = 41, BLOCK_COMMENT = 42
+    BREAK = 8, CONTINUE = 9, RETURN = 10, VEC_N = 11, VECF_N = 12, L_PAREN = 13, 
+    R_PAREN = 14, L_BRACKET = 15, R_BRACKET = 16, L_BRACE = 17, R_BRACE = 18, 
+    COMMA = 19, SEMICOLON = 20, QUESTION = 21, COLON = 22, PLUS = 23, MINUS = 24, 
+    STAR = 25, DIV = 26, MOD = 27, NOT = 28, AND = 29, OR = 30, LT = 31, 
+    GT = 32, LE = 33, GE = 34, EQ = 35, NE = 36, ASSIGN = 37, IDENTIFIER = 38, 
+    INTCONST = 39, FLOATCONST = 40, WHITESPACE = 41, LINE_COMMENT = 42, 
+    BLOCK_COMMENT = 43
   };
 
   enum {
     RuleCompilationUnit = 0, RuleDecl = 1, RuleVecDecl = 2, RuleVecInit = 3, 
-    RuleConstDecl = 4, RuleBType = 5, RuleConstDef = 6, RuleConstInitVal = 7, 
-    RuleVarDecl = 8, RuleVarDef = 9, RuleInitVal = 10, RuleFuncDef = 11, 
-    RuleFuncType = 12, RuleFuncFParams = 13, RuleFuncFParam = 14, RuleBlock = 15, 
-    RuleBlockItem = 16, RuleStmt = 17, RuleExp = 18, RuleCond = 19, RuleLVal = 20, 
-    RulePrimaryExp = 21, RuleNumber = 22, RuleUnaryExp = 23, RuleUnaryOp = 24, 
-    RuleFuncRParams = 25, RuleMulExp = 26, RuleAddExp = 27, RuleRelExp = 28, 
-    RuleEqExp = 29, RuleLAndExp = 30, RuleLOrExp = 31, RuleConstExp = 32
+    RuleVecfDecl = 4, RuleConstDecl = 5, RuleBType = 6, RuleConstDef = 7, 
+    RuleConstInitVal = 8, RuleVarDecl = 9, RuleVarDef = 10, RuleInitVal = 11, 
+    RuleFuncDef = 12, RuleFuncType = 13, RuleFuncFParams = 14, RuleFuncFParam = 15, 
+    RuleBlock = 16, RuleBlockItem = 17, RuleStmt = 18, RuleExp = 19, RuleCond = 20, 
+    RuleLVal = 21, RulePrimaryExp = 22, RuleNumber = 23, RuleUnaryExp = 24, 
+    RuleUnaryOp = 25, RuleFuncRParams = 26, RuleMulExp = 27, RuleAddExp = 28, 
+    RuleRelExp = 29, RuleEqExp = 30, RuleLAndExp = 31, RuleLOrExp = 32, 
+    RuleConstExp = 33
   };
 
   explicit SysY2022Parser(antlr4::TokenStream *input);
@@ -53,6 +55,7 @@ public:
   class DeclContext;
   class VecDeclContext;
   class VecInitContext;
+  class VecfDeclContext;
   class ConstDeclContext;
   class BTypeContext;
   class ConstDefContext;
@@ -109,6 +112,7 @@ public:
     ConstDeclContext *constDecl();
     VarDeclContext *varDecl();
     VecDeclContext *vecDecl();
+    VecfDeclContext *vecfDecl();
 
     virtual void enterRule(antlr4::tree::ParseTreeListener *listener) override;
     virtual void exitRule(antlr4::tree::ParseTreeListener *listener) override;
@@ -158,6 +162,26 @@ public:
   };
 
   VecInitContext* vecInit();
+
+  class  VecfDeclContext : public antlr4::ParserRuleContext {
+  public:
+    VecfDeclContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *VECF_N();
+    antlr4::tree::TerminalNode *IDENTIFIER();
+    antlr4::tree::TerminalNode *SEMICOLON();
+    antlr4::tree::TerminalNode *ASSIGN();
+    VecInitContext *vecInit();
+    ExpContext *exp();
+
+    virtual void enterRule(antlr4::tree::ParseTreeListener *listener) override;
+    virtual void exitRule(antlr4::tree::ParseTreeListener *listener) override;
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  VecfDeclContext* vecfDecl();
 
   class  ConstDeclContext : public antlr4::ParserRuleContext {
   public:

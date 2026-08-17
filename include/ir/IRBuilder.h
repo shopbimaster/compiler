@@ -26,6 +26,8 @@ public:
     // 《前端+显式长度》 显式长度向量声明访问器（vec4/vec8/...，仅前端扩展）
     std::any visitVecDecl(SysY2022Parser::VecDeclContext* ctx) override;
     std::any visitVecInit(SysY2022Parser::VecInitContext* ctx) override;
+    // 《前端+显式长度》 浮点向量扩展：显式长度浮点向量声明访问器（vecf4/vecf8/...）
+    std::any visitVecfDecl(SysY2022Parser::VecfDeclContext* ctx) override;
     std::any visitVarDef(SysY2022Parser::VarDefContext* ctx) override;
     std::any visitInitVal(SysY2022Parser::InitValContext* ctx) override;
     std::any visitFuncDef(SysY2022Parser::FuncDefContext* ctx) override;
@@ -103,6 +105,19 @@ private:
                            Value* vec, bool scalarOnLeft);
     // 向量逐元素拷贝（编译期展开）：dst = src
     void   emitVecCopy(Value* dst, Value* src);
+
+    // ===== 《前端+显式长度》 浮点向量扩展（FADD/FSUB/FMUL/FDIV，编译期展开） =====
+    // 判断 Value 是否为浮点向量（PointerToArrayOfFloat）
+    bool   isVecfValue(Value* v);
+    // 从 VECF_N token 文本提取长度（"vecf4" → 4）
+    unsigned extractVecfLen(antlr4::tree::TerminalNode* vecfToken);
+    // 浮点向量二元运算（编译期展开）：left op right → alloca [N x float]
+    Value* emitVecfBinOp(Instruction::Opcode op, Value* left, Value* right);
+    // 浮点标量广播运算（编译期展开）：scalar op vecf → alloca [N x float]
+    Value* emitVecfScalarOp(Instruction::Opcode op, Value* scalar,
+                            Value* vec, bool scalarOnLeft);
+    // 浮点向量逐元素拷贝（编译期展开）：dst = src
+    void   emitVecfCopy(Value* dst, Value* src);
 
     // ===== 常数表达式编译期求值 =====
     Value* constEval(SysY2022Parser::AddExpContext* ctx);
