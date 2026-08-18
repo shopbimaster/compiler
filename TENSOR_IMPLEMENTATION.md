@@ -137,4 +137,40 @@ fallback 到 I32，`t1` 类型为 `[4 x i32]`。`emitInitStoresVar` 递归处理
 
 ---
 
-## V5：张量拷贝赋值（待实现）
+## V5：张量拷贝赋值 `t1 = t2`
+
+### 修改点
+
+| 文件 | 修改 |
+|------|------|
+| `src/ir/IRBuilder.cpp` | `visitStmt` 的 `lVal = exp` 分支：lhs 是张量 alloca 且 rhs 是"指向数组的指针"（张量变量或张量运算临时结果）时，走 `emitTensorCopy` 逐元素拷贝，不再生成单个 store |
+| `test/functional/tensor/05_tensor_copy.sy` + `.out` | 新增测试：1D 拷贝、深拷贝验证（改 dst 不影响 src）、2D 拷贝 |
+| `scripts/run_tensor_tests.sh` | 新增 tensor 套件一键回归脚本（编译→链接→qemu→比对 .out，支持 O0/O1） |
+
+### 原理
+
+- 张量变量在表达式中以**裸名**出现时（`visitPrimaryExp`），保留 alloca 指针不衰减，
+  因此 `a = b` 的 rhs 直接拿到 src 张量的基址。
+- `emitTensorCopy(dst, src)` 按元素总数（`getTotalElements`）行优先展开，
+  每个元素 `load src → store dst`，多维下标由 `flatToGepIndices` 分解——天然深拷贝。
+- 该接线同时覆盖 `t = a + b`、`t = a @ b` 等"运算结果赋回张量"的情形
+  （rhs 是 `emitTensorElementWise`/`emitTensorMatMul` 返回的临时张量 alloca）。
+
+### 验证
+
+- 05_tensor_copy：`a=b` 后 a={10,20,30,40}；改 a[0]=99 后 b[0] 仍为 10（深拷贝）；2D `m2=m1` 正确 ✓
+- tensor 套件 O0/O1 全 5 通过；func O0 99 OK / 1 DIFF（68_brainfk 预存）、
+  func O1 97 OK / 3 DIFF（62_percolation/68_brainfk/71_full_conn 均为基线预存失败）；quick 5/5。
+
+### 踩坑
+
+- **判断条件不能只靠 `isTensorOperand(rhs)`**：张量运算的临时结果 alloca 没有变量名，
+  不在 `tensorVars` 中。故条件为"lhs 是张量 && rhs 是指向数组的指针"，
+  普通数组不会触发（lhs 必须过 `isTensorOperand`）。
+
+---
+
+## 当前状态小结
+
+V1~V5 全部完成：词法/语法 → 声明初始化 → 逐元素运算+标量提升+单目 → 矩阵乘法 → 拷贝赋值。
+张量在 IR 层即多维数组，后端/优化器零改动；tensor 套件 5/5（O0+O1），全量回归无新增失败。
