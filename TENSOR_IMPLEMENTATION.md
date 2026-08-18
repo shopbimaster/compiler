@@ -80,7 +80,37 @@ fallback 到 I32，`t1` 类型为 `[4 x i32]`。`emitInitStoresVar` 递归处理
 
 ---
 
-## V3：张量逐元素运算 + 标量提升 + 单目 ±（待实现）
+## V3：张量逐元素运算 + 标量提升 + 单目 ±
+
+### 修改点
+
+| 文件 | 修改 |
+|------|------|
+| `include/ir/IRBuilder.h` | 加 `tensorVars` 成员（name→isFloat）+ 6 个辅助方法声明：`isTensorOperand`/`emitTensorElementWise`/`emitTensorScalarOp`/`emitTensorNeg`/`emitTensorCopy`/`emitTensorMatMul` |
+| `src/ir/IRBuilder.cpp` | `visitVarDecl` 登记张量变量；`visitPrimaryExp` 张量裸名不衰减（保留 alloca 指针）；`visitAddExp`/`visitMulExp` 张量运算拦截；`visitUnaryExp` 张量 `-`/`+`；`visitStmt` 张量整体赋值走 `emitTensorCopy`；新增 6 个辅助方法实现（`emitTensorMatMul` 留 stub） |
+| `test/functional/tensor/02_tensor_arith.sy` + `.out` | 新增测试：9 种运算全覆盖 |
+
+### 原理
+
+- **识别**：`tensorVars` 记录 `tensor` 声明的变量名；`isTensorOperand(v)` 反查符号表确认 v 是张量 alloca。
+- **运算展开**：`emitTensorElementWise` 对 lhs/rhs 逐元素 `load → op → store`；`emitTensorScalarOp` 把标量隐式转换到元素类型后与每元素运算（`scalarOnLeft` 控制操作数顺序）。
+- **单目**：`-t` → 逐元素 `0 - elem`；`+t` → 原样返回（SysY2026 规范）。
+- **结果**：返回新的临时张量 alloca（`[N x ...]` 指针），可继续参与链式运算或被 `t = ...` 拷贝。
+
+### 验证
+
+- 9 种运算输出全对（O0 + O1）。
+- 功能回归 99/100（仅预存 68_brainfk DIFF）。
+
+### 踩坑
+
+- **临时结果不在 tensorVars**：`emitTensorElementWise` 返回的临时 alloca 没有变量名，
+  `isTensorOperand` 对它会返回 false。因此 `visitStmt` 的张量赋值判断**不能只靠
+  `isTensorOperand(rhs)`**，而是判断 rhs 是"指向数组的指针"即可（lhs 仍需是张量）。
+- **多维数组扁平索引**：`emitTensorElementWise` 用 `[0, i]` 扁平 GEP 遍历（行优先展开），
+  与张量"按赋值表达式顺序填充"的线性内存布局一致。
+
+---
 
 ## V4：矩阵乘法 @（待实现）
 

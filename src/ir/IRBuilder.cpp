@@ -161,6 +161,9 @@ std::any IRBuilder::visitBType(SysY2022Parser::BTypeContext* ctx) {
 // ================================================================
 std::any IRBuilder::visitVarDecl(SysY2022Parser::VarDeclContext* ctx) {
     Type* baseType = std::any_cast<Type*>(visitBType(ctx->bType()));
+    // SysY2026：记录该声明是否为张量（以及元素是否为 float）
+    bool isTensorDecl = (ctx->bType()->tensorType() != nullptr);
+    bool isFloatElem  = isTensorDecl && (ctx->bType()->tensorType()->FLOAT() != nullptr);
     for (auto* defCtx : ctx->varDef()) {
         std::string name = defCtx->IDENTIFIER()->getText();
 
@@ -234,6 +237,8 @@ std::any IRBuilder::visitVarDecl(SysY2022Parser::VarDeclContext* ctx) {
             }
             declare(name, alloca);
         }
+        // SysY2026：登记张量变量名（全局与局部统一）
+        if (isTensorDecl) tensorVars[name] = isFloatElem;
     }
     return {};
 }
@@ -416,6 +421,17 @@ std::any IRBuilder::visitStmt(SysY2022Parser::StmtContext* ctx) {
         Value* lhsPtr = valFrom(visitLVal(ctx->lVal())); // get pointer (alloca)
         Value* rhs = valFrom(visitExp(ctx->exp()));
         if (lhsPtr && rhs) {
+            // SysY2026：张量整体赋值（t = tensor_expr）→ 逐元素拷贝
+            // lhs 是张量 alloca，rhs 是指向数组的指针（张量运算结果或另一张量）
+            bool lhsIsTensorArr = lhsPtr->getType()->isPointer() &&
+                static_cast<PointerType*>(lhsPtr->getType())->getPointeeType()->isArray() &&
+                isTensorOperand(lhsPtr);
+            bool rhsIsArrPtr = rhs->getType()->isPointer() &&
+                static_cast<PointerType*>(rhs->getType())->getPointeeType()->isArray();
+            if (lhsIsTensorArr && rhsIsArrPtr) {
+                emitTensorCopy(lhsPtr, rhs);
+                return {};
+            }
             auto* ptrTy = dynamic_cast<PointerType*>(lhsPtr->getType());
             if (ptrTy) {
                 rhs = implConvert(rhs, ptrTy->getPointeeType());
@@ -632,7 +648,11 @@ std::any IRBuilder::visitPrimaryExp(SysY2022Parser::PrimaryExpContext* ctx) {
             PointerType* ptrTy = static_cast<PointerType*>(ptr->getType());
             Type* pointee = ptrTy->getPointeeType();
             if (pointee->isArray()) {
-                // Array decay to pointer to first element
+                // SysY2026 张量：裸名保持 alloca 指针，让表达式层识别为张量操作数
+                if (isTensorOperand(ptr)) {
+                    return std::any(static_cast<Value*>(ptr));
+                }
+                // 普通数组：衰减为首元素指针
                 std::vector<Value*> indices;
                 indices.push_back(ConstantInt::get(IntegerType::I32, 0));
                 indices.push_back(ConstantInt::get(IntegerType::I32, 0));
@@ -750,6 +770,18 @@ std::any IRBuilder::visitUnaryExp(SysY2022Parser::UnaryExpContext* ctx) {
         std::string op = ctx->unaryOp()->getText();
         Value* operand = valFrom(visitUnaryExp(ctx->unaryExp()));
 
+        // SysY2026：张量单目运算
+        if (isTensorOperand(operand)) {
+            if (op == "-") {
+                return std::any(emitTensorNeg(operand));
+            }
+            // '+' 原样输出（SysY2026 规范：输出原张量）
+            if (op == "+") {
+                return std::any(operand);
+            }
+            // '!' 对张量无定义，按标量 0 处理（不会产生有效结果，但保持编译通过）
+        }
+
         if (op == "-") {
             if (operand->getType()->isFloat()) {
                 Value* zero = ConstantFloat::get(FloatType::get(), 0.0);
@@ -849,7 +881,8 @@ Value* IRBuilder::conditionToBool(Value* val) {
 }
 
 // ================================================================
-// mulExp: unaryExp | mulExp (* / %) unaryExp
+// mulExp: unaryExp | mulExp (* / % @) unaryExp
+// SysY2026：张量 * / %（逐元素）+ @（矩阵乘法）+ 标量广播
 // ================================================================
 std::any IRBuilder::visitMulExp(SysY2022Parser::MulExpContext* ctx) {
     auto result = visit(ctx->children[0]);
@@ -867,6 +900,46 @@ std::any IRBuilder::visitMulExp(SysY2022Parser::MulExpContext* ctx) {
         if (dynamic_cast<tree::TerminalNode*>(opNode)) {
             opText = static_cast<tree::TerminalNode*>(opNode)->getSymbol()->getText();
         }
+
+        // ===== SysY2026 张量运算 =====
+        bool lIsTensor = isTensorOperand(left);
+        bool rIsTensor = isTensorOperand(rightVal);
+        if (lIsTensor || rIsTensor) {
+            if (opText == "@") {
+                // 矩阵乘法：仅 2 维张量
+                if (!lIsTensor || !rIsTensor) {
+                    throw std::runtime_error("@ operator requires two tensor operands");
+                }
+                result = std::any(emitTensorMatMul(left, rightVal));
+                i += 2;
+                continue;
+            }
+            // * / % 逐元素
+            if (opText == "%" ) {
+                // 模运算：仅 int 张量支持
+                if (lIsTensor && rIsTensor) {
+                    result = std::any(emitTensorElementWise(Instruction::Opcode::SREM, Instruction::Opcode::SREM, left, rightVal));
+                } else if (lIsTensor && !rIsTensor) {
+                    result = std::any(emitTensorScalarOp(Instruction::Opcode::SREM, Instruction::Opcode::SREM, left, rightVal, /*scalarOnLeft=*/false));
+                } else {
+                    result = std::any(emitTensorScalarOp(Instruction::Opcode::SREM, Instruction::Opcode::SREM, rightVal, left, /*scalarOnLeft=*/true));
+                }
+            } else {
+                auto intOp = (opText == "*") ? Instruction::Opcode::MUL  : Instruction::Opcode::SDIV;
+                auto fltOp = (opText == "*") ? Instruction::Opcode::FMUL : Instruction::Opcode::FDIV;
+                if (lIsTensor && rIsTensor) {
+                    result = std::any(emitTensorElementWise(intOp, fltOp, left, rightVal));
+                } else if (lIsTensor && !rIsTensor) {
+                    result = std::any(emitTensorScalarOp(intOp, fltOp, left, rightVal, /*scalarOnLeft=*/false));
+                } else {
+                    result = std::any(emitTensorScalarOp(intOp, fltOp, rightVal, left, /*scalarOnLeft=*/true));
+                }
+            }
+            i += 2;
+            continue;
+        }
+
+        // ===== 标量路径 =====
         // Determine result type: float wins if either operand is float
         Type* resultTy = left->getType();
         bool isFloatOp = left->getType()->isFloat() || rightVal->getType()->isFloat();
@@ -893,6 +966,7 @@ std::any IRBuilder::visitMulExp(SysY2022Parser::MulExpContext* ctx) {
 
 // ================================================================
 // addExp: mulExp | addExp (+ -) mulExp
+// SysY2026：张量运算（张量±张量逐元素 / 张量±标量广播）
 // ================================================================
 std::any IRBuilder::visitAddExp(SysY2022Parser::AddExpContext* ctx) {
     auto result = visit(ctx->children[0]);
@@ -910,6 +984,24 @@ std::any IRBuilder::visitAddExp(SysY2022Parser::AddExpContext* ctx) {
             opText = static_cast<tree::TerminalNode*>(opNode)->getSymbol()->getText();
         }
 
+        // ===== SysY2026 张量运算 =====
+        bool lIsTensor = isTensorOperand(left);
+        bool rIsTensor = isTensorOperand(rightVal);
+        if (lIsTensor || rIsTensor) {
+            auto intOp  = (opText == "+") ? Instruction::Opcode::ADD  : Instruction::Opcode::SUB;
+            auto fltOp  = (opText == "+") ? Instruction::Opcode::FADD : Instruction::Opcode::FSUB;
+            if (lIsTensor && rIsTensor) {
+                result = std::any(emitTensorElementWise(intOp, fltOp, left, rightVal));
+            } else if (lIsTensor && !rIsTensor) {
+                result = std::any(emitTensorScalarOp(intOp, fltOp, left, rightVal, /*scalarOnLeft=*/false));
+            } else {
+                result = std::any(emitTensorScalarOp(intOp, fltOp, rightVal, left, /*scalarOnLeft=*/true));
+            }
+            i += 2;
+            continue;
+        }
+
+        // ===== 标量路径 =====
         // Determine result type: float wins if either operand is float
         Type* resultTy = left->getType();
         bool isFloatOp = left->getType()->isFloat() || rightVal->getType()->isFloat();
@@ -1175,6 +1267,177 @@ Value* IRBuilder::lookup(const std::string& name) {
 
 std::string IRBuilder::newTempName() {
     return "t" + std::to_string(tempCount++);
+}
+
+// ================================================================
+// SysY2026 张量辅助：识别、展开、运算
+// ================================================================
+
+// 判断 Value 是否为张量操作数（指向 ArrayType 的 alloca 指针，
+// 且对应变量名在 tensorVars 中）。要求完整形状（所有维度已知）。
+bool IRBuilder::isTensorOperand(Value* v) {
+    if (!v || !v->getType()->isPointer()) return false;
+    auto* pointee = static_cast<PointerType*>(v->getType())->getPointeeType();
+    if (!pointee->isArray()) return false;
+    // 查找当前符号表中匹配此 alloca 值的变量名
+    for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+        for (const auto& kv : *it) {
+            if (kv.second == v) {
+                return tensorVars.find(kv.first) != tensorVars.end();
+            }
+        }
+    }
+    return false;
+}
+
+// 计算数组类型的总元素数（张量必须是完整多维数组，所有维度已知）
+static unsigned getTotalElements(Type* ty, Type*& leafType) {
+    unsigned total = 1;
+    leafType = ty;
+    while (leafType->isArray()) {
+        auto* arr = static_cast<ArrayType*>(leafType);
+        total *= arr->getNumElements();
+        leafType = arr->getElementType();
+    }
+    return total;
+}
+
+// 张量逐元素标量运算：lhs/rhs 均为同形张量 alloca，生成结果张量 alloca。
+Value* IRBuilder::emitTensorElementWise(Instruction::Opcode intOp, Instruction::Opcode floatOp,
+                                         Value* lhs, Value* rhs) {
+    Type* lhsLeafTy = nullptr;  unsigned lhsTotal = getTotalElements(
+        static_cast<PointerType*>(lhs->getType())->getPointeeType(), lhsLeafTy);
+    Type* rhsLeafTy = nullptr;  unsigned rhsTotal = getTotalElements(
+        static_cast<PointerType*>(rhs->getType())->getPointeeType(), rhsLeafTy);
+    // 形状与元素类型必须一致
+    if (lhsTotal != rhsTotal || lhsLeafTy != rhsLeafTy) {
+        throw std::runtime_error("Tensor shape mismatch in element-wise op");
+    }
+    bool isFloat = lhsLeafTy->isFloat();
+    Instruction::Opcode op = isFloat ? floatOp : intOp;
+    auto* srcTy = static_cast<PointerType*>(lhs->getType())->getPointeeType();
+    auto* resTy = static_cast<PointerType*>(lhs->getType())->getPointeeType();
+    auto* result = Instruction::createAlloca(resTy, newTempName());
+    currentBB->pushBack(result);
+
+    for (unsigned i = 0; i < lhsTotal; ++i) {
+        auto idx0 = ConstantInt::get(IntegerType::I32, 0);
+        auto idxI = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
+        std::vector<Value*> idx = {idx0, idxI};
+        // lhs[i]  (使用 srcTy 作为 GEP 源类型；对多维数组，扁平索引按行优先)
+        auto* gepL = Instruction::createGetElementPtr(srcTy, lhs, idx, newTempName());
+        currentBB->pushBack(gepL);
+        auto* loadL = Instruction::createLoad(lhsLeafTy, gepL, newTempName());
+        currentBB->pushBack(loadL);
+        // rhs[i]
+        auto* gepR = Instruction::createGetElementPtr(srcTy, rhs, idx, newTempName());
+        currentBB->pushBack(gepR);
+        auto* loadR = Instruction::createLoad(lhsLeafTy, gepR, newTempName());
+        currentBB->pushBack(loadR);
+        // op
+        auto* binOp = Instruction::createBinOp(op, lhsLeafTy, newTempName(), loadL, loadR);
+        currentBB->pushBack(binOp);
+        // store
+        auto* gepRes = Instruction::createGetElementPtr(resTy, result, idx, newTempName());
+        currentBB->pushBack(gepRes);
+        auto* store = Instruction::createStore(binOp, gepRes);
+        currentBB->pushBack(store);
+    }
+    return result;
+}
+
+// 标量提升为同型张量（每个分量 = 标量），再逐元素运算。
+Value* IRBuilder::emitTensorScalarOp(Instruction::Opcode intOp, Instruction::Opcode floatOp,
+                                      Value* tensorVal, Value* scalarVal, bool scalarOnLeft) {
+    Type* leafTy = nullptr;
+    unsigned total = getTotalElements(
+        static_cast<PointerType*>(tensorVal->getType())->getPointeeType(), leafTy);
+    bool isFloat = leafTy->isFloat();
+    Instruction::Opcode op = isFloat ? floatOp : intOp;
+    Type* srcTy = static_cast<PointerType*>(tensorVal->getType())->getPointeeType();
+    auto* result = Instruction::createAlloca(srcTy, newTempName());
+    currentBB->pushBack(result);
+
+    scalarVal = implConvert(scalarVal, leafTy);
+    for (unsigned i = 0; i < total; ++i) {
+        auto idx0 = ConstantInt::get(IntegerType::I32, 0);
+        auto idxI = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
+        std::vector<Value*> idx = {idx0, idxI};
+        auto* gep = Instruction::createGetElementPtr(srcTy, tensorVal, idx, newTempName());
+        currentBB->pushBack(gep);
+        auto* load = Instruction::createLoad(leafTy, gep, newTempName());
+        currentBB->pushBack(load);
+
+        auto* binOp = scalarOnLeft
+            ? Instruction::createBinOp(op, leafTy, newTempName(), scalarVal, load)
+            : Instruction::createBinOp(op, leafTy, newTempName(), load, scalarVal);
+        currentBB->pushBack(binOp);
+
+        auto* gepRes = Instruction::createGetElementPtr(srcTy, result, idx, newTempName());
+        currentBB->pushBack(gepRes);
+        auto* store = Instruction::createStore(binOp, gepRes);
+        currentBB->pushBack(store);
+    }
+    return result;
+}
+
+// 单目取负：0 - elem（或 0.0 - elem）
+Value* IRBuilder::emitTensorNeg(Value* tensorVal) {
+    Type* leafTy = nullptr;
+    unsigned total = getTotalElements(
+        static_cast<PointerType*>(tensorVal->getType())->getPointeeType(), leafTy);
+    Type* srcTy = static_cast<PointerType*>(tensorVal->getType())->getPointeeType();
+    Value* zero = leafTy->isFloat()
+        ? static_cast<Value*>(ConstantFloat::get(FloatType::get(), 0.0))
+        : static_cast<Value*>(ConstantInt::get(IntegerType::I32, 0));
+    auto* result = Instruction::createAlloca(srcTy, newTempName());
+    currentBB->pushBack(result);
+
+    for (unsigned i = 0; i < total; ++i) {
+        auto idx0 = ConstantInt::get(IntegerType::I32, 0);
+        auto idxI = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
+        std::vector<Value*> idx = {idx0, idxI};
+        auto* gep = Instruction::createGetElementPtr(srcTy, tensorVal, idx, newTempName());
+        currentBB->pushBack(gep);
+        auto* load = Instruction::createLoad(leafTy, gep, newTempName());
+        currentBB->pushBack(load);
+        auto* subOp = leafTy->isFloat()
+            ? Instruction::createBinOp(Instruction::Opcode::FSUB, leafTy, newTempName(), zero, load)
+            : Instruction::createBinOp(Instruction::Opcode::SUB,    leafTy, newTempName(), zero, load);
+        currentBB->pushBack(subOp);
+        auto* gepRes = Instruction::createGetElementPtr(srcTy, result, idx, newTempName());
+        currentBB->pushBack(gepRes);
+        auto* store = Instruction::createStore(subOp, gepRes);
+        currentBB->pushBack(store);
+    }
+    return result;
+}
+
+// 张量逐元素拷贝（dst = src），同型同尺寸。
+void IRBuilder::emitTensorCopy(Value* dst, Value* src) {
+    Type* leafTy = nullptr;
+    unsigned total = getTotalElements(
+        static_cast<PointerType*>(src->getType())->getPointeeType(), leafTy);
+    Type* srcTy = static_cast<PointerType*>(src->getType())->getPointeeType();
+    for (unsigned i = 0; i < total; ++i) {
+        auto idx0 = ConstantInt::get(IntegerType::I32, 0);
+        auto idxI = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
+        std::vector<Value*> idx = {idx0, idxI};
+        auto* gepS = Instruction::createGetElementPtr(srcTy, src, idx, newTempName());
+        currentBB->pushBack(gepS);
+        auto* loadS = Instruction::createLoad(leafTy, gepS, newTempName());
+        currentBB->pushBack(loadS);
+        auto* gepD = Instruction::createGetElementPtr(srcTy, dst, idx, newTempName());
+        currentBB->pushBack(gepD);
+        auto* store = Instruction::createStore(loadS, gepD);
+        currentBB->pushBack(store);
+    }
+}
+
+// 矩阵乘法 @：lhs[M x N] @ rhs[N x L] → result[M x L]（V4 实现）
+Value* IRBuilder::emitTensorMatMul(Value* lhs, Value* rhs) {
+    (void)lhs; (void)rhs;
+    throw std::runtime_error("Tensor @ (matmul) not yet implemented (V4)");
 }
 
 Type* IRBuilder::toIRType(const std::string& sysyType) {

@@ -86,6 +86,25 @@ private:
                                   std::vector<uint32_t>& outData);
     Value*          zeroForType(Type* ty);
 
+    // ===== SysY2026 张量辅助 =====
+    // 记录张量变量名（由 'tensor' 关键字声明），区分普通数组。
+    std::unordered_map<std::string, bool> tensorVars;   // name → isFloat
+    // 判断 Value 是否为张量操作数（指向数组的 alloca 指针，且变量名在 tensorVars 中）
+    // 注：表达式中的张量通过 lVal 的裸名进入，先由 visitPrimaryExp 保留 alloca 指针。
+    bool   isTensorOperand(Value* v);
+    // 张量逐元素标量运算：lhs/rhs 均为同形张量 alloca，生成结果张量 alloca。
+    Value* emitTensorElementWise(Instruction::Opcode intOp, Instruction::Opcode floatOp,
+                                 Value* lhs, Value* rhs);
+    // 张量与标量：标量提升到同型张量（每个分量都等于该标量），再逐元素运算。
+    Value* emitTensorScalarOp(Instruction::Opcode intOp, Instruction::Opcode floatOp,
+                              Value* tensorVal, Value* scalarVal, bool scalarOnLeft);
+    // 单目取负：-tensor → 逐元素取负（0 - elem 或 0.0 - elem）。
+    Value* emitTensorNeg(Value* tensorVal);
+    // 张量拷贝赋值：dst = src（同形张量逐元素拷贝）。
+    void   emitTensorCopy(Value* dst, Value* src);
+    // 矩阵乘法 @：lhs[M x N] @ rhs[N x L] → result[M x L]。
+    Value* emitTensorMatMul(Value* lhs, Value* rhs);
+
     // ===== 常数表达式编译期求值 =====
     Value* constEval(SysY2022Parser::AddExpContext* ctx);
     Value* constEvalMul(SysY2022Parser::MulExpContext* ctx);
