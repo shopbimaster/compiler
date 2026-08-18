@@ -1,0 +1,15 @@
+// 张量声明 + 顺序填充初始化（SysY2026 规范示例）
+// tensor int t1[4]={1,2};           → {1,2,0,0}
+// tensor int t2[2][3]={{3,4},{5,6,7}}; → {{3,4,0},{5,6,7}}
+// tensor float t3[2][2]={0.1,0.2,0.3,0.4};
+int main() {
+    tensor int t1[4] = {1, 2};
+    putint(t1[0]); putch(32); putint(t1[1]); putch(32);
+    putint(t1[2]); putch(32); putint(t1[3]); putch(10);
+
+    tensor int t2[2][3] = {{3,4},{5,6,7}};
+    putint(t2[0][0]); putch(32); putint(t2[0][1]); putch(32); putint(t2[0][2]); putch(32);
+    putint(t2[1][0]); putch(32); putint(t2[1][1]); putch(32); putint(t2[1][2]); putch(10);
+
+    return 0;
+}
