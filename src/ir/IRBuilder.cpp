@@ -1302,6 +1302,32 @@ static unsigned getTotalElements(Type* ty, Type*& leafType) {
     return total;
 }
 
+// 收集数组类型各维度大小（外→内），如 [2 x [3 x i32]] → {2, 3}
+static void collectDims(Type* ty, std::vector<unsigned>& dims, Type*& leafType) {
+    leafType = ty;
+    while (leafType->isArray()) {
+        auto* arr = static_cast<ArrayType*>(leafType);
+        dims.push_back(arr->getNumElements());
+        leafType = arr->getElementType();
+    }
+}
+
+// 把扁平线性索引（行优先）分解为多维 GEP 下标（含前导 0）。
+// 如 dims={2,3}，flat=4 → [0, 1, 1]（第 1 行第 1 列）
+static std::vector<Value*> flatToGepIndices(unsigned flat, const std::vector<unsigned>& dims) {
+    std::vector<Value*> indices;
+    indices.push_back(ConstantInt::get(IntegerType::I32, 0));
+    unsigned rem = flat;
+    for (size_t d = 0; d < dims.size(); ++d) {
+        unsigned stride = 1;
+        for (size_t k = d + 1; k < dims.size(); ++k) stride *= dims[k];
+        unsigned idx = rem / stride;
+        rem %= stride;
+        indices.push_back(ConstantInt::get(IntegerType::I32, static_cast<int64_t>(idx)));
+    }
+    return indices;
+}
+
 // 张量逐元素标量运算：lhs/rhs 均为同形张量 alloca，生成结果张量 alloca。
 Value* IRBuilder::emitTensorElementWise(Instruction::Opcode intOp, Instruction::Opcode floatOp,
                                          Value* lhs, Value* rhs) {
@@ -1320,11 +1346,13 @@ Value* IRBuilder::emitTensorElementWise(Instruction::Opcode intOp, Instruction::
     auto* result = Instruction::createAlloca(resTy, newTempName());
     currentBB->pushBack(result);
 
+    // 收集维度用于扁平→多维下标转换
+    std::vector<unsigned> dims;  Type* leaf = nullptr;
+    collectDims(srcTy, dims, leaf);
+
     for (unsigned i = 0; i < lhsTotal; ++i) {
-        auto idx0 = ConstantInt::get(IntegerType::I32, 0);
-        auto idxI = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
-        std::vector<Value*> idx = {idx0, idxI};
-        // lhs[i]  (使用 srcTy 作为 GEP 源类型；对多维数组，扁平索引按行优先)
+        std::vector<Value*> idx = flatToGepIndices(i, dims);
+        // lhs[i]
         auto* gepL = Instruction::createGetElementPtr(srcTy, lhs, idx, newTempName());
         currentBB->pushBack(gepL);
         auto* loadL = Instruction::createLoad(lhsLeafTy, gepL, newTempName());
@@ -1359,10 +1387,10 @@ Value* IRBuilder::emitTensorScalarOp(Instruction::Opcode intOp, Instruction::Opc
     currentBB->pushBack(result);
 
     scalarVal = implConvert(scalarVal, leafTy);
+    std::vector<unsigned> dims;  Type* leaf = nullptr;
+    collectDims(srcTy, dims, leaf);
     for (unsigned i = 0; i < total; ++i) {
-        auto idx0 = ConstantInt::get(IntegerType::I32, 0);
-        auto idxI = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
-        std::vector<Value*> idx = {idx0, idxI};
+        std::vector<Value*> idx = flatToGepIndices(i, dims);
         auto* gep = Instruction::createGetElementPtr(srcTy, tensorVal, idx, newTempName());
         currentBB->pushBack(gep);
         auto* load = Instruction::createLoad(leafTy, gep, newTempName());
@@ -1393,10 +1421,10 @@ Value* IRBuilder::emitTensorNeg(Value* tensorVal) {
     auto* result = Instruction::createAlloca(srcTy, newTempName());
     currentBB->pushBack(result);
 
+    std::vector<unsigned> dims;  Type* leaf = nullptr;
+    collectDims(srcTy, dims, leaf);
     for (unsigned i = 0; i < total; ++i) {
-        auto idx0 = ConstantInt::get(IntegerType::I32, 0);
-        auto idxI = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
-        std::vector<Value*> idx = {idx0, idxI};
+        std::vector<Value*> idx = flatToGepIndices(i, dims);
         auto* gep = Instruction::createGetElementPtr(srcTy, tensorVal, idx, newTempName());
         currentBB->pushBack(gep);
         auto* load = Instruction::createLoad(leafTy, gep, newTempName());
@@ -1419,10 +1447,10 @@ void IRBuilder::emitTensorCopy(Value* dst, Value* src) {
     unsigned total = getTotalElements(
         static_cast<PointerType*>(src->getType())->getPointeeType(), leafTy);
     Type* srcTy = static_cast<PointerType*>(src->getType())->getPointeeType();
+    std::vector<unsigned> dims;  Type* leaf = nullptr;
+    collectDims(srcTy, dims, leaf);
     for (unsigned i = 0; i < total; ++i) {
-        auto idx0 = ConstantInt::get(IntegerType::I32, 0);
-        auto idxI = ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i));
-        std::vector<Value*> idx = {idx0, idxI};
+        std::vector<Value*> idx = flatToGepIndices(i, dims);
         auto* gepS = Instruction::createGetElementPtr(srcTy, src, idx, newTempName());
         currentBB->pushBack(gepS);
         auto* loadS = Instruction::createLoad(leafTy, gepS, newTempName());
@@ -1434,10 +1462,86 @@ void IRBuilder::emitTensorCopy(Value* dst, Value* src) {
     }
 }
 
-// 矩阵乘法 @：lhs[M x N] @ rhs[N x L] → result[M x L]（V4 实现）
+// 矩阵乘法 @：lhs[M x N] @ rhs[N x L] → result[M x L]
+// 仅支持 2 维张量（SysY2026 规范）。三重循环标量展开，无 SIMD 依赖。
 Value* IRBuilder::emitTensorMatMul(Value* lhs, Value* rhs) {
-    (void)lhs; (void)rhs;
-    throw std::runtime_error("Tensor @ (matmul) not yet implemented (V4)");
+    auto* lhsArrTy = static_cast<ArrayType*>(
+        static_cast<PointerType*>(lhs->getType())->getPointeeType());
+    auto* rhsArrTy = static_cast<ArrayType*>(
+        static_cast<PointerType*>(rhs->getType())->getPointeeType());
+    // lhs 必须是 [M x [N x T]]，rhs 必须是 [N x [L x T]]
+    if (!lhsArrTy->getElementType()->isArray() ||
+        !rhsArrTy->getElementType()->isArray()) {
+        throw std::runtime_error("@ operator requires 2-D tensors");
+    }
+    unsigned M = lhsArrTy->getNumElements();
+    auto* lhsRowTy = static_cast<ArrayType*>(lhsArrTy->getElementType());
+    unsigned N = lhsRowTy->getNumElements();
+    Type* leafTy = lhsRowTy->getElementType();
+
+    unsigned N2 = rhsArrTy->getNumElements();
+    auto* rhsRowTy = static_cast<ArrayType*>(rhsArrTy->getElementType());
+    unsigned L = rhsRowTy->getNumElements();
+    if (N != N2) {
+        throw std::runtime_error("@ operator dimension mismatch: lhs cols != rhs rows");
+    }
+
+    // 结果类型 [M x [L x T]]
+    Type* resRowTy = ArrayType::get(leafTy, L);
+    Type* resTy    = ArrayType::get(resRowTy, M);
+    auto* result = Instruction::createAlloca(resTy, newTempName());
+    currentBB->pushBack(result);
+
+    bool isFloat = leafTy->isFloat();
+    auto mulOp = isFloat ? Instruction::Opcode::FMUL : Instruction::Opcode::MUL;
+    auto addOp = isFloat ? Instruction::Opcode::FADD : Instruction::Opcode::ADD;
+
+    // for i in [0,M): for j in [0,L): acc=0; for k in [0,N): acc += lhs[i][k]*rhs[k][j]; result[i][j]=acc
+    for (unsigned i = 0; i < M; ++i) {
+        for (unsigned j = 0; j < L; ++j) {
+            Value* acc = isFloat
+                ? static_cast<Value*>(ConstantFloat::get(FloatType::get(), 0.0))
+                : static_cast<Value*>(ConstantInt::get(IntegerType::I32, 0));
+            for (unsigned k = 0; k < N; ++k) {
+                // lhs[i][k]
+                std::vector<Value*> idxL = {
+                    ConstantInt::get(IntegerType::I32, 0),
+                    ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i)),
+                    ConstantInt::get(IntegerType::I32, static_cast<int64_t>(k))
+                };
+                auto* gepL = Instruction::createGetElementPtr(lhsArrTy, lhs, idxL, newTempName());
+                currentBB->pushBack(gepL);
+                auto* loadL = Instruction::createLoad(leafTy, gepL, newTempName());
+                currentBB->pushBack(loadL);
+                // rhs[k][j]
+                std::vector<Value*> idxR = {
+                    ConstantInt::get(IntegerType::I32, 0),
+                    ConstantInt::get(IntegerType::I32, static_cast<int64_t>(k)),
+                    ConstantInt::get(IntegerType::I32, static_cast<int64_t>(j))
+                };
+                auto* gepR = Instruction::createGetElementPtr(rhsArrTy, rhs, idxR, newTempName());
+                currentBB->pushBack(gepR);
+                auto* loadR = Instruction::createLoad(leafTy, gepR, newTempName());
+                currentBB->pushBack(loadR);
+                // acc += lhs[i][k] * rhs[k][j]
+                auto* prod = Instruction::createBinOp(mulOp, leafTy, newTempName(), loadL, loadR);
+                currentBB->pushBack(prod);
+                acc = Instruction::createBinOp(addOp, leafTy, newTempName(), acc, prod);
+                currentBB->pushBack(static_cast<Instruction*>(acc));
+            }
+            // result[i][j] = acc
+            std::vector<Value*> idxRes = {
+                ConstantInt::get(IntegerType::I32, 0),
+                ConstantInt::get(IntegerType::I32, static_cast<int64_t>(i)),
+                ConstantInt::get(IntegerType::I32, static_cast<int64_t>(j))
+            };
+            auto* gepRes = Instruction::createGetElementPtr(resTy, result, idxRes, newTempName());
+            currentBB->pushBack(gepRes);
+            auto* store = Instruction::createStore(acc, gepRes);
+            currentBB->pushBack(store);
+        }
+    }
+    return result;
 }
 
 Type* IRBuilder::toIRType(const std::string& sysyType) {

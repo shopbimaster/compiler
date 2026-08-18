@@ -112,6 +112,29 @@ fallback 到 I32，`t1` 类型为 `[4 x i32]`。`emitInitStoresVar` 递归处理
 
 ---
 
-## V4：矩阵乘法 @（待实现）
+## V4：矩阵乘法 @
+
+### 修改点
+
+| 文件 | 修改 |
+|------|------|
+| `src/ir/IRBuilder.cpp` | 补全 `emitTensorMatMul`（三重循环标量展开 M×L×N）；修正 `emitTensorElementWise`/`emitTensorScalarOp`/`emitTensorNeg`/`emitTensorCopy` 的扁平索引为多维 GEP 下标（新增 `collectDims`/`flatToGepIndices` 辅助函数） |
+| `test/functional/tensor/03_tensor_matmul.sy` + `.out` | 2×2 @ 2×2 验证 |
+| `test/functional/tensor/04_tensor_2d.sy` + `.out` | 2D 逐元素运算验证 |
+
+### 踩坑
+
+- **扁平索引不适用于多维数组**：V3 用 `[0, i]` 扁平索引对 1D 张量正确，但对 2D 张量
+  `[2 x [3 x i32]]` 的 GEP `[0, 5]` 无效（第一维最大索引为 1）。修复：用 `flatToGepIndices`
+  把线性索引按行优先分解为 `[0, i, j, ...]` 多级下标。
+- 这同时说明**V3 的测试只覆盖了 1D**，多维测试（04_tensor_2d）必须在 V4 补上。
+
+### 验证
+
+- matmul: `{{1,2},{3,4}} @ {{5,6},{7,8}} = {{19,22},{43,50}}` ✓
+- 2D 逐元素 + 与 * 输出正确 ✓（O0+O1）。
+- 功能回归 99/100。
+
+---
 
 ## V5：张量拷贝赋值（待实现）

@@ -1,0 +1,19 @@
+// 2 维张量逐元素运算（验证扁平索引→多维下标转换）
+// a={{1,2,3},{4,5,6}}  b={{6,5,4},{3,2,1}}
+// a+b={{7,7,7},{7,7,7}}  a*b={{6,10,12},{12,10,6}}
+int main() {
+    tensor int a[2][3] = {{1,2,3},{4,5,6}};
+    tensor int b[2][3] = {{6,5,4},{3,2,1}};
+
+    tensor int s[2][3];
+    s = a + b;
+    putint(s[0][0]); putch(32); putint(s[0][1]); putch(32); putint(s[0][2]); putch(32);
+    putint(s[1][0]); putch(32); putint(s[1][1]); putch(32); putint(s[1][2]); putch(10);
+
+    tensor int m[2][3];
+    m = a * b;
+    putint(m[0][0]); putch(32); putint(m[0][1]); putch(32); putint(m[0][2]); putch(32);
+    putint(m[1][0]); putch(32); putint(m[1][1]); putch(32); putint(m[1][2]); putch(10);
+
+    return 0;
+}
