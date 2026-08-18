@@ -28,6 +28,9 @@ public:
   virtual void enterBType(SysY2022Parser::BTypeContext * /*ctx*/) override { }
   virtual void exitBType(SysY2022Parser::BTypeContext * /*ctx*/) override { }
 
+  virtual void enterTensorType(SysY2022Parser::TensorTypeContext * /*ctx*/) override { }
+  virtual void exitTensorType(SysY2022Parser::TensorTypeContext * /*ctx*/) override { }
+
   virtual void enterConstDef(SysY2022Parser::ConstDefContext * /*ctx*/) override { }
   virtual void exitConstDef(SysY2022Parser::ConstDefContext * /*ctx*/) override { }
 

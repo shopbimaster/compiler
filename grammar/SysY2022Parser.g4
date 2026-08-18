@@ -13,8 +13,11 @@ decl: constDecl | varDecl;
 // 常量声明
 constDecl: CONST bType constDef (COMMA constDef)* SEMICOLON;
 
-// 基本类型
-bType: INT | FLOAT;
+// 基本类型（SysY2026 新增：张量类型 'tensor' ('int' | 'float')）
+bType: INT | FLOAT | tensorType;
+
+// 张量类型：各维度大小由声明时方括号显式确定，如 tensor int t[2][3]
+tensorType: TENSOR (INT | FLOAT);
 
 // 常量定义
 constDef: IDENTIFIER (L_BRACKET constExp R_BRACKET)* ASSIGN constInitVal;
@@ -40,8 +43,8 @@ initVal:
 // 函数定义
 funcDef: funcType IDENTIFIER L_PAREN (funcFParams)? R_PAREN block;
 
-// 函数类型
-funcType: VOID | INT | FLOAT;
+// 函数类型（SysY2026 新增：张量返回类型）
+funcType: VOID | INT | FLOAT | tensorType;
 
 // 函数形参表
 funcFParams: funcFParam (COMMA funcFParam)*;
@@ -93,10 +96,10 @@ unaryOp: PLUS | MINUS | NOT;
 // 函数实参表
 funcRParams: exp (COMMA exp)*;
 
-// 乘除模表达式
+// 乘除模表达式（SysY2026 新增：'@' 矩阵乘法，与乘除同优先级）
 mulExp:
     unaryExp
-    | mulExp (STAR | DIV | MOD) unaryExp;
+    | mulExp (STAR | DIV | MOD | MATMUL) unaryExp;
 
 // 加减表达式
 addExp:

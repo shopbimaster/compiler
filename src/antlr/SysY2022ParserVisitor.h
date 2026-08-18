@@ -27,6 +27,8 @@ public:
 
     virtual std::any visitBType(SysY2022Parser::BTypeContext *context) = 0;
 
+    virtual std::any visitTensorType(SysY2022Parser::TensorTypeContext *context) = 0;
+
     virtual std::any visitConstDef(SysY2022Parser::ConstDefContext *context) = 0;
 
     virtual std::any visitConstInitVal(SysY2022Parser::ConstInitValContext *context) = 0;

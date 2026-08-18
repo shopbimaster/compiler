@@ -26,6 +26,9 @@ public:
   virtual void enterBType(SysY2022Parser::BTypeContext *ctx) = 0;
   virtual void exitBType(SysY2022Parser::BTypeContext *ctx) = 0;
 
+  virtual void enterTensorType(SysY2022Parser::TensorTypeContext *ctx) = 0;
+  virtual void exitTensorType(SysY2022Parser::TensorTypeContext *ctx) = 0;
+
   virtual void enterConstDef(SysY2022Parser::ConstDefContext *ctx) = 0;
   virtual void exitConstDef(SysY2022Parser::ConstDefContext *ctx) = 0;
 

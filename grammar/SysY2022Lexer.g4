@@ -10,6 +10,7 @@ INT:      'int';
 FLOAT:    'float';
 VOID:     'void';
 CONST:    'const';
+TENSOR:   'tensor';
 IF:       'if';
 ELSE:     'else';
 WHILE:    'while';
@@ -35,6 +36,7 @@ MINUS:  '-';
 STAR:   '*';
 DIV:    '/';
 MOD:    '%';
+MATMUL: '@';
 
 // ===== 逻辑运算符 =====
 NOT: '!';

@@ -31,6 +31,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitTensorType(SysY2022Parser::TensorTypeContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitConstDef(SysY2022Parser::ConstDefContext *ctx) override {
     return visitChildren(ctx);
   }
