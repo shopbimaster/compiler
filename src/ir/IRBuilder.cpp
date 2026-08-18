@@ -150,9 +150,14 @@ std::any IRBuilder::visitConstDecl(SysY2022Parser::ConstDeclContext* ctx) {
 }
 
 // ================================================================
-// bType: INT | FLOAT
+// bType: INT | FLOAT | tensorType（SysY2026）
 // ================================================================
 std::any IRBuilder::visitBType(SysY2022Parser::BTypeContext* ctx) {
+    // SysY2026：tensor float / tensor int 直接查子节点，避免 getText() 拼接导致 fallback I32
+    if (ctx->tensorType()) {
+        if (ctx->tensorType()->FLOAT()) return std::any(static_cast<Type*>(FloatType::get()));
+        return std::any(static_cast<Type*>(IntegerType::I32));
+    }
     return std::any(toIRType(ctx->getText()));
 }
 
@@ -352,9 +357,14 @@ std::any IRBuilder::visitFuncDef(SysY2022Parser::FuncDefContext* ctx) {
 }
 
 // ================================================================
-// funcType: VOID | INT | FLOAT
+// funcType: VOID | INT | FLOAT | tensorType（SysY2026）
 // ================================================================
 std::any IRBuilder::visitFuncType(SysY2022Parser::FuncTypeContext* ctx) {
+    // SysY2026：tensor 返回类型
+    if (ctx->tensorType()) {
+        if (ctx->tensorType()->FLOAT()) return std::any(static_cast<Type*>(FloatType::get()));
+        return std::any(static_cast<Type*>(IntegerType::I32));
+    }
     return std::any(toIRType(ctx->getText()));
 }
 
@@ -1274,7 +1284,7 @@ std::string IRBuilder::newTempName() {
 // ================================================================
 
 // 判断 Value 是否为张量操作数（指向 ArrayType 的 alloca 指针，
-// 且对应变量名在 tensorVars 中）。要求完整形状（所有维度已知）。
+// 且对应变量名在 tensorVars 中，或是张量运算返回的临时 alloca）。
 bool IRBuilder::isTensorOperand(Value* v) {
     if (!v || !v->getType()->isPointer()) return false;
     auto* pointee = static_cast<PointerType*>(v->getType())->getPointeeType();
@@ -1286,6 +1296,10 @@ bool IRBuilder::isTensorOperand(Value* v) {
                 return tensorVars.find(kv.first) != tensorVars.end();
             }
         }
+    }
+    // 张量运算临时结果（emitTensorElementWise/emitTensorMatMul 返回的 alloca）→ 视为张量
+    if (auto* inst = dynamic_cast<Instruction*>(v)) {
+        if (inst->getOpcode() == Instruction::Opcode::ALLOCA) return true;
     }
     return false;
 }
@@ -1447,6 +1461,7 @@ void IRBuilder::emitTensorCopy(Value* dst, Value* src) {
     unsigned total = getTotalElements(
         static_cast<PointerType*>(src->getType())->getPointeeType(), leafTy);
     Type* srcTy = static_cast<PointerType*>(src->getType())->getPointeeType();
+    Type* dstTy = static_cast<PointerType*>(dst->getType())->getPointeeType();
     std::vector<unsigned> dims;  Type* leaf = nullptr;
     collectDims(srcTy, dims, leaf);
     for (unsigned i = 0; i < total; ++i) {
@@ -1455,7 +1470,8 @@ void IRBuilder::emitTensorCopy(Value* dst, Value* src) {
         currentBB->pushBack(gepS);
         auto* loadS = Instruction::createLoad(leafTy, gepS, newTempName());
         currentBB->pushBack(loadS);
-        auto* gepD = Instruction::createGetElementPtr(srcTy, dst, idx, newTempName());
+        // dst 用自己的类型做 GEP，避免类型不一致
+        auto* gepD = Instruction::createGetElementPtr(dstTy, dst, idx, newTempName());
         currentBB->pushBack(gepD);
         auto* store = Instruction::createStore(loadS, gepD);
         currentBB->pushBack(store);

@@ -1,0 +1,32 @@
+// SysY2026 tensor float 测试：声明、初始化、逐元素运算、单目取负、标量广播
+int main() {
+    tensor float t1[3] = {1.5, 2.5, 3.5};
+    tensor float t2[3] = {0.5, 1.0, 1.5};
+
+    // float 张量逐元素加
+    tensor float r1[3];
+    r1 = t1 + t2;
+    putint(r1[0]); putch(32); putint(r1[1]); putch(32); putint(r1[2]); putch(10);
+
+    // float 张量逐元素减
+    r1 = t1 - t2;
+    putint(r1[0]); putch(32); putint(r1[1]); putch(32); putint(r1[2]); putch(10);
+
+    // float 张量 * 标量
+    r1 = t1 * 2;
+    putint(r1[0]); putch(32); putint(r1[1]); putch(32); putint(r1[2]); putch(10);
+
+    // float 张量 / 标量
+    r1 = t1 / 2;
+    putint(r1[0]); putch(32); putint(r1[1]); putch(32); putint(r1[2]); putch(10);
+
+    // float 张量单目取负
+    r1 = -t1;
+    putint(r1[0]); putch(32); putint(r1[1]); putch(32); putint(r1[2]); putch(10);
+
+    // 标量在左边
+    r1 = 2 * t1;
+    putint(r1[0]); putch(32); putint(r1[1]); putch(32); putint(r1[2]); putch(10);
+
+    return 0;
+}

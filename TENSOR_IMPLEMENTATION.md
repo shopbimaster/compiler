@@ -3,7 +3,7 @@
 > 分支：`feat-tensor`（基于 `main`）
 > 策略：**最小修改、小步提交**。张量在 IR 层复用现有 `ArrayType` 多维数组机制，
 > 不新增 IR 类型，后端/优化器零侵入。
-> 每个提交（V1~V5）只新增一个最小功能系列，并跑快速全量回归。
+> 每个提交（V1~V6）只新增一个最小功能系列，并跑快速全量回归。
 
 ## 实现思路总览
 
@@ -170,7 +170,37 @@ fallback 到 I32，`t1` 类型为 `[4 x i32]`。`emitInitStoresVar` 递归处理
 
 ---
 
+## V6：tensor float 类型修正 + 链式运算支持
+
+### 修改点
+
+| 文件 | 修改 |
+|------|------|
+| `src/ir/IRBuilder.cpp` | **修复 1**：`visitBType` 对 `tensor float` 返回 `FloatType*` 而非 fallback I32（直接查 `ctx->tensorType()->FLOAT()` 子节点，避免 `getText()` 拼接 `"tensorfloat"` 不匹配） |
+| `src/ir/IRBuilder.cpp` | **修复 2**：`visitFuncType` 同上，tensor 返回类型正确识别 int/float |
+| `src/ir/IRBuilder.cpp` | **修复 3**：`isTensorOperand` 对符号表未命中的"指向数组的 ALLOCA 指令"返回 true（张量运算临时结果），使链式运算 `a+b+c`、`(a+b)@c` 可行 |
+| `src/ir/IRBuilder.cpp` | **修复 4**：`emitTensorCopy` 的 dst GEP 用 `dstTy`（dst 的 pointee 类型）而非 `srcTy`，类型自洽 |
+| `test/functional/tensor/06_tensor_float.sy` + `.out` | 新增：float 张量声明/初始化/逐元素运算/单目取负/标量广播 |
+| `test/functional/tensor/07_tensor_chain.sy` + `.out` | 新增：链式运算 `a+b+c`、`a+b+scalar`、`-a+b`、`(m1+m2)@m2` |
+
+### 踩坑
+
+- **`std::any` 类型安全**：`FloatType::get()` 返回 `FloatType*`，直接 `std::any(FloatType::get())`
+  存入的是 `FloatType*`；调用处 `std::any_cast<Type*>(...)` 会抛 `bad_any_cast`。
+  必须 `std::any(static_cast<Type*>(FloatType::get()))` 显式向上转型。
+- **链式运算根因**：`emitTensorElementWise` 返回的临时 alloca 无变量名，符号表查找失败。
+  V3/V5 的 `visitStmt` 用"rhs 是数组指针"绕过了赋值场景，但 `a+b+c` 的中间结果
+  在 `visitAddExp`/`visitMulExp` 中被 `isTensorOperand` 拦截失败，走标量路径产生错误 IR。
+
+### 验证
+
+- tensor 套件 O0/O1 全 7 通过（含新增 float + 链式）。
+- func O0 99 OK / 1 DIFF（68_brainfk 预存）、func O1 97 OK / 3 DIFF（均为基线预存失败）。
+- quick 5/5。
+
+---
+
 ## 当前状态小结
 
-V1~V5 全部完成：词法/语法 → 声明初始化 → 逐元素运算+标量提升+单目 → 矩阵乘法 → 拷贝赋值。
-张量在 IR 层即多维数组，后端/优化器零改动；tensor 套件 5/5（O0+O1），全量回归无新增失败。
+V1~V6 全部完成：词法/语法 → 声明初始化 → 逐元素运算+标量提升+单目 → 矩阵乘法 → 拷贝赋值 → float 修正+链式运算。
+张量在 IR 层即多维数组，后端/优化器零改动；tensor 套件 7/7（O0+O1），全量回归无新增失败。
