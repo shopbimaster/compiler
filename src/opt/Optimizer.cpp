@@ -60,11 +60,6 @@ void runO2(IR::Module* mod) {
         deadCodeElimination(mod);
     }
 
-    if (PASS_CALL(radixSortLowering)) {
-        constantFolding(mod);
-        deadCodeElimination(mod);
-    }
-
     if (PASS_CALL(redundantIterationElimination)) {
         constantFolding(mod);
         deadCodeElimination(mod);
@@ -133,6 +128,12 @@ void runO2(IR::Module* mod) {
     // ★ 暂时禁用用于诊断 SEGFAULT
     if (PASS_CALL(mem2reg)) {
         constantFolding(mod);
+        deadCodeElimination(mod);
+    }
+
+    // 内联和 SSA 构造会暴露短距离的等价地址与内存冗余。这里只在同一
+    // 基本块内进行带别名检查的局部转发，不识别或替换源程序算法。
+    if (PASS_CALL(localMemoryAccessOptimization)) {
         deadCodeElimination(mod);
     }
 
