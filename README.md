@@ -1,12 +1,15 @@
-# SysY2022 编译器
+# SysY2026 编译器
 
-将 SysY2022 语言编译为 RV64GC 汇编的完整编译器，目标平台为 FPGA BOOM CPU 软核（medany 内存模型）。编译器只启用依赖程序语义和 IR 数据流的通用优化，不得通过函数名、测试名、输入值或测评环境特征触发专用优化。
+将 SysY2026 编译为 RV64GC 汇编，目标平台为 FPGA BOOM CPU 软核（medany 内存模型）。
+
+语言标准以 [SysY2026.pdf](SysY2026.pdf) 为准；便于检索的文本版见 [SysY2026语言定义.txt](SysY2026语言定义.txt)，运行时接口见 [SysY2026运行时库.txt](SysY2026运行时库.txt)。
 
 AI 辅助说明：项目开发使用 OpenAI Codex 辅助合规审计、通用优化实现、正确性诊断、测试和文档整理。所有 AI 生成结果均由参赛队成员理解、人工复核、修改并通过回归测试后纳入项目，参赛队对最终实现和正确性负责。
 
 ## 目录
 
 - [总体架构](#总体架构)
+- [SysY2026 张量语义](#sysy2026-张量语义)
 - [模块依赖链](#模块依赖链)
 - [优化管线](#优化管线)
 - [后端代码生成](#后端代码生成)
@@ -20,12 +23,12 @@ AI 辅助说明：项目开发使用 OpenAI Codex 辅助合规审计、通用优
 
 ## 总体架构
 
-编译器采用 **ParseTree → IR → Assembly** 的精简三段式架构，跳过独立 AST 层与语义分析阶段：ANTLR4 Visitor 直接从 ParseTree 生成 IR，IR 经分层优化管线后由后端生成 RV64GC 汇编。
+编译器采用 **ParseTree → IR → Assembly** 的精简三段式架构，跳过独立 AST 层与独立语义分析阶段：ANTLR4 Visitor 直接从 ParseTree 生成 IR，IR 经分层优化管线后由后端生成 RV64GC 汇编。Tensor 表达式也在 Visitor 阶段展开为现有标量 IR，因此中端优化和 RV64GC 后端不需要新增 Tensor 专用数据类型。
 
 ```mermaid
 graph TD
-    Src["SysY 源码 (.sy)"]
-    Lexer["ANTLR4 词法/语法分析<br/>grammar/SysY2022Lexer.g4<br/>SysY2022Parser.g4"]
+    Src["SysY2026 源码 (.sy)"]
+    Lexer["ANTLR4 词法/语法分析<br/>grammar/SysY2022Lexer.g4<br/>grammar/SysY2022Parser.g4"]
     ParseTree["ParseTree"]
     IRBuilder["IRBuilder<br/>Visitor 模式直生 IR<br/>src/ir/IRBuilder.cpp"]
     IRModule["IR Module<br/>include/ir/IR.h<br/>Value/BB/Func/Module/Type"]
@@ -44,8 +47,42 @@ graph TD
 
 - **无独立 AST 层**：直接使用 ANTLR4 Visitor 模式从 ParseTree 生成 IR，简化编译流程（ParseTree → IR → Assembly）。
 - **无 SemanticAnalyzer**：假设输入程序无语法/语义错误。
+- **Tensor 前端标量化**：Tensor 复用定长数组类型，逐元素运算和矩阵乘法在 IRBuilder 中展开为 GEP、LOAD、标量计算和 STORE，不依赖目标机 SIMD 指令。
 - **分层优化管线**：O1→O2→O3→P0→P3 分阶段调度，每阶段后运行 CF/DCE 清理；阶段间迭代收敛（最多 2 次）。
 - **目标导向优化**：针对 BOOM 微架构（16 项 ROB、14 周期分支误预测、单周期全流水 mul、4 周期 load-use）定制软件流水、分支概率布局、归约分裂、指令预取等硬件协同优化。
+
+## SysY2026 张量语义
+
+SysY2026 正式定义了 `tensor` 张量类型和矩阵乘运算符 `@`。Tensor 的元素类型为 `int` 或 `float`，形状沿用数组声明语法并要求维度为编译期常量。
+
+```c
+tensor int a[2][2] = {{1, 2}, {3, 4}};
+tensor int b[2][2] = {{5, 6}, {7, 8}};
+tensor int c[2][2];
+
+int main() {
+    c = a + b;       // 同形 Tensor 逐元素加法
+    c = c * 2;       // Tensor 与标量逐元素运算
+    c = a @ b;       // 二维矩阵乘法
+    return c[0][0];  // 仍可使用普通数组下标访问元素
+}
+```
+
+### 当前支持范围
+
+- `tensor int`、`tensor float` 定长对象的声明、初始化和下标访问。
+- 同元素数量、同元素类型 Tensor 之间的逐元素算术；整数元素支持 `+`、`-`、`*`、`/`、`%`，浮点元素支持 `+`、`-`、`*`、`/`。
+- Tensor 与标量之间的对应逐元素算术运算。
+- Tensor 一元 `+`、一元 `-` 和同形 Tensor 赋值复制。
+- 二维 Tensor 的 `@` 矩阵乘法，左右矩阵的内维必须一致。
+
+### 实现方式和边界
+
+- 词法和语法入口位于 `grammar/SysY2022Lexer.g4`、`grammar/SysY2022Parser.g4`，生成代码保存在 `src/antlr/`。
+- `IRBuilder` 通过 Tensor 标记区分普通数组与 Tensor；底层存储仍使用 `ArrayType`。
+- Tensor 运算结果使用临时 `ALLOCA`，并展开为既有的 GEP、LOAD、整数/浮点运算和 STORE 指令。
+- 当前实现是标量语义扩展，不会生成 SIMD 指令；后续若接入原生 SIMD，需要另行扩展 Vector IR、指令选择和向量寄存器分配。
+- 当前主要支持定长 Tensor 变量和表达式；动态形状、隐式多维广播以及 Tensor 函数参数/返回值不属于该版本的稳定接口。
 
 ### BOOM 微架构约束
 
@@ -414,9 +451,10 @@ flowchart LR
 
 | 文件                        | 入口函数                         | 职责                                                        |
 | --------------------------- | -------------------------------- | ----------------------------------------------------------- |
-| `grammar/SysY2022Lexer.g4`  | —（ANTLR4 生成）                 | SysY2022 词法规则                                           |
-| `grammar/SysY2022Parser.g4` | —（ANTLR4 生成）                 | SysY2022 语法规则                                           |
-| `src/ir/IRBuilder.cpp`      | `IRBuilder::compile(sourcePath)` | Visitor 模式从 ParseTree 直接生成 IR Module                 |
+| `grammar/SysY2022Lexer.g4`  | —（ANTLR4 生成）                 | SysY2026 词法规则；沿用历史内部文件名                       |
+| `grammar/SysY2022Parser.g4` | —（ANTLR4 生成）                 | SysY2026 语法规则；沿用历史内部文件名                       |
+| `src/antlr/`                | ANTLR4 生成的 Lexer/Parser/Visitor | 编译时实际参与解析的生成代码；语法修改后由脚本同步生成    |
+| `src/ir/IRBuilder.cpp`      | `IRBuilder::compile(sourcePath)` | Visitor 模式从 ParseTree 直接生成 IR；Tensor 运算标量化     |
 | `src/main.cpp`              | `main()`                         | 命令行解析 + 调度编译流程                                   |
 | `src/Compiler.cpp`          | `Compiler::emitAsmToFile()`      | 编译门面：compile → runOptPasses → TargetCodeGen → peephole |
 
@@ -559,6 +597,12 @@ make -j$(nproc)
 
 # 输出 IR（调试用）
 ./build/compiler -o output.ir input.sy -o3
+```
+
+Tensor 源文件仍使用相同命令编译，不需要额外开关：
+
+```bash
+./build/compiler -S -o tensor.s tensor.sy -O1
 ```
 
 ### Pass 开关（环境变量）
