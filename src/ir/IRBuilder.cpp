@@ -153,6 +153,10 @@ std::any IRBuilder::visitConstDecl(SysY2022Parser::ConstDeclContext* ctx) {
 // bType: INT | FLOAT
 // ================================================================
 std::any IRBuilder::visitBType(SysY2022Parser::BTypeContext* ctx) {
+    if(ctx->tensorType()){
+        if(ctx->tensorType()->FLOAT())return std::any(static_cast<Type*>(FloatType::get()));
+        return std::any(static_cast<Type*>(IntegerType::I32));
+    }
     return std::any(toIRType(ctx->getText()));
 }
 
@@ -161,6 +165,9 @@ std::any IRBuilder::visitBType(SysY2022Parser::BTypeContext* ctx) {
 // ================================================================
 std::any IRBuilder::visitVarDecl(SysY2022Parser::VarDeclContext* ctx) {
     Type* baseType = std::any_cast<Type*>(visitBType(ctx->bType()));
+
+    bool isTensorDecl=(ctx->bType()->TensorType()!=nullptr);
+    bool isFloatElement=isTensorDecl&&(ctx->bType()->tensorType()->FLOAT()!=nullptr);
     for (auto* defCtx : ctx->varDef()) {
         std::string name = defCtx->IDENTIFIER()->getText();
 
@@ -234,6 +241,7 @@ std::any IRBuilder::visitVarDecl(SysY2022Parser::VarDeclContext* ctx) {
             }
             declare(name, alloca);
         }
+        if(isTensorDecl)tensorVals[name]=isFloatElement;
     }
     return {};
 }
@@ -350,6 +358,9 @@ std::any IRBuilder::visitFuncDef(SysY2022Parser::FuncDefContext* ctx) {
 // funcType: VOID | INT | FLOAT
 // ================================================================
 std::any IRBuilder::visitFuncType(SysY2022Parser::FuncTypeContext* ctx) {
+    if(ctx->tensorType()){
+        if(ctx->tensorType()->FLOAT())return std::any(static_cast<Type*>(IntegerType::I32));
+    }
     return std::any(toIRType(ctx->getText()));
 }
 
@@ -416,6 +427,14 @@ std::any IRBuilder::visitStmt(SysY2022Parser::StmtContext* ctx) {
         Value* lhsPtr = valFrom(visitLVal(ctx->lVal())); // get pointer (alloca)
         Value* rhs = valFrom(visitExp(ctx->exp()));
         if (lhsPtr && rhs) {
+
+            bool lhsIsTensorArr=lhsPtr->getType()->isPointer()&&static_cast<PointerType*>(lhsPtr->getType())->getPointeeType()->isArray()&&isTensorOperand(lhsPtr);
+            bool rhsIsTensorArr=rhs->getType()->isPointer()&&static_cast<PointerType*>(rhs->getType())->getPointeeType()->isArray()&&isTensorOperand(rhs);
+            if(lhsIsTensorArr&&rhsIsTensorArr){
+                emitTensorCopy(lhsPtr,rhs);
+                return{};
+            }
+
             auto* ptrTy = dynamic_cast<PointerType*>(lhsPtr->getType());
             if (ptrTy) {
                 rhs = implConvert(rhs, ptrTy->getPointeeType());
@@ -632,6 +651,14 @@ std::any IRBuilder::visitPrimaryExp(SysY2022Parser::PrimaryExpContext* ctx) {
             PointerType* ptrTy = static_cast<PointerType*>(ptr->getType());
             Type* pointee = ptrTy->getPointeeType();
             if (pointee->isArray()) {
+
+
+
+
+                //
+                if(isTensorOperand(ptr)){
+                    return std::any(static_cast<Value*>(ptr));
+                }
                 // Array decay to pointer to first element
                 std::vector<Value*> indices;
                 indices.push_back(ConstantInt::get(IntegerType::I32, 0));
@@ -750,6 +777,18 @@ std::any IRBuilder::visitUnaryExp(SysY2022Parser::UnaryExpContext* ctx) {
         std::string op = ctx->unaryOp()->getText();
         Value* operand = valFrom(visitUnaryExp(ctx->unaryExp()));
 
+        if(isTensorOperand(operand)){
+            if(op=="-"){
+                return std::any(emitTensorNeg(operand));
+            }
+
+            if(op=="+"){
+                return std::any(operand);
+            }
+        }
+
+
+
         if (op == "-") {
             if (operand->getType()->isFloat()) {
                 Value* zero = ConstantFloat::get(FloatType::get(), 0.0);
@@ -867,6 +906,37 @@ std::any IRBuilder::visitMulExp(SysY2022Parser::MulExpContext* ctx) {
         if (dynamic_cast<tree::TerminalNode*>(opNode)) {
             opText = static_cast<tree::TerminalNode*>(opNode)->getSymbol()->getText();
         }
+
+
+
+
+        bool lIsTensor=isTensorOperand(left);
+        bool rIsTensor=isTensorOperand(rightVal);
+        if(lIsTensor||rIsTensor){
+            if(opText=="@"){
+                if(!lIsTensor||!rIsTensor)throw std::runtime_error("fuck not both tensor");
+                result=std::any(emitTensorMatMul(left,rightVal));
+                i+=2;
+                continue;
+            }
+            if(opText=="%"){
+                if(lIsTensor&&rIsTensor){
+                    result=std::any(emitTensorElementWise(Instruction::Opcode::SREM,Instruction::Opcode::SREM,left,rightVal));
+                }
+                else if(lIsTensor&&!rIsTensor){
+                    result=std::any(emitTensorScalarOp(Instruction::Opcode::SREM,Instruction::Opcode::SREM,left,rightVal,false));
+                }
+                else result=std::any(emitTensorScalarOp(Instruction::Opcode::SREM,Instruction::Opcode::SREM,rightVal,left,true));
+            }else{
+                auto intOp=(opText=="*")?Instruction::Opcode::MUL:Instruction::Opcode::SDIV;
+                auto fltOp=(opText=="*")?Instruction::Opcode::FMUL:Instruction::Opcode::FDIV;
+                if(lIsTensor&&rIsTensor)result=std::any(emitTensorElementWise(intOp,fltOp,left,rightVal));
+                else if(lIsTensor&&!rIsTensor)result=std::any(emitTensorScalarOp(intOp,fltOp,left,rightVal,false));
+                else result=std::any(emitTensorScalarOp(intOp,fltOp,rightVal,left,true));
+                i+=2;
+                continue;
+            }
+        }
         // Determine result type: float wins if either operand is float
         Type* resultTy = left->getType();
         bool isFloatOp = left->getType()->isFloat() || rightVal->getType()->isFloat();
@@ -910,6 +980,17 @@ std::any IRBuilder::visitAddExp(SysY2022Parser::AddExpContext* ctx) {
             opText = static_cast<tree::TerminalNode*>(opNode)->getSymbol()->getText();
         }
 
+        bool lIsTensor=isTensorOperand(left);
+        bool rIsTensor=isTensorOperand(rightVal);
+        if(lIsTensor||rIsTensor){
+                auto intOp=(opText=="+")?Instruction::Opcode::ADD:Instruction::Opcode::SUB;
+                auto fltOp=(opText=="+")?Instruction::Opcode::FADD:Instruction::Opcode::FSUB;
+                if(lIsTensor&&rIsTensor)result=std::any(emitTensorElementWise(intOp,fltOp,left,rightVal));
+                else if(lIsTensor&&!rIsTensor)result=std::any(emitTensorScalarOp(intOp,fltOp,left,rightVal,false));
+                else result=std::any(emitTensorScalarOp(intOp,fltOp,rightVal,left,true));
+                i+=2;
+                continue;
+        }
         // Determine result type: float wins if either operand is float
         Type* resultTy = left->getType();
         bool isFloatOp = left->getType()->isFloat() || rightVal->getType()->isFloat();
@@ -1176,6 +1257,225 @@ Value* IRBuilder::lookup(const std::string& name) {
 std::string IRBuilder::newTempName() {
     return "t" + std::to_string(tempCount++);
 }
+
+bool IRBuilder::isTensorOperand(Value*v){
+    if(!v||!v->getType()->isPointer())return false;
+    auto*pointee=static_cast<PointerType*>(v->getType())->getPointeeType();
+    if(!pointee->isArray())return false;
+    for(auto it=scopeStack.rbegin();it!=scopeStack.rend();++it){
+        for(const auto&kv:*it){
+            if(kv.second==v)return tensorVals.find(kv.first)!=tensorVals.end();
+        }
+    }
+    if(auto*inst=dynamic_cast<Instruction*>(v)){
+        if(inst->getOpcode()==Instruction::Opcode::ALLOCA)return true;
+    }
+    return false;
+}
+
+
+static unsigned getTotalElements(Type*ty,Type*&leafType){
+    unsigned total=1;leafType=ty;
+    while(leafType->isArray()){
+        auto*arr=static_cast<ArrayType*>(leafType);
+        total*=arr->getNumElements();
+        leafType=arr->getElementType();
+    }
+    return total;
+}
+
+static void collectDims(Type*ty,std::vector<unsigned>&dims,Type*&leafType){
+    leafType=ty;
+    while(leafType->isArray()){
+        auto*arr=static_cast<ArrayType*>(leafType);
+        dims.push_back(arr->getNumElements());
+        leafType=arr->getElementType();
+    }
+}
+
+static std::vector<Value*>flatToGepIndices(unsigned flat,const std::vector<unsigned>&dims){
+    std::vector<Value*>indices;
+    indices.push_back(ConstantInt::get(IntegerType::I32,0));
+    unsigned rem=flat;
+    for(size_t d=0;d<dims.size();++d){
+        unsigned stride=1;
+        for(size_t k=d+1;k<dims.size();++k)stride*=dims[k];
+        unsigned idx=rem/stride;
+        rem%=stride;
+        indices.push_back(ConstantInt::get(IntegerType::I32,static_cast<int64_t>(idx)));
+    }
+    return indices;
+}
+
+
+Value* IRBuilder::emitTensorElementWise(Instruction::Opcode intOp,Instruction::Opcode floatOp,Value*lhs,Value*rhs){
+    Type*lhsLeafTy=nullptr;unsigned lhsTotal=getTotalElements(static_cast<PointerType*>(lhs->getType())->getPointeeType(),lhsLeafTy);
+    Type*rhsLeafTy=nullptr;unsigned rhsTotal=getTotalElements(static_cast<PointerType*>(rhs->getType())->getPointeeType(),rhsLeafTy);
+    if(lhsTotal!=rhsTotal||lhsLeafTy!=rhsLeafTy)throw std::runtime_error("fuck");
+    bool isFloat=lhsLeafTy->isFloat();
+    Instruction::Opcode op=isFloat?floatOp:intOp;
+    auto*srcTy=static_cast<PointerType*>(lhs->getType())->getPointeeType();
+    auto*resTy=static_cast<PointerType*>(lhs->getType())->getPointeeType();
+    auto*result=Instruction::createAlloca(resTy,newTempName());
+    currentBB->pushBack(result);
+    std::vector<unsigned>dims;Type*leaf=nullptr;collectDims(srcTy,dims,leaf);
+    for(unsigned i=0;i<lhsTotal;++i){
+        std::vector<Value*>idx=flatToGepIndices(i,dims);
+        auto*gepL=Instruction::createGetElementPtr(srcTy,lhs,idx,newTempName());
+        currentBB->pushBack(gepL);
+        auto*loadL=Instruction::createLoad(lhsLeafTy,gepL,newTempName());
+        currentBB->pushBack(loadL);
+
+        auto*gepR=Instruction::createGetElementPtr(srcTy,rhs,idx,newTempName());
+        currentBB->pushBack(gepR);
+        auto*loadR=Instruction::createLoad(rhsLeafTy,gepR,newTempName());
+        currentBB->pushBack(loadR);
+
+        auto*binOp=Instruction::createBinOp(op,lhsLeafTy,newTempName(),loadL,loadR);
+        currentBB->pushBack(binOp);
+        auto*gepRes=Instruction::createGetElementPtr(resTy,result,idx,newTempName());
+        currentBB->pushBack(gepRes);
+        auto*store=Instruction::createStore(binOp,gepRes);
+        currentBB->pushBack(store);
+    }
+    return result;
+}
+
+Value*IRBuilder::emitTensorScalarOp(Instruction::Opcode intOp,Instruction::Opcode floatOp,Value*tensorVal,Value*scalarVal,bool scalarOnLeft){
+    Type*leafTy=nullptr;
+    unsigned total=getTotalElements(static_cast<PointerType*>(tensorVal->getType())->getPointeeType(),leafTy);
+    bool isFloat=leafTy->isFloat();
+    Instruction::Opcode op=isFloat?floatOp:intOp;
+    Type*srcTy=static_cast<PointerType*>(tensorVal->getType())->getPointeeType();
+    auto*result=Instruction::createAlloca(srcTy,newTempName());
+    currentBB->pushBack(result);
+    scalarVal=implConvert(scalarVal,leafTy);
+    std::vector<unsigned>dims;Type*leaf=nullptr;collectDims(srcTy,dims,leaf);
+    for(unsigned i=0;i<total;++i){
+        std::vector<Value*>idx=flatToGepIndices(i,dims);
+        auto*gep=Instruction::createGetElementPtr(srcTy,tensorVal,idx,newTempName());
+        currentBB->pushBack(gep);
+        auto*load=Instruction::createLoad(leafTy,gep,newTempName());
+        currentBB->pushBack(load);
+        auto*binOp=scalarOnLeft?Instruction::createBinOp(op,leafTy,newTempName(),scalarVal,load):Instruction::createBinOp(op,leafTy,newTempName(),load,scalarVal);
+        currentBB->pushBack(binOp);
+        auto*gepRes=Instruction::createGetElementPtr(srcTy,result,idx,newTempName());
+        currentBB->pushBack(gepRes);
+        auto*store=Instruction::createStore(binOp,gepRes);
+        currentBB->pushBack(store);
+    }
+    return result;
+}
+
+
+Value*IRBuilder::emitTensorNeg(Value*tensorVal){
+    Type*leafTy=nullptr;
+    unsigned total=getTotalElements(static_cast<PointerType*>(tensorVal->getType())->getPointeeType(),leafTy);
+    Type*srcTy=static_cast<PointerType*>(tensorVal->getType())->getPointeeType();
+    Value*zero=leafTy->isFloat()?static_cast<Value*>(ConstantFloat::get(FloatType::get(),0.0)):static_cast<Value*>(ConstantInt::get(IntegerType::I32,0));
+    auto*result=Instruction::createAlloca(srcTy,newTempName());
+    currentBB->pushBack(result);
+    std::vector<unsigned>dims;Type*leaf=nullptr;collectDims(srcTy,dims,leaf);
+    for(unsigned i=0;i<total;++i){
+        std::vector<Value*>idx=flatToGepIndices(i,dims);
+        auto*gep=Instruction::createGetElementPtr(srcTy,tensorVal,idx,newTempName());
+        currentBB->pushBack(gep);
+        auto*load=Instruction::createLoad(leafTy,gep,newTempName());
+        currentBB->pushBack(load);
+        auto*subOp=leafTy->isFloat()?Instruction::createBinOp(Instruction::Opcode::FSUB,leafTy,newTempName(),zero,load):Instruction::createBinOp(Instruction::Opcode::SUB,leafTy,newTempName(),zero,load);
+        currentBB->pushBack(subOp);
+        auto*gepRes=Instruction::createGetElementPtr(srcTy,result,idx,newTempName());
+        currentBB->pushBack(gepRes);
+        auto*store=Instruction::createStore(subOp,gepRes);
+        currentBB->pushBack(store);
+    }
+    return result;
+}
+
+
+void IRBuilder::emitTensorCopy(Value*dst,Value*src){
+    Type*leafTy=nullptr;
+    unsigned total=getTotalElements(static_cast<PointerType*>(src->getType())->getPointeeType(),leafTy);
+    Type*srcTy=static_cast<PointerType*>(src->getType())->getPointeeType();
+    Type*dstTy=static_cast<PointerType*>(dst->getType())->getPointeeType();
+    std::vector<unsigned>dims;Type*leaf=nullptr;collectDims(srcTy,dims,leaf);
+    for(unsigned i=0;i<total;++i){
+        std::vector<Value*>idx=flatToGepIndices(i,dims);
+        auto*gepS=Instruction::createGetElementPtr(srcTy,src,idx,newTempName());
+        currentBB->pushBack(gepS);
+        auto*loadS=Instruction::createLoad(leafTy,gepS,newTempName());
+        currentBB->pushBack(loadS);
+        auto*gepD=Instruction::createGetElementPtr(dstTy,dst,idx,newTempName());
+        currentBB->pushBack(gepD);
+        auto*store=Instruction::createStore(loadS,gepD);
+        currentBB->pushBack(store);
+    }
+}
+
+
+
+Value*IRBuilder::emitTensorMatMul(Value*lhs,Value*rhs){
+    auto*lhsArrTy=(static_cast<ArrayType*>(lhs->getType())->getElementType());
+    auto*rhsArrTy=(static_cast<ArrayType*>(rhs->getType())->getElementType());
+    if(!lhsArrTy->getElementType()->isArray()||!rhsArrTy->getElementType()->isArray())throw std::runtime_error("fuck Ds of tensor");
+    unsigned M=lhsArrTy->getNumElements();
+    auto*lhsRowTy=static_cast<ArrayType*>(lhsArrTy->getElementType());
+    unsigned N=lhsRowTy->getNumElements();
+    Type*leafTy=lhsRowTy->getElementType();
+    unsigned N2=rhsArrTy->getNumElements();
+    auto*rhsRowTystatic_cast<ArrayType*>(rhsArrTy->getElementType());
+    unsigned L=rhsRowTy->getNumElements();
+    if(N!=N2)throw std::runtime_error("fuck shape of tensor");
+    Type*resRowTy=ArrayType::get(leafTy,L);
+    Type*resTy=ArrayType::get(resRowTy,M);
+    auto*result=Instruction::createAlloca(resTy,newTempName());
+    currentBB->pushBack(result);
+    bool isFloat=leafTy->isFloat();
+    auto mulOp=isFloat?Instruction::Opcode::FMUL:Instruction::Opcode::MUL;
+    auto addOp=isFloat?Instruction::Opcode::FADD:Instruction::Opcode::ADD;
+    for(unsigned i=0;i<M;++i){
+        for(unsigned j=0;j<L;++j){
+            Value*acc=isFloat?static_cast<Value*>(ConstantFloat::get(FloatType::get(),0.0)):static_cast<Value*>(ConstantInt::get(IntegerType::I32,0));
+            for(unsigned k=0;k<N;++k){
+                std::vector<Value*>idxL={
+                    ConstantInt::get(IntegerType::I32,0),
+                    ConstantInt::get(IntegerType::I32,static_cast<int64_t>(i)),
+                    ConstantInt::get(IntegerType::I32,static_cast<int64_t>(k))
+                };
+                auto*gepL=Instruction::createGetElementPtr(lhsArrTy,lhs,idxL,newTempName());
+                currentBB->pushBack(gepL);
+                auto*loadL=Instruction::createLoad(leafTy,gepL,newTempName());
+                currentBB->pushBack(loadL);
+
+                std::vector<Value*>idxR={
+                    ConstantInt::get(IntegerType::I32,0),
+                    ConstantInt::get(IntegerType::I32,static_cast<int64_t>(k)),
+                    ConstantInt::get(IntegerType::I32,static_cast<int64_t>(j))
+                };
+                auto*gepR=Instruction::createGetElementPtr(rhsArrTy,rhs,idxR,newTempName());
+                currentBB->pushBack(gepR);
+                auto*loadR=Instruction::createLoad(leafTy,gepR,newTempName());
+                currentBB->pushBack(loadR);
+
+                auto*prod=Instruction::createBinOp(mulOp,leafTy,newTempName(),loadL,loadR);
+                currentBB->pushBack(prod);
+                acc=Instruction::createBinOp(addOp,leafTy,newTempName(),acc,prod);
+                currentBB->pushBack(static_cast<Instruction*>(acc));
+            }
+            std::vector<Value*>idxRes={
+                ConstantInt::get(IntegerType::I32,0),
+                ConstantInt::get(IntegerType::I32,static_cast<int64_t>(i)),
+                ConstantInt::get(IntegerType::I32,static_cast<int64_t>(j))
+            };
+            auto*gepRes=Instruction::createGetElementPtr(resTy,result,idxRes,newTempName());
+            currentBB->pushBack(gepRes);
+            auto*store=Instruction::createStore(acc,gepRes);
+            currentBB->pushBack(store);
+        }
+    }
+    return result;
+}
+
 
 Type* IRBuilder::toIRType(const std::string& sysyType) {
     if (sysyType == "int")   return IntegerType::I32;

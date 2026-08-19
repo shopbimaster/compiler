@@ -14,7 +14,10 @@ decl: constDecl | varDecl;
 constDecl: CONST bType constDef (COMMA constDef)* SEMICOLON;
 
 // 基本类型
-bType: INT | FLOAT;
+bType: INT | FLOAT | tensorType;
+
+//张量类型
+tensorType: TENSOR(INT|FLOAT);
 
 // 常量定义
 constDef: IDENTIFIER (L_BRACKET constExp R_BRACKET)* ASSIGN constInitVal;
@@ -41,7 +44,7 @@ initVal:
 funcDef: funcType IDENTIFIER L_PAREN (funcFParams)? R_PAREN block;
 
 // 函数类型
-funcType: VOID | INT | FLOAT;
+funcType: VOID | INT | FLOAT | tensorType;
 
 // 函数形参表
 funcFParams: funcFParam (COMMA funcFParam)*;
@@ -96,7 +99,7 @@ funcRParams: exp (COMMA exp)*;
 // 乘除模表达式
 mulExp:
     unaryExp
-    | mulExp (STAR | DIV | MOD) unaryExp;
+    | mulExp (STAR | DIV | MOD | MATMUL) unaryExp;
 
 // 加减表达式
 addExp:

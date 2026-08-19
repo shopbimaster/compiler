@@ -86,6 +86,15 @@ private:
                                   std::vector<uint32_t>& outData);
     Value*          zeroForType(Type* ty);
 
+    std::unordered_map<std::string,bool>tensorVals;
+    bool isTensorOperand(Value*v);
+    Value*emitTensorElementWise(Instruction::Opcode inrOp,Instruction::Opcode floatOp,Value*lhs,Value*rhs);
+    Value*emitTensorScalarOp(Instruction::Opcode inrOp,Instruction::Opcode floatOp,Value*tensorVal,Value*scalarVal,bool scalarOnLeft);
+    Value*emitTensorNeg(Value*tensorVal);
+    void emitTensorCopy(Value*dst,Value*src);
+    Value*emitTensorMatMul(Value*lhs,Value*rhs);
+
+
     // ===== 常数表达式编译期求值 =====
     Value* constEval(SysY2022Parser::AddExpContext* ctx);
     Value* constEvalMul(SysY2022Parser::MulExpContext* ctx);
