@@ -8,7 +8,7 @@ fragment WORD:   LETTER | DIGIT | '_';
 // ===== 关键字 =====
 INT:      'int';
 FLOAT:    'float';
-TENSOR：  'tensor';
+TENSOR:   'tensor';
 VOID:     'void';
 CONST:    'const';
 IF:       'if';

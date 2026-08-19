@@ -166,7 +166,7 @@ std::any IRBuilder::visitBType(SysY2022Parser::BTypeContext* ctx) {
 std::any IRBuilder::visitVarDecl(SysY2022Parser::VarDeclContext* ctx) {
     Type* baseType = std::any_cast<Type*>(visitBType(ctx->bType()));
 
-    bool isTensorDecl=(ctx->bType()->TensorType()!=nullptr);
+    bool isTensorDecl=(ctx->bType()->tensorType()!=nullptr);
     bool isFloatElement=isTensorDecl&&(ctx->bType()->tensorType()->FLOAT()!=nullptr);
     for (auto* defCtx : ctx->varDef()) {
         std::string name = defCtx->IDENTIFIER()->getText();
@@ -1415,15 +1415,15 @@ void IRBuilder::emitTensorCopy(Value*dst,Value*src){
 
 
 Value*IRBuilder::emitTensorMatMul(Value*lhs,Value*rhs){
-    auto*lhsArrTy=(static_cast<ArrayType*>(lhs->getType())->getElementType());
-    auto*rhsArrTy=(static_cast<ArrayType*>(rhs->getType())->getElementType());
-    if(!lhsArrTy->getElementType()->isArray()||!rhsArrTy->getElementType()->isArray())throw std::runtime_error("fuck Ds of tensor");
+    auto*lhsArrTy=(static_cast<ArrayType*>(lhs->getType()));
+    auto*rhsArrTy=(static_cast<ArrayType*>(rhs->getType()));
+    if(! lhsArrTy->getElementType()->isArray()|| !rhsArrTy->getElementType()->isArray())throw std::runtime_error("fuck Ds of tensor");
     unsigned M=lhsArrTy->getNumElements();
     auto*lhsRowTy=static_cast<ArrayType*>(lhsArrTy->getElementType());
     unsigned N=lhsRowTy->getNumElements();
     Type*leafTy=lhsRowTy->getElementType();
     unsigned N2=rhsArrTy->getNumElements();
-    auto*rhsRowTystatic_cast<ArrayType*>(rhsArrTy->getElementType());
+    auto* rhsRowTy = static_cast<ArrayType*>(rhsArrTy->getElementType());
     unsigned L=rhsRowTy->getNumElements();
     if(N!=N2)throw std::runtime_error("fuck shape of tensor");
     Type*resRowTy=ArrayType::get(leafTy,L);

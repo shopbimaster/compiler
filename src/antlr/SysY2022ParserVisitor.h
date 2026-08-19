@@ -1,5 +1,5 @@
 
-// Generated from grammar/SysY2022Parser.g4 by ANTLR 4.13.1
+// Generated from SysY2022Parser.g4 by ANTLR 4.13.1
 
 #pragma once
 
@@ -26,6 +26,8 @@ public:
     virtual std::any visitConstDecl(SysY2022Parser::ConstDeclContext *context) = 0;
 
     virtual std::any visitBType(SysY2022Parser::BTypeContext *context) = 0;
+
+    virtual std::any visitTensorType(SysY2022Parser::TensorTypeContext *context) = 0;
 
     virtual std::any visitConstDef(SysY2022Parser::ConstDefContext *context) = 0;
 

@@ -1,5 +1,5 @@
 
-// Generated from grammar/SysY2022Parser.g4 by ANTLR 4.13.1
+// Generated from SysY2022Parser.g4 by ANTLR 4.13.1
 
 #pragma once
 
@@ -28,6 +28,10 @@ public:
   }
 
   virtual std::any visitBType(SysY2022Parser::BTypeContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitTensorType(SysY2022Parser::TensorTypeContext *ctx) override {
     return visitChildren(ctx);
   }
 
