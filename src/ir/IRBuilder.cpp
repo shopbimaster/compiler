@@ -1415,8 +1415,8 @@ void IRBuilder::emitTensorCopy(Value*dst,Value*src){
 
 
 Value*IRBuilder::emitTensorMatMul(Value*lhs,Value*rhs){
-    auto*lhsArrTy=(static_cast<ArrayType*>(lhs->getType()));
-    auto*rhsArrTy=(static_cast<ArrayType*>(rhs->getType()));
+    auto*lhsArrTy=static_cast<ArrayType*>(static_cast<PointerType*>(lhs->getType())->getPoiteeType());
+    auto*rhsArrTy=static_cast<ArrayType*>(static_cast<PointerType*>(rhs->getType())->getPointeeType());
     if(! lhsArrTy->getElementType()->isArray()|| !rhsArrTy->getElementType()->isArray())throw std::runtime_error("fuck Ds of tensor");
     unsigned M=lhsArrTy->getNumElements();
     auto*lhsRowTy=static_cast<ArrayType*>(lhsArrTy->getElementType());
